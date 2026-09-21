@@ -1,0 +1,15 @@
+# 备用容器化方案：需先具备 python:3.12-slim 镜像
+services:
+  api:
+    build: .
+    image: bnu-meeting-api:latest
+    container_name: bnu-meeting-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # 同机 new-api（容器内访问宿主机）
+      MMA_UPSTREAM_BASE_URL: http://host.docker.internal:3000/v1
+      MMA_ALLOW_SERVER_KEY: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

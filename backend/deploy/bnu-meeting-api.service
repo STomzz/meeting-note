@@ -1,0 +1,19 @@
+[Unit]
+Description=BNU Meeting Minutes API (stateless backend)
+Documentation=https://github.com/bnu-meeting-notes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bnu-meeting-api/backend
+EnvironmentFile=-/etc/bnu-meeting-api/env
+ExecStart=/root/bnu-meeting-api/backend/.venv/bin/uvicorn app.main:app \
+    --host 0.0.0.0 --port 8000 --workers 2 --no-access-log
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

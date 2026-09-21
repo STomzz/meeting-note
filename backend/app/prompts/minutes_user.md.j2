@@ -1,0 +1,11 @@
+【会议信息】
+标题：{{ title or "未提供" }}
+日期：{{ meeting_date or "未提供" }}
+参会人：{{ participants_text or "未提供" }}
+{% if template %}
+【附加要求】
+{{ template }}
+{% endif %}
+
+【转写原文】
+{{ transcript }}

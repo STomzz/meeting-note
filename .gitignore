@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+smoke-out*/
+.env
+dist/
+# 本地私有配置（后端地址等，见 app/scripts/local.env.example）
+app/scripts/local.env
