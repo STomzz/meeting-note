@@ -368,16 +368,8 @@ async function discardClip() {
 const refCount = computed(() => parseRefs(store.content).length)
 const unrefDialog = ref(false)
 const unrefList = ref<ClipInfo[]>([])
-/** 本次处理是否忽略转写缓存（按钮下拉里的「强制重新转写」） */
+/** 本次处理是否忽略转写缓存（工具栏「强制重转」） */
 const processForce = ref(false)
-const processOptions = [
-  { content: '一键处理（缓存命中不重复转写）', value: 'normal' },
-  { content: '强制重新转写（忽略缓存，较慢）', value: 'force' },
-]
-
-function onProcessPick(item: { value?: unknown }) {
-  void processCurrent(item?.value === 'force')
-}
 
 async function processCurrent(force = processForce.value) {
   if (!store.currentId || meeting.processing) return
@@ -774,17 +766,30 @@ async function removeCurrent() {
                 · {{ unrefClips.length }} 未引用</template
               >
             </t-button>
-            <t-dropdown
-              v-if="refCount"
-              trigger="click"
-              :options="processOptions"
-              :disabled="meeting.processing"
-              @click="onProcessPick"
-            >
-              <t-button size="small" variant="outline" :loading="meeting.processing">
+            <template v-if="refCount">
+              <t-button
+                size="small"
+                variant="outline"
+                :loading="meeting.processing"
+                @click="processCurrent(false)"
+              >
                 一键处理（{{ refCount }} 段录音）
               </t-button>
-            </t-dropdown>
+              <t-popup
+                trigger="hover"
+                placement="bottom"
+                content="忽略转写缓存，把全部录音重新识别一遍。只在换了识别模型、或对上次转写不满意时用（较慢）。"
+              >
+                <t-button
+                  size="small"
+                  variant="text"
+                  :disabled="meeting.processing"
+                  @click="processCurrent(true)"
+                >
+                  强制重转
+                </t-button>
+              </t-popup>
+            </template>
             <t-button size="small" :disabled="!store.dirty" theme="primary" @click="saveCurrent()"
               >保存</t-button
             >
@@ -979,9 +984,21 @@ async function removeCurrent() {
           {{ c.dir }}/{{ c.file }}（{{ formatDur(c.durationMs) }}）
         </li>
       </ul>
+      <div class="dialog-options">
+        <button class="dlg-opt primary" @click="insertUnrefAndProcess">
+          <span class="dlg-opt-title">插入引用并一起处理（推荐）</span>
+          <span class="dlg-opt-desc">
+            自动在笔记里补上这 {{ unrefList.length }} 段录音的 <code>/v</code> 引用，然后一起转写 + 生成纪要。
+          </span>
+        </button>
+        <button class="dlg-opt" @click="ignoreUnref">
+          <span class="dlg-opt-title">这次先不管它们</span>
+          <span class="dlg-opt-desc">
+            只处理已经写进笔记的录音；这些录音仍留在文件夹里，之后可以手动插入引用再处理。
+          </span>
+        </button>
+      </div>
       <div class="dialog-actions">
-        <t-button theme="primary" @click="insertUnrefAndProcess">插入并处理</t-button>
-        <t-button variant="outline" @click="ignoreUnref">忽略并继续</t-button>
         <t-button variant="text" @click="unrefDialog = false">取消</t-button>
       </div>
     </t-dialog>
@@ -1474,6 +1491,60 @@ async function removeCurrent() {
   gap: 8px;
   justify-content: flex-end;
   margin-top: 4px;
+}
+
+/* 未引用录音弹窗：把两个去路写成带说明的选项，一眼能看懂 */
+.dialog-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.dlg-opt {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m, 6px);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+
+.dlg-opt:hover {
+  border-color: var(--primary);
+  background: var(--brand-weak);
+}
+
+.dlg-opt.primary {
+  border-color: var(--primary);
+}
+
+.dlg-opt-title {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.dlg-opt.primary .dlg-opt-title {
+  color: var(--primary);
+}
+
+.dlg-opt-desc {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-3);
+}
+
+.dlg-opt-desc code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--panel-2);
 }
 
 .unref-text {
