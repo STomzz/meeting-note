@@ -334,6 +334,20 @@ fn qa_cancel(state: State<'_, AppState>) {
     state.cancel_qa.store(true, Ordering::SeqCst);
 }
 
+/// 追问建议：按需调用一次对话模型，返回 3 条可能想继续问的问题。
+#[tauri::command]
+async fn qa_suggest(
+    question: String,
+    answer: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    qa::suggest(&cfg, &question, &answer).await.map_err(err)
+}
+
 /// 读取问答会话历史（JSON 文件，结构由前端定义）。
 #[tauri::command]
 fn chat_history_load(state: State<'_, AppState>) -> Result<Value, String> {
@@ -830,6 +844,7 @@ pub fn run() {
             ask_question,
             ask_question_stream,
             qa_cancel,
+            qa_suggest,
             chat_history_load,
             chat_history_save,
             meeting_create,

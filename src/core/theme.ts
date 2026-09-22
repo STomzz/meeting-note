@@ -38,6 +38,9 @@ export function applyTheme(mode: ThemeMode = getThemeMode()): boolean {
   return dark
 }
 
+/** 主题变化事件：设置页与侧栏按钮共享同一个状态。 */
+export const THEME_EVENT = 'bnu-theme-changed'
+
 export function setThemeMode(mode: ThemeMode) {
   try {
     localStorage.setItem(STORAGE_KEY, mode)
@@ -45,6 +48,11 @@ export function setThemeMode(mode: ThemeMode) {
     // 存不了也不影响本次生效
   }
   applyTheme(mode)
+  try {
+    window.dispatchEvent(new CustomEvent<ThemeMode>(THEME_EVENT, { detail: mode }))
+  } catch {
+    // 事件发不出去不影响已生效的主题
+  }
 }
 
 /** 页面启动时调用：应用当前模式，并在 auto 下跟随系统变化。返回解绑函数。 */

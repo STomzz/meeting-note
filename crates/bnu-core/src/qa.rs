@@ -126,6 +126,57 @@ pub async fn answer(
     })
 }
 
+/// 从模型输出里解析追问建议：去掉编号/引号/空行，去重，最多 3 条。
+pub fn parse_suggestions(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line
+            .trim()
+            .trim_start_matches(|c: char| {
+                c.is_ascii_digit() || matches!(c, '.' | '-' | '、' | ')' | '）' | ' ' | '#' | '*')
+            })
+            .trim();
+        let cleaned = trimmed.trim_matches(|c| matches!(c, '"' | '\'' | '“' | '”' | '「' | '」'));
+        if cleaned.chars().count() < 4 || cleaned.chars().count() > 30 {
+            continue;
+        }
+        if out.iter().any(|q| q == cleaned) {
+            continue;
+        }
+        out.push(cleaned.to_string());
+        if out.len() == 3 {
+            break;
+        }
+    }
+    out
+}
+
+/// 追问建议：按需触发（每次点击才调用一次模型，省上游配额）。
+pub async fn suggest(cfg: &ModelConfig, question: &str, answer: &str) -> Result<Vec<String>> {
+    let chat_cfg = cfg
+        .chat
+        .as_ref()
+        .ok_or_else(|| anyhow!("未配置对话模型：请到「设置」里填写对话端点（问答需要它）"))?;
+    let messages = vec![
+        ChatMessage::system(
+            "你是笔记问答助手。根据用户的问题与助手回答，给出 3 个用户可能想继续追问的中文问题。\
+每行一个，不要编号、不要引号、不要解释，每条不超过 20 字。",
+        ),
+        ChatMessage::user(format!(
+            "问题：{}\n\n回答（节选）：{}",
+            question.trim(),
+            truncate_chars(answer.trim(), 800)
+        )),
+    ];
+    let reply = models::chat(
+        chat_cfg,
+        &messages,
+        &ChatOptions { max_tokens: Some(200), temperature: Some(0.5), ..Default::default() },
+    )
+    .await?;
+    Ok(parse_suggestions(&reply.content))
+}
+
 /// 流式问答事件（经 Tauri Channel 推给前端）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
@@ -279,6 +330,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("未配置对话模型"), "{err}");
+    }
+
+    #[test]
+    fn parse_suggestions_strips_numbering_and_dedupes() {
+        let text = "1. 镜像站还有哪些替代？\n2、部署文档写完了吗？\n- 镜像站还有哪些替代？\n\n3) 回滚步骤是什么？\n4. 第四条应被丢弃";
+        let list = parse_suggestions(text);
+        assert_eq!(
+            list,
+            vec!["镜像站还有哪些替代？", "部署文档写完了吗？", "回滚步骤是什么？"]
+        );
+    }
+
+    #[test]
+    fn parse_suggestions_ignores_short_or_long_lines() {
+        assert!(parse_suggestions("好的\n这一行特别长特别长特别长特别长特别长特别长特别长特别长特别长特别长特别长特别长").is_empty());
     }
 
     #[tokio::test]

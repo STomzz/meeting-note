@@ -100,6 +100,19 @@ describe('chat store（流式，浏览器预览适配器）', () => {
     expect(s.entries).toHaveLength(0)
   })
 
+  it('追问建议：按需生成 3 条', async () => {
+    const s = useChatStore()
+    await s.loadHistory()
+    await s.ask('镜像拉取超时')
+    const entry = s.entries[0]
+    expect(entry.suggestions).toBeUndefined()
+
+    await s.loadSuggestions(entry)
+    expect(entry.suggestions).toHaveLength(3)
+    expect(entry.suggesting).toBe(false)
+    expect(entry.suggestions?.[0]).toContain('镜像')
+  })
+
   it('历史落盘后可重新读出（预览模式走 localStorage）', async () => {
     const s = useChatStore()
     await s.loadHistory()

@@ -8,6 +8,7 @@ import {
   type Capability,
   type ModelConfigInput,
 } from '../core/models'
+import { getThemeMode, setThemeMode, type ThemeMode } from '../core/theme'
 import { useSettingsStore } from '../stores/settings'
 import { useChatStore } from '../stores/chat'
 import { useNotesStore } from '../stores/notes'
@@ -21,6 +22,15 @@ const notesStore = useNotesStore()
 const meeting = useMeetingNoteStore()
 const legacy = useMeetingsStore()
 const inTauri = isTauri()
+
+// 外观：主题三态（与侧栏按钮同步）
+const themeMode = ref<ThemeMode>(getThemeMode())
+
+function onThemeChange(value: unknown) {
+  const mode: ThemeMode = value === 'light' || value === 'dark' ? value : 'auto'
+  themeMode.value = mode
+  setThemeMode(mode)
+}
 
 // 数据维护：旧会议导出 + 录音自检
 const migrating = ref(false)
@@ -197,6 +207,23 @@ function paramsPlaceholder(cap: Capability): string {
     <div class="settings-body">
       <div v-if="!inTauri" class="card tip">
         浏览器预览模式：配置只存在浏览器本地，不能发起真实请求（测试连接请在桌面客户端里做）。
+      </div>
+
+      <div class="card">
+        <div class="card-title">外观</div>
+        <div class="card-note">
+          主题默认跟随系统；也可以固定浅色或深色。切换立即生效，重启后保留（侧栏左下角按钮同样可切）。
+        </div>
+        <t-radio-group
+          :value="themeMode"
+          variant="default-filled"
+          size="small"
+          @change="onThemeChange($event)"
+        >
+          <t-radio-button value="auto">跟随系统</t-radio-button>
+          <t-radio-button value="light">浅色</t-radio-button>
+          <t-radio-button value="dark">深色</t-radio-button>
+        </t-radio-group>
       </div>
 
       <div class="card">

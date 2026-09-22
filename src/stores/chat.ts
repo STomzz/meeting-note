@@ -21,6 +21,10 @@ export interface ChatEntry extends StoredEntry {
   streaming?: boolean
   /** 思考过程（部分模型返回 reasoning_content） */
   reasoning?: string
+  /** 追问建议（按需生成，不落盘） */
+  suggestions?: string[]
+  /** 追问建议请求中 */
+  suggesting?: boolean
 }
 
 let seq = 1
@@ -256,6 +260,7 @@ export const useChatStore = defineStore('chat', {
       entry.stopped = false
       entry.error = ''
       entry.reasoning = ''
+      entry.suggestions = undefined
       entry.answer = undefined
       try {
         entry.answer = await retrievalAdapter().askStream(entry.question, (ev) =>
@@ -302,6 +307,22 @@ export const useChatStore = defineStore('chat', {
           entry.answer = ev.answer
           entry.pending = false
           entry.streaming = false
+      }
+    },
+
+    /** 按需拉取追问建议（一次请求，注意上游限流）。 */
+    async loadSuggestions(entry: ChatEntry) {
+      const answer = entry.answer?.answer?.trim()
+      if (!answer || entry.suggesting) return
+      entry.suggesting = true
+      try {
+        entry.suggestions = await retrievalAdapter().suggest(entry.question, answer)
+        if (!entry.suggestions.length) entry.suggestions = undefined
+      } catch (e) {
+        entry.suggestions = undefined
+        entry.error = entry.error ? `${entry.error}\n${String(e)}` : String(e)
+      } finally {
+        entry.suggesting = false
       }
     },
 

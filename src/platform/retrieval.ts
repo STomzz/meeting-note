@@ -17,6 +17,8 @@ export interface RetrievalAdapter {
   askStream(question: string, onEvent: (ev: QaStreamEvent) => void, topK?: number): Promise<Answer>
   /** 请求停止当前流式问答（下一次增量检查时生效）。 */
   cancel(): Promise<void>
+  /** 追问建议（按需触发，一次请求最多 3 条）。 */
+  suggest(question: string, answer: string): Promise<string[]>
 }
 
 class TauriRetrievalAdapter implements RetrievalAdapter {
@@ -36,6 +38,9 @@ class TauriRetrievalAdapter implements RetrievalAdapter {
   }
   cancel() {
     return invoke<void>('qa_cancel')
+  }
+  suggest(question: string, answer: string) {
+    return invoke<string[]>('qa_suggest', { question, answer })
   }
 }
 
@@ -138,6 +143,16 @@ class MockRetrievalAdapter implements RetrievalAdapter {
 
   async cancel() {
     this.cancelled = true
+  }
+
+  /** 预览模式：给出与问题相关的示例追问（不调用模型）。 */
+  async suggest(question: string): Promise<string[]> {
+    const short = question.replace(/\s+/g, ' ').slice(0, 12)
+    return [
+      `关于「${short}」还有哪些细节？`,
+      '相关笔记里有哪些待办？',
+      '这个结论的依据是什么？',
+    ]
   }
 
   private cancelled = false

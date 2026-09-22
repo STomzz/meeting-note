@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { isTauri } from './platform'
 import RecorderPanel from './components/RecorderPanel.vue'
 import {
+  THEME_EVENT,
   THEME_LABELS,
   getThemeMode,
   initTheme,
@@ -22,11 +23,20 @@ const modeText = computed(() => (isTauri() ? '桌面客户端模式' : '浏览�
 const theme = ref<ThemeMode>(getThemeMode())
 let disposeTheme: (() => void) | null = null
 
+function onThemeEvent(event: Event) {
+  const mode = (event as CustomEvent<ThemeMode>).detail
+  if (mode === 'auto' || mode === 'light' || mode === 'dark') theme.value = mode
+}
+
 onMounted(() => {
   disposeTheme = initTheme()
+  window.addEventListener(THEME_EVENT, onThemeEvent)
 })
 
-onBeforeUnmount(() => disposeTheme?.())
+onBeforeUnmount(() => {
+  disposeTheme?.()
+  window.removeEventListener(THEME_EVENT, onThemeEvent)
+})
 
 const themeIcon = computed(() =>
   theme.value === 'dark' ? 'moon' : theme.value === 'light' ? 'sunny' : 'desktop',

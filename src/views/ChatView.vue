@@ -435,6 +435,15 @@ function stepList(e: ChatEntry): string[] {
                 <t-icon name="file-add" size="14px" />
                 <span>存为笔记</span>
               </button>
+              <button
+                class="icon-btn"
+                title="让模型给几个可能的追问（会调用一次模型）"
+                :disabled="e.suggesting"
+                @click="chat.loadSuggestions(e)"
+              >
+                <t-icon name="lightbulb" size="14px" />
+                <span>{{ e.suggesting ? '生成中…' : '猜你想问' }}</span>
+              </button>
               <span class="spacer" />
               <span class="answer-meta">
                 {{ modeLabel(e.answer.trace.mode) }}
@@ -442,6 +451,18 @@ function stepList(e: ChatEntry): string[] {
                   · {{ e.answer.completionTokens }} tokens
                 </template>
               </span>
+            </div>
+
+            <div v-if="e.suggestions?.length" class="suggests fade-in">
+              <span class="suggests-label">继续追问</span>
+              <button
+                v-for="q in e.suggestions"
+                :key="q"
+                class="sample suggest-chip"
+                @click="useSample(q)"
+              >
+                {{ q }}
+              </button>
             </div>
 
             <div v-if="e.answer.sources.length" class="sources">
@@ -881,6 +902,24 @@ function stepList(e: ChatEntry): string[] {
 .answer-meta {
   font-size: 11.5px;
   color: var(--text-3);
+}
+
+.suggests {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.suggests-label {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.suggest-chip {
+  font-size: 12.5px;
+  padding: 4px 12px;
 }
 
 .sources {
