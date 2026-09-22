@@ -3,7 +3,7 @@
 use rusqlite::{Connection, Result};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 打开（或创建）数据库文件，启用 WAL 并执行迁移。
 pub fn open(path: &Path) -> Result<Connection> {
@@ -19,6 +19,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 内存库（测试用）。
 pub fn open_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -64,6 +65,17 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        -- 块向量（暴力检索：个人知识库规模足够，避免引入向量库依赖）
+        -- 每个块只保留一份向量，切换嵌入模型后旧向量会被覆盖（按 model 过滤使用）。
+        CREATE TABLE IF NOT EXISTS chunk_vectors (
+            chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+            model      TEXT NOT NULL,
+            dim        INTEGER NOT NULL,
+            vec        BLOB NOT NULL,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_vectors_model ON chunk_vectors(model);
         "#,
     )?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

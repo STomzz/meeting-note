@@ -5,7 +5,7 @@ import type { NoteMeta, NotesAdapter, ScanStats, SearchHit } from '../core/types
  * 让 `npm run dev` 在浏览器里也能点开笔记模块看 UI，不参与打包后的真实数据。
  */
 
-const SEED: Array<[string, string]> = [
+export const SEED: Array<[string, string]> = [
   [
     '欢迎使用 BNU Notes.md',
     `# 欢迎使用 BNU Notes\n\n这是一个**纯本地**的知识库客户端：笔记、图谱、会议数据都在你本机。\n\n## 快速上手\n\n- 左侧列表可以搜索、按文件夹筛选\n- 右侧编辑，\`Ctrl/Cmd + S\` 保存\n- 云端只用来调用模型（嵌入 / 重排 / 对话 / 转写），可在设置里配置\n\n> 当前是浏览器预览模式，数据存在内存里。`,
@@ -20,7 +20,7 @@ const SEED: Array<[string, string]> = [
   ],
 ]
 
-function splitTitle(content: string, fallback: string): { title: string; tags: string } {
+export function splitTitle(content: string, fallback: string): { title: string; tags: string } {
   const h1 = content.match(/^#\s+(.+)$/m)
   const fm = content.match(/^---\n([\s\S]*?)\n---/)
   let tags = ''

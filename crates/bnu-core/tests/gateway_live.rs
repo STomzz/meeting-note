@@ -130,3 +130,66 @@ async fn live_test_capability_all() {
         }
     }
 }
+
+/// 端到端：索引 → 构建向量 → 混合检索 + 重排 → 问答（带引用）。
+#[tokio::test]
+#[ignore]
+async fn live_qa_end_to_end() {
+    use bnu_core::{db, notes, qa, retrieval, vectors};
+    use std::sync::Mutex;
+
+    let cfg = live_config();
+    assert_key(&cfg);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("周会.md"),
+        "# 周会纪要\n\n2026-09-20 周会：讨论了镜像拉取超时的问题，决定改用镜像站并重试；下周三前完成部署。\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("读书.md"),
+        "# 读书笔记\n\n今天读了 Rust 所有权的章节，理解了借用检查。\n",
+    )
+    .unwrap();
+
+    let conn = db::open_memory().unwrap();
+    let stats = notes::scan_vault(&conn, dir.path()).unwrap();
+    println!("索引：{} 篇", stats.indexed);
+    let m = Mutex::new(conn);
+
+    let progress = vectors::build(&m, cfg.embedding.as_ref().unwrap(), 16, 64).await.unwrap();
+    println!(
+        "向量索引：embedded={} remaining={} dim={} {}ms",
+        progress.embedded, progress.remaining, progress.dim, progress.elapsed_ms
+    );
+    assert_eq!(progress.remaining, 0);
+
+    let status = {
+        let c = m.lock().unwrap();
+        retrieval::status(&c, &cfg).unwrap()
+    };
+    println!(
+        "状态：chunks={} vectors={} ready={}",
+        status.chunks, status.vectors, status.vector_ready
+    );
+    assert!(status.vector_ready);
+
+    let answer = qa::answer(&m, &cfg, "镜像拉取超时最后是怎么解决的？", 6).await.unwrap();
+    println!(
+        "模式={} 耗时={}ms tokens={:?}\n回答：{}",
+        answer.trace.mode, answer.elapsed_ms, answer.completion_tokens, answer.answer
+    );
+    for (i, s) in answer.sources.iter().enumerate() {
+        println!(
+            "  [{}] {} 第 {}-{} 行 来源={:?}",
+            i + 1,
+            s.note_id,
+            s.start_line,
+            s.end_line,
+            s.sources
+        );
+    }
+    assert!(!answer.answer.is_empty());
+    assert!(answer.sources.iter().any(|s| s.note_id == "周会.md"));
+    assert_eq!(answer.trace.mode, "hybrid+rerank");
+}

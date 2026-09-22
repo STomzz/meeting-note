@@ -3,8 +3,11 @@
 use bnu_core::db;
 use bnu_core::models::{self, ModelConfig, PublicModelConfig};
 use bnu_core::notes::{self, NoteMeta, ScanStats, SearchHit};
+use bnu_core::qa::{self, Answer};
+use bnu_core::retrieval::{self, RetrievalStatus};
 use bnu_core::rusqlite::{Connection, Result as SqlResult};
 use bnu_core::secret::SecretBox;
+use bnu_core::vectors::{self, EmbedProgress};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -165,6 +168,56 @@ async fn list_available_models(
     models::list_models(&endpoint).await.map_err(err)
 }
 
+// ---------------------------------------------------------------------------
+// 检索与问答
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn retrieval_status(state: State<'_, AppState>) -> Result<RetrievalStatus, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    let cfg = models::load_config(&conn, &state.secret).map_err(err)?;
+    retrieval::status(&conn, &cfg).map_err(err)
+}
+
+#[tauri::command]
+async fn build_vector_index(
+    batch: Option<usize>,
+    max_chunks: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<EmbedProgress, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    let embedding = cfg
+        .embedding
+        .as_ref()
+        .ok_or_else(|| "未配置嵌入模型：请到「设置」配置嵌入端点后再构建向量索引".to_string())?;
+    vectors::build(
+        &state.conn,
+        embedding,
+        batch.unwrap_or(16),
+        max_chunks.unwrap_or(256),
+    )
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+async fn ask_question(
+    question: String,
+    top_k: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Answer, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    qa::answer(&state.conn, &cfg, &question, top_k.unwrap_or(6))
+        .await
+        .map_err(err)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -213,7 +266,10 @@ pub fn run() {
             get_model_config,
             save_model_config,
             test_model,
-            list_available_models
+            list_available_models,
+            retrieval_status,
+            build_vector_index,
+            ask_question
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

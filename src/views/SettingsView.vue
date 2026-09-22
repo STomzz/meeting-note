@@ -9,9 +9,11 @@ import {
   type ModelConfigInput,
 } from '../core/models'
 import { useSettingsStore } from '../stores/settings'
+import { useChatStore } from '../stores/chat'
 import { isTauri } from '../platform'
 
 const store = useSettingsStore()
+const chat = useChatStore()
 const inTauri = isTauri()
 
 interface Draft {
@@ -35,6 +37,7 @@ onMounted(async () => {
   await store.load()
   fillFromConfig()
   devPrefill()
+  void chat.loadStatus()
 })
 
 /** 开发模式便利：未配置的能力自动填入推荐端点与 .env.local 里的测试 Key（仍需手动点保存）。 */
@@ -267,6 +270,31 @@ function paramsPlaceholder(cap: Capability): string {
       </div>
 
       <div class="card">
+        <div class="card-title">检索索引</div>
+        <div class="card-note">
+          全文索引随 vault 扫描自动维护；配置嵌入模型后可构建向量索引，检索升级为"全文 + 语义"混合召回（问答页可看到当前模式）。
+        </div>
+        <div class="index-row">
+          <span class="stat">笔记块 {{ chat.status?.chunks ?? 0 }}</span>
+          <span class="stat">向量 {{ chat.status?.vectors ?? 0 }}</span>
+          <span v-if="chat.status?.hasEmbedding" class="stat">待构建 {{ chat.status?.pending ?? 0 }}</span>
+          <span class="spacer" />
+          <t-button
+            size="small"
+            :disabled="!inTauri || !chat.status?.hasEmbedding"
+            :loading="chat.building"
+            @click="chat.buildIndex()"
+          >
+            构建向量索引
+          </t-button>
+        </div>
+        <div v-if="chat.buildMessage" class="card-note">{{ chat.buildMessage }}</div>
+        <div v-if="!chat.status?.hasEmbedding" class="card-note">
+          未配置嵌入模型：检索使用全文匹配（FTS5 trigram，中文友好），功能正常。
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-title">存储与备份（P7 实现）</div>
         <div class="card-note">
           笔记 vault 目录、zip 导出/导入、数据占用统计。全部数据只保存在本机。
@@ -365,6 +393,18 @@ function paramsPlaceholder(cap: Capability): string {
   color: var(--text-2);
   line-height: 1.6;
   word-break: break-all;
+}
+
+.index-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.stat {
+  font-size: 12px;
+  color: var(--text-3);
 }
 
 .spacer {

@@ -301,6 +301,23 @@ pub fn delete_note(conn: &Connection, root: &Path, id: &str) -> Result<()> {
     remove_from_index(conn, id)
 }
 
+/// 查询词 >= 3 字符时返回 FTS5 MATCH 表达式；更短返回 `None`（调用方走 LIKE 兜底）。
+pub fn fts_match_expr(query: &str) -> Option<String> {
+    let q = query.trim();
+    if q.chars().count() < 3 {
+        return None;
+    }
+    let terms: Vec<String> = q
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" AND "))
+    }
+}
+
 /// 全文检索。
 ///
 /// - 查询 >= 3 字符：FTS5 trigram 子串匹配（中文友好）；
@@ -331,11 +348,9 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Search
         return Ok(rows.flatten().collect());
     }
 
-    let terms: Vec<String> = q
-        .split_whitespace()
-        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect();
-    let match_expr = terms.join(" AND ");
+    let Some(match_expr) = fts_match_expr(q) else {
+        return Ok(Vec::new());
+    };
 
     let mut stmt = conn.prepare(
         r#"SELECT f.note_id, f.title, c.start_line, c.end_line,

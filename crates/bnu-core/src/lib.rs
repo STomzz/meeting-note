@@ -11,7 +11,10 @@ pub mod db;
 pub mod markdown;
 pub mod models;
 pub mod notes;
+pub mod qa;
+pub mod retrieval;
 pub mod secret;
+pub mod vectors;
 
 /// 重导出，方便上层（Tauri 壳）使用同一版本的 rusqlite 类型。
 pub use rusqlite;
