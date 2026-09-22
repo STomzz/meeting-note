@@ -11,13 +11,16 @@
 | Actions 页手动 `workflow_dispatch` | 只上传为 workflow artifact（需登录 GitHub 才能下） |
 
 - runner：`windows-latest`（x64）；产物路径 `src-tauri/target/release/bundle/{nsis,msi}/`
-- 版本号取 `src-tauri/tauri.conf.json`（当前 `0.1.1`），文件名形如 `bnu-notes_0.1.1_x64-setup.exe`
+- 版本号取 `src-tauri/tauri.conf.json` 里的 `version`，文件名形如 `bnu-notes_<版本>_x64-setup.exe`
 - 安装包内**不含任何密钥**：网关地址与 API Key 由用户在应用内「设置 → 模型能力」填写
 
 ## 安装
 
 - **未做代码签名**：首次运行会触发 SmartScreen（「更多信息 → 仍要运行」）。内网自用可接受，
   要消除提示需买代码签名证书，并在 `tauri.conf.json` 配 `bundle.windows.certificateThumbprint`。
+- **Smart App Control（智能应用控制）会直接拦未签名应用**：Win11 上如果「安全中心 → 应用和浏览器控制 →
+  智能应用控制」处于开启状态，安装/运行可能被阻断且没有「仍要运行」。自用机器可在同一页面把它关掉
+  （关闭后不可再打开，除非重装系统——自己权衡），或改用组策略/签名方案。
 - NSIS 安装包默认**按当前用户安装**（`NSISInstallerMode::CurrentUser`，不需要管理员）。
 - WebView2 运行时：Win11 自带；Win10 缺失时安装包会静默下载 bootstrapper（需要联网）。
 
