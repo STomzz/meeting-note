@@ -373,16 +373,16 @@ function paramsPlaceholder(cap: Capability): string {
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-l);
   padding: 16px;
   margin-bottom: 16px;
   max-width: 880px;
 }
 
 .card.tip {
-  background: #fffbe6;
-  border-color: #ffe58f;
-  color: #7c5e00;
+  background: var(--warning-weak);
+  border-color: var(--border);
+  color: var(--warning);
   font-size: 12px;
 }
 
@@ -401,7 +401,7 @@ function paramsPlaceholder(cap: Capability): string {
 
 .cap-card {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-m);
   padding: 12px;
   margin-top: 12px;
 }

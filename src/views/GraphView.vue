@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { Graph } from '@antv/g6'
 import { useRouter } from 'vue-router'
@@ -82,8 +82,29 @@ function toG6Data(snapshot: GraphSnapshot) {
   return { nodes, edges }
 }
 
+function cssVar(name: string, fallback: string): string {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return value || fallback
+}
+
+/** 主题切换（浅色/深色）后重建画布：G6 的 canvas 样式不会跟着 CSS 变量走。 */
+let themeObserver: MutationObserver | null = null
+
+async function remountGraph() {
+  const old = graph
+  graph = null
+  old?.destroy()
+  await nextTick()
+  await mountGraph()
+}
+
 async function mountGraph() {
   if (graph || !container.value) return
+  const labelFill = cssVar('--text-2', '#475569')
+  const edgeLabelFill = cssVar('--text-3', '#94a3b8')
+  const edgeStroke = cssVar('--border-strong', '#cbd5e1')
+  const selectedStroke = cssVar('--text', '#0f172a')
+  const labelBg = cssVar('--panel', '#ffffff')
   graph = new Graph({
     container: container.value,
     autoResize: true,
@@ -104,24 +125,24 @@ async function mountGraph() {
         cursor: 'pointer',
         labelPlacement: 'bottom',
         labelFontSize: 11,
-        labelFill: '#475569',
+        labelFill,
+        labelBackgroundFill: labelBg,
         labelBackground: true,
-        labelBackgroundFill: 'rgba(255,255,255,0.85)',
         labelBackgroundRadius: 4,
         labelPadding: [1, 4],
       },
       state: {
-        selected: { lineWidth: 3, stroke: '#0f172a' },
+        selected: { lineWidth: 3, stroke: selectedStroke },
       },
     },
     edge: {
       style: {
-        stroke: '#cbd5e1',
+        stroke: edgeStroke,
         endArrowSize: 6,
         labelFontSize: 10,
-        labelFill: '#94a3b8',
+        labelFill: edgeLabelFill,
         labelBackground: true,
-        labelBackgroundFill: 'rgba(255,255,255,0.85)',
+        labelBackgroundFill: labelBg,
         labelBackgroundRadius: 3,
       },
     },
@@ -180,8 +201,8 @@ async function openNote(noteId: string, line?: number) {
   try {
     if (!notes.notes.length) await notes.init()
     await notes.openNote(noteId)
+    if (line) notes.locateNote(noteId, line)
     await router.push('/notes')
-    void MessagePlugin.info(line ? `已打开「${noteId}」（第 ${line} 行附近）` : `已打开「${noteId}」`)
   } catch (e) {
     void MessagePlugin.error(String(e))
   }
@@ -197,9 +218,16 @@ onMounted(async () => {
   await store.bindProgress()
   await store.refresh()
   await mountGraph()
+  themeObserver = new MutationObserver(() => void remountGraph())
+  themeObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['theme-mode'],
+  })
 })
 
 onBeforeUnmount(() => {
+  themeObserver?.disconnect()
+  themeObserver = null
   graph?.destroy()
   graph = null
   store.unbindProgress()
@@ -388,8 +416,8 @@ function openMention(m: EntityMention) {
   background: var(--panel);
 }
 .banner.err {
-  color: #b91c1c;
-  background: #fef2f2;
+  color: var(--danger);
+  background: var(--brand-weak);
 }
 .banner-text {
   flex: 1;
@@ -440,7 +468,7 @@ function openMention(m: EntityMention) {
 .canvas {
   flex: 1;
   min-width: 0;
-  background: #fbfcfe;
+  background: var(--panel);
 }
 .detail {
   width: 320px;
@@ -487,7 +515,7 @@ function openMention(m: EntityMention) {
   cursor: pointer;
 }
 .nb:hover {
-  background: #eef2f7;
+  background: var(--hover);
 }
 .nb .dir {
   color: var(--text-3);
@@ -515,7 +543,7 @@ function openMention(m: EntityMention) {
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
-  color: #1d4ed8;
+  color: var(--primary);
 }
 .note-count {
   color: var(--text-3);
@@ -528,14 +556,14 @@ function openMention(m: EntityMention) {
   cursor: pointer;
 }
 .mention:hover {
-  background: #f8fafc;
+  background: var(--hover);
 }
 .m-head {
   color: var(--text-3);
   margin-bottom: 3px;
 }
 .m-snippet {
-  color: var(--text-2, #334155);
+  color: var(--text-2);
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
