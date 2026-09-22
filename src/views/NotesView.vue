@@ -726,7 +726,9 @@ async function removeCurrent() {
         <t-input v-model="renameValue" @enter="doRename" />
       </div>
       <div v-if="renameTarget?.kind === 'note'" class="dialog-hint">
-        只改文件名；笔记里的内容与录音引用不受影响，别处对这篇笔记的链接不会自动更新。
+        标题（正文第一个 <code>#</code> 行）一定会改；文件名与标题一致时文件名同步改
+        （<code>会议/2026-09-22-周会.md</code> 这类带日期的文件名保持不变）。
+        录音与 `/v` 引用不受影响，别处的链接不会自动更新。
       </div>
     </t-dialog>
 

@@ -476,34 +476,87 @@ pub fn move_note(conn: &Connection, root: &Path, id: &str, folder: &str) -> Resu
     Ok(candidate)
 }
 
-/// 重命名笔记（同目录，仅换标题；重名自动加序号），返回新 id。
+/// 重命名笔记（同目录），返回新 id。
+///
+/// 语义：**标题 = 正文第一个 H1**，重命名一定会改 H1（树上的名字就是它）。
+/// 文件名只在「原本就与标题一致」时才跟着改（`新建笔记` 建出来的就是这种）；
+/// 像 `会议/2026-09-22-周会.md` 这种文件名带日期、H1 是「周会」的，只改标题不动文件名，
+/// 避免重命名把日期前缀弄丢、也避免录音目录跟着换。
 pub fn rename_note(conn: &Connection, root: &Path, id: &str, title: &str) -> Result<String> {
     ensure_safe_id(id)?;
+    let title = title.trim();
+    anyhow::ensure!(!title.is_empty(), "标题不能为空");
     let old = root.join(id);
     anyhow::ensure!(old.is_file(), "笔记不存在：{id}");
-    let folder = folder_of(id);
-    let base = safe_filename(title);
-    let mut candidate = if folder.is_empty() {
-        format!("{base}.md")
-    } else {
-        format!("{folder}/{base}.md")
-    };
-    if candidate == id {
-        return Ok(id.to_string());
-    }
-    let mut n = 2;
-    while root.join(&candidate).exists() {
-        candidate = if folder.is_empty() {
-            format!("{base}-{n}.md")
+
+    let content = std::fs::read_to_string(&old).unwrap_or_default();
+    let stem = Path::new(id)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    // 没有 H1 时文件名就是标题，同样跟随；有 H1 则要求改名前两者一致
+    let in_sync = first_h1(&content).map(|h| h == stem).unwrap_or(true);
+
+    let mut new_id = id.to_string();
+    if in_sync {
+        let folder = folder_of(id);
+        let base = safe_filename(title);
+        let mut candidate = if folder.is_empty() {
+            format!("{base}.md")
         } else {
-            format!("{folder}/{base}-{n}.md")
+            format!("{folder}/{base}.md")
         };
-        n += 1;
+        let mut n = 2;
+        while root.join(&candidate).exists() && candidate != id {
+            candidate = if folder.is_empty() {
+                format!("{base}-{n}.md")
+            } else {
+                format!("{folder}/{base}-{n}.md")
+            };
+            n += 1;
+        }
+        if candidate != id {
+            std::fs::rename(&old, root.join(&candidate))
+                .with_context(|| format!("重命名笔记失败: {}", old.display()))?;
+            new_id = candidate;
+        }
     }
-    std::fs::rename(&old, root.join(&candidate))
-        .with_context(|| format!("重命名笔记失败: {}", old.display()))?;
+
+    if let Some(updated) = replace_first_h1(&content, title) {
+        let path = root.join(&new_id);
+        std::fs::write(&path, updated)
+            .with_context(|| format!("更新笔记标题失败: {}", path.display()))?;
+    }
     scan_vault(conn, root)?;
-    Ok(candidate)
+    Ok(new_id)
+}
+
+/// 正文里第一个 H1 的标题文本（没有 H1 → None）。
+fn first_h1(content: &str) -> Option<String> {
+    content.lines().find_map(|l| {
+        l.trim_start()
+            .strip_prefix("# ")
+            .map(|t| t.trim().to_string())
+    })
+}
+
+/// 把正文里第一个 H1 换成新标题（保留结尾换行风格）；没有 H1 或内容不变时返回 None。
+fn replace_first_h1(content: &str, title: &str) -> Option<String> {
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    let idx = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("# "))?;
+    lines[idx] = format!("# {title}");
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    if out == content {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// 查询词 >= 3 字符时返回 FTS5 MATCH 表达式；更短返回 `None`（调用方走 LIKE 兜底）。
@@ -873,9 +926,12 @@ mod tests {
             "不允许带路径"
         );
 
-        // 重命名笔记：索引里旧 id 消失、新 id 出现
+        // 重命名笔记（标题与文件名一致）：文件跟着改，H1 同步
         let rid = rename_note(&conn, root, "工作/周会.md", "周会（重命名）").unwrap();
         assert_eq!(rid, "工作/周会（重命名）.md");
+        assert!(std::fs::read_to_string(root.join(&rid))
+            .unwrap()
+            .contains("# 周会（重命名）"));
         let ids: Vec<String> = list_notes(&conn)
             .unwrap()
             .into_iter()
@@ -888,5 +944,24 @@ mod tests {
             1,
             "重命名后全文索引仍可用"
         );
+
+        // 重命名笔记（会议那种文件名带日期、H1 与文件名不一致）：只改标题，文件名与 id 不动
+        write(
+            root,
+            "会议/2026-09-22-示例周会.md",
+            "# 示例周会\n\n纪要正文。\n",
+        );
+        let mid =
+            rename_note(&conn, root, "会议/2026-09-22-示例周会.md", "示例周会（改）").unwrap();
+        assert_eq!(mid, "会议/2026-09-22-示例周会.md", "文件名带日期时保持不动");
+        assert!(std::fs::read_to_string(root.join(&mid))
+            .unwrap()
+            .contains("# 示例周会（改）"));
+        let titles: Vec<String> = list_notes(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.title)
+            .collect();
+        assert!(titles.contains(&"示例周会（改）".to_string()), "{titles:?}");
     }
 }

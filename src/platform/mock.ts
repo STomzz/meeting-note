@@ -189,17 +189,28 @@ export class MockNotesAdapter implements NotesAdapter {
   async renameNote(id: string, title: string): Promise<string> {
     const content = this.files.get(id)
     if (content === undefined) throw new Error(`笔记不存在：${id}`)
-    const folder = id.includes('/') ? id.slice(0, id.lastIndexOf('/')) : ''
-    const stem = title.trim().replace(/[\\/:*?"<>|]/g, '-').replace(/^[.\s]+|[.\s]+$/g, '')
-    let next = folder ? `${folder}/${stem}.md` : `${stem}.md`
-    let n = 2
-    while (this.files.has(next)) {
-      next = folder ? `${folder}/${stem}-${n}.md` : `${stem}-${n}.md`
-      n += 1
+    const cleanTitle = title.trim()
+    if (!cleanTitle) throw new Error('标题不能为空')
+    const file = id.split('/').pop() as string
+    const stem = file.replace(/\.md$/i, '')
+    const h1 = content.match(/^[ \t]*# (.+)$/m)?.[1]?.trim()
+    const inSync = h1 === undefined || h1 === stem
+
+    let next = id
+    if (inSync) {
+      const folder = id.includes('/') ? id.slice(0, id.lastIndexOf('/')) : ''
+      const base = cleanTitle.replace(/[\\/:*?"<>|]/g, '-').replace(/^[.\s]+|[.\s]+$/g, '')
+      next = folder ? `${folder}/${base}.md` : `${base}.md`
+      let n = 2
+      while (this.files.has(next) && next !== id) {
+        next = folder ? `${folder}/${base}-${n}.md` : `${base}-${n}.md`
+        n += 1
+      }
     }
-    if (next === id) return id
-    this.files.delete(id)
-    this.files.set(next, content)
+    const updated =
+      h1 === undefined ? content : content.replace(/^([ \t]*)# .+$/m, `$1# ${cleanTitle}`)
+    if (next !== id) this.files.delete(id)
+    this.files.set(next, updated)
     return next
   }
 
