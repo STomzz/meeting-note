@@ -3,7 +3,7 @@
  * 块编辑器（所见即所得）。
  *
  * - 正文按「块」渲染成排版后的样子：点某一段进编辑，点别处 / Ctrl+Enter 写回；
- * - 编辑空段时输入 `#` 或 `/` 弹出块类型菜单（正文 / 一级标题 / …），选完回车就是排版结果；
+ * - 编辑空段时输入 `#` / `##` / `/` 弹出块类型菜单（正文 / 一级标题 / …），选完回车就是排版结果；
  * - 只替换被编辑的那一块：其它块（会议笔记里的 `/v` 引用、`> 🎙 转写`、纪要段）逐字节不动。
  */
 import { computed, nextTick, onBeforeUnmount, ref, watch, type ComponentPublicInstance } from 'vue'
@@ -15,8 +15,8 @@ import {
   applyPreset,
   blockAtLine,
   detectKind,
-  insertBlockAfter,
   dropBlock,
+  insertBlockAfter,
   insertBlocksBefore,
   insertParagraphAfter,
   insertParagraphAtIndex,
