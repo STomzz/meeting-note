@@ -239,6 +239,22 @@ describe('会议笔记 store（引用插入）', () => {
     store.clearPendingRef()
     expect(store.pendingRef).toBeNull()
   })
+
+  it('loadRefs：只刷新引用列表（编辑器存盘后重算「未引用」用）', async () => {
+    const store = useMeetingNoteStore()
+    await store.loadRefs(NOTE_ID)
+    expect(store.refs.map((r) => r.fileName)).toEqual(['seg_0001.wav'])
+    expect(store.error).toBe('')
+    await store.loadRefs('会议/别的笔记.md')
+    expect(store.refs).toEqual([])
+  })
+
+  it('loadRefs：没传 id 又没打开过笔记时什么都不做', async () => {
+    const store = useMeetingNoteStore()
+    await store.loadRefs()
+    expect(store.currentId).toBe('')
+    expect(store.refs).toEqual([])
+  })
 })
 
 describe('会议笔记 store（录音面板）', () => {

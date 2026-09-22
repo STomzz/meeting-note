@@ -7,7 +7,8 @@
  * - 只替换被编辑的那一块：其它块（会议笔记里的 `/v` 引用、`> 🎙 转写`、纪要段）逐字节不动。
  */
 import { computed, nextTick, onBeforeUnmount, ref, watch, type ComponentPublicInstance } from 'vue'
-import { MINUTES_HEADING } from '../core/meetingNote'
+import { MINUTES_HEADING, formatDur, parseRefLine, slashCommandAt } from '../core/meetingNote'
+import { filterRefOptions, refLineFor, type RefOption } from '../core/refPicker'
 import {
   BLOCK_PRESETS,
   appendBlocks,
@@ -16,6 +17,7 @@ import {
   blockAtLine,
   detectKind,
   dropBlock,
+  dropBlockTidy,
   insertBlockAfter,
   insertBlocksBefore,
   insertParagraphAfter,
@@ -33,8 +35,10 @@ const props = withDefaults(
     /** 单块 markdown → HTML（父组件提供，含 `/v` 播放器替换等） */
     render: (md: string) => string
     editable?: boolean
+    /** `/v` 选择器候选（父组件已按「本笔记优先 / 未引用优先」排好序） */
+    refOptions?: RefOption[]
   }>(),
-  { editable: true },
+  { editable: true, refOptions: () => [] },
 )
 
 const emit = defineEmits<{ (e: 'update:content', value: string): void }>()
@@ -49,6 +53,24 @@ const flashId = ref<number | null>(null)
 const menuAbove = ref(false)
 /** 当前这一轮编辑的输入框元素：只有它的 blur 才算「用户点到别处」。 */
 let sessionEl: HTMLTextAreaElement | null = null
+
+/** `/v` 录音选择器（和块类型菜单互斥） */
+const refOpen = ref(false)
+const refIndex = ref(0)
+const refFilter = ref('')
+const refMatches = computed(() => filterRefOptions(props.refOptions, refFilter.value))
+
+/** 引用行右侧「⋯」菜单 */
+const refMenuId = ref<number | null>(null)
+const copied = ref(false)
+/** 下方空间不够时把「⋯」菜单翻到引用行上方 */
+const menuAboveRef = ref(false)
+let copiedTimer = 0
+
+/** 操作提示只在本次会话第一次进编辑时露一下 */
+let hintShown = false
+const showHint = ref(false)
+let hintTimer = 0
 
 /** 正在编辑的输入框。注意它在 v-for 里，模板 ref 会变成数组，所以用函数 ref。 */
 const taEl = ref<HTMLTextAreaElement | null>(null)
@@ -80,6 +102,8 @@ watch(
     blocks.value = splitBlocks(value)
     editingId.value = null
     menuOpen.value = false
+    refOpen.value = false
+    refMenuId.value = null
   },
 )
 
@@ -103,8 +127,19 @@ function startEdit(block: Block, caret: 'start' | 'end' = 'end') {
   editingId.value = block.id
   draft.value = block.text
   menuOpen.value = false
+  refOpen.value = false
+  refMenuId.value = null
   menuIndex.value = 0
   sessionEl = null
+  // 提示只在本次会话第一次编辑时出现，之后不打扰
+  if (!hintShown) {
+    hintShown = true
+    showHint.value = true
+    window.clearTimeout(hintTimer)
+    hintTimer = window.setTimeout(() => {
+      showHint.value = false
+    }, 8000)
+  }
   void nextTick(() => {
     const el = currentTa()
     if (!el) return
@@ -124,6 +159,8 @@ function commit() {
   const block = blocks.value.find((b) => b.id === id)
   editingId.value = null
   menuOpen.value = false
+  refOpen.value = false
+  refMenuId.value = null
   if (!block || draft.value === block.text) return
   const next = replaceBlock(blocks.value, id, draft.value)
   blocks.value = next
@@ -134,7 +171,14 @@ function cancel() {
   sessionEl = null
   editingId.value = null
   menuOpen.value = false
+  refOpen.value = false
+  refMenuId.value = null
   draft.value = ''
+}
+
+/** 这一块是不是 `/v` 引用行（渲染出来是一个播放器）。 */
+function isRefBlock(block: Block): boolean {
+  return parseRefLine(block.text) !== null
 }
 
 /**
@@ -188,14 +232,84 @@ function choose(kind: BlockKind) {
 }
 
 function onInput() {
+  const el = currentTa()
+  const cursor = el ? el.selectionStart : draft.value.length
+  // 行首敲 `/v` / `/video` → 录音选择器（与源码模式同一套判定）
+  const hit = slashCommandAt(draft.value, cursor)
+  if (hit) {
+    refFilter.value = hit.filter
+    refIndex.value = 0
+    refOpen.value = true
+    menuOpen.value = false
+    return
+  }
+  if (refOpen.value) refOpen.value = false
   const text = draft.value.trim()
   // 空段里输入 `#` / `##` / `/` 就召唤块类型菜单
   if (text === '/' || /^#{1,6}$/.test(text)) {
     openMenu()
     return
   }
-  // 继续打字（例如写成 `/v xxx`）就把块类型菜单收起来
+  // 继续打字就把块类型菜单收起来
   if (menuOpen.value) menuOpen.value = false
+}
+
+/** 选中一条录音：把正在输入的 `/v …` 换成完整引用行。 */
+function pickRef(opt: RefOption) {
+  const el = currentTa()
+  const cursor = el ? el.selectionStart : draft.value.length
+  const hit = slashCommandAt(draft.value, cursor)
+  const line = refLineFor(opt)
+  draft.value = hit ? draft.value.slice(0, hit.start) + line + draft.value.slice(cursor) : line
+  refOpen.value = false
+  commit()
+}
+
+/** 打开 / 收起引用行的「⋯」菜单。 */
+function toggleRefMenu(e: MouseEvent, block: Block) {
+  if (refMenuId.value === block.id) {
+    refMenuId.value = null
+    return
+  }
+  const el = e.currentTarget as HTMLElement | null
+  if (el) menuAboveRef.value = window.innerHeight - el.getBoundingClientRect().bottom < 140
+  copied.value = false
+  refMenuId.value = block.id
+}
+
+/** 删掉文档里的这一行引用（音频文件本身不动）。 */
+function deleteRef(block: Block) {
+  refMenuId.value = null
+  const next = dropBlockTidy(blocks.value, block.id)
+  blocks.value = next
+  emitContent(joinBlocks(next))
+}
+
+/** 复制音频路径（vault 相对路径，粘到资源管理器里能用）。 */
+async function copyRefPath(block: Block) {
+  const ref = parseRefLine(block.text)
+  if (!ref) return
+  try {
+    await navigator.clipboard.writeText(ref.raw)
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = ref.raw
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    try {
+      document.execCommand('copy')
+    } catch {
+      // 复制不了就算了，源码模式里还能看到路径
+    }
+    ta.remove()
+  }
+  copied.value = true
+  window.clearTimeout(copiedTimer)
+  copiedTimer = window.setTimeout(() => {
+    copied.value = false
+  }, 1400)
 }
 
 /** 在文末新起一段（「＋ 新起一段」按钮 / 空文档入口）。 */
@@ -241,6 +355,28 @@ function splitForEnter(el: HTMLTextAreaElement | null): { head: string; tail: st
 }
 
 function onKeydown(e: KeyboardEvent) {
+  if (refOpen.value) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      const total = refMatches.value.length
+      if (total) {
+        const dir = e.key === 'ArrowDown' ? 1 : -1
+        refIndex.value = (refIndex.value + dir + total) % total
+      }
+      return
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      const opt = refMatches.value[refIndex.value]
+      if (opt) pickRef(opt)
+      return
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      refOpen.value = false
+      return
+    }
+  }
   if (menuOpen.value) {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault()
@@ -332,7 +468,11 @@ function locate(startLine: number, endLine: number) {
   }, 1800)
 }
 
-onBeforeUnmount(() => window.clearTimeout(flashTimer))
+onBeforeUnmount(() => {
+  window.clearTimeout(flashTimer)
+  window.clearTimeout(hintTimer)
+  window.clearTimeout(copiedTimer)
+})
 
 defineExpose({ insertLines, locate })
 </script>
@@ -347,6 +487,7 @@ defineExpose({ insertLines, locate })
             :ref="setTaRef"
             v-model="draft"
             class="blk-ta"
+            :class="`k-${draftKind}`"
             :rows="rows"
             spellcheck="false"
             @input="onInput"
@@ -366,21 +507,58 @@ defineExpose({ insertLines, locate })
               <span class="menu-hint">{{ p.hint }}</span>
             </button>
           </div>
-          <div class="blk-tip">
-            Esc 取消 · Ctrl+Enter 写回 · 输入 <code>#</code> 或 <code>/</code> 换块类型
+          <div v-if="refOpen" class="blk-menu ref-menu" :class="{ above: menuAbove }">
+            <div class="menu-head">插入录音引用（↑↓ 选择 · Enter 插入 · Esc 取消）</div>
+            <div v-if="!refMatches.length" class="ref-empty">
+              还没有可选录音：用右下角「录音」录一段，或把 wav 放进 <code>会议音频/</code> 下。
+            </div>
+            <button
+              v-for="(o, i) in refMatches"
+              :key="o.path"
+              class="ref-item"
+              :class="{ on: i === refIndex }"
+              @mousedown.prevent="pickRef(o)"
+            >
+              <span class="ref-tag" :class="{ used: o.used }">{{ o.used ? '已引用' : '未引用' }}</span>
+              <span class="ref-name" :title="o.label">{{ o.label }}</span>
+              <span class="ref-meta">{{ formatDur(o.durationMs) }}</span>
+            </button>
+          </div>
+          <div v-if="showHint" class="blk-hint">
+            Enter 新起一段 · Esc 取消 · Ctrl+Enter 写回 · 输入 <code>#</code> 换块类型、<code>/v</code> 插录音引用
           </div>
         </div>
-        <div
-          v-else
-          class="blk md-body"
-          :class="{ flash: flashId === b.id }"
-          :data-block-id="b.id"
-          :title="editable ? '点一下改这一段' : ''"
-          @click="onBlockClick($event, b)"
-          v-html="render(b.text)"
-        />
+        <template v-else>
+          <div
+            class="blk md-body"
+            :class="{ flash: flashId === b.id, 'has-ref': isRefBlock(b) }"
+            :data-block-id="b.id"
+            :title="editable ? '点一下改这一段' : ''"
+            @click="onBlockClick($event, b)"
+            v-html="render(b.text)"
+          />
+          <div v-if="editable && isRefBlock(b)" class="blk-tools">
+            <button class="tool-btn" title="引用操作" @mousedown.prevent @click.stop="toggleRefMenu($event, b)">
+              <t-icon name="ellipsis" size="14px" />
+            </button>
+          </div>
+          <div v-if="refMenuId === b.id" class="ref-actions" :class="{ above: menuAboveRef }">
+            <button class="act-item" @mousedown.prevent @click.stop="deleteRef(b)">删除引用（音频文件保留）</button>
+            <button class="act-item" @mousedown.prevent @click.stop="copyRefPath(b)">
+              {{ copied ? '已复制' : '复制音频路径' }}
+            </button>
+          </div>
+        </template>
       </div>
     </template>
+
+    <div
+      v-if="refMenuId !== null"
+      class="ref-backdrop"
+      @mousedown.prevent
+      @click="refMenuId = null"
+      @contextmenu.prevent="refMenuId = null"
+    />
 
     <div v-if="!hasBody" class="empty-tip" @mousedown.prevent="addParagraph(null)">
       还没有内容，点这里开始写（输入 <code>#</code> 或 <code>/</code> 可换块类型）
@@ -434,32 +612,63 @@ defineExpose({ insertLines, locate })
 
 .blk-editing {
   position: relative;
-  padding: 2px 0;
+  padding: 2px 6px;
 }
 
+/* 编辑态不画「输入框」：透明、无边框，只有光标在闪；字号跟着块类型走，与渲染结果一致 */
 .blk-ta {
   display: block;
   width: 100%;
   box-sizing: border-box;
-  padding: 6px 8px;
-  border: 1px solid var(--primary);
-  border-radius: var(--radius-m);
-  background: var(--panel);
-  color: var(--text);
-  font-family: var(--font-sans);
-  font-size: inherit;
-  line-height: inherit;
-  resize: vertical;
+  margin: 0;
+  padding: 0;
+  border: 0;
   outline: none;
+  background: transparent;
+  color: inherit;
+  font-family: var(--font-sans);
+  font-size: 14.5px;
+  line-height: 1.85;
+  resize: none;
+  overflow: hidden;
+  caret-color: var(--primary);
 }
 
-.blk-tip {
+.blk-ta.k-h1 {
+  font-size: 21.75px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.blk-ta.k-h2 {
+  font-size: 18.1px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.blk-ta.k-h3 {
+  font-size: 15.95px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.blk-ta.k-quote {
+  color: var(--text-2);
+}
+
+.blk-ta.k-code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.blk-hint {
   margin-top: 4px;
   font-size: 11.5px;
   color: var(--text-3);
 }
 
-.blk-tip code,
+.blk-hint code,
+.ref-empty code,
 .empty-tip code {
   padding: 0 3px;
   border-radius: 3px;
@@ -530,6 +739,159 @@ defineExpose({ insertLines, locate })
   white-space: nowrap;
   font-size: 11.5px;
   color: var(--text-3);
+}
+
+/* ---- `/v` 录音选择器 ---- */
+
+.ref-menu {
+  width: min(440px, 92vw);
+  max-height: 300px;
+  overflow: auto;
+}
+
+.ref-empty {
+  padding: 8px;
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--text-3);
+}
+
+.ref-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ref-item.on {
+  background: var(--brand-weak);
+}
+
+.ref-tag {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--primary);
+  border-radius: 8px;
+  color: var(--primary);
+  font-size: 10px;
+}
+
+.ref-tag.used {
+  border-color: var(--border);
+  color: var(--text-3);
+}
+
+.ref-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ref-meta {
+  flex: none;
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 引用行右侧的「⋯」：桌面悬停出现，触屏常显 ---- */
+
+.blk.has-ref {
+  padding-right: 34px;
+}
+
+.blk-tools {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  display: none;
+  transform: translateY(-50%);
+}
+
+.blk-slot:hover .blk-tools,
+.blk-tools:focus-within {
+  display: block;
+}
+
+@media (pointer: coarse) {
+  .blk-tools {
+    display: block;
+  }
+}
+
+.tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  background: var(--panel);
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.tool-btn:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.ref-actions {
+  position: absolute;
+  z-index: 21;
+  top: 100%;
+  right: 6px;
+  min-width: 200px;
+  margin-top: 2px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--panel);
+  box-shadow: var(--shadow-2);
+}
+
+.ref-actions.above {
+  top: auto;
+  bottom: 100%;
+  margin-top: 0;
+  margin-bottom: 2px;
+}
+
+.act-item {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.act-item:hover {
+  background: var(--hover);
+}
+
+.ref-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
 }
 
 .empty-tip {

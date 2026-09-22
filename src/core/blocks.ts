@@ -129,6 +129,30 @@ export function dropBlock(blocks: Block[], id: number): Block[] {
   return renumberLines(blocks.filter((b) => b.id !== id))
 }
 
+/**
+ * 删掉某一块，并把删除处并到一起的空行合成一个（删 `/v` 引用行时用）。
+ *
+ * 空行块文本约定：`''` = 一个空行，`'\n'` = 两个空行（见 splitBlocks / joinBlocks）。
+ * 例：`正文\n\n/v x\n\n后文` → 删引用 → `正文\n\n后文`（而不是留两个空行）。
+ */
+export function dropBlockTidy(blocks: Block[], id: number): Block[] {
+  const idx = blocks.findIndex((b) => b.id === id)
+  if (idx < 0) return blocks
+  const out = blocks.filter((b) => b.id !== id)
+  const at = Math.min(idx, out.length - 1)
+  const left = at - 1 >= 0 ? out[at - 1] : undefined
+  const right = at >= 0 && at < out.length ? out[at] : undefined
+  if (left?.gap && right?.gap) {
+    // 两侧空行并成一个：保留更「宽」的那个（都是单空行时 = 一个空行）
+    const keep = left.text.length >= right.text.length ? left : right
+    out.splice(at - 1, 2, keep)
+  } else if (!left && right?.gap) {
+    // 引用在文首：把残留的开头空行也去掉
+    out.splice(at >= 0 ? at : 0, 1)
+  }
+  return renumberLines(out)
+}
+
 /** 把某一块的文本换成新文本（新文本内部若有空行会再切块），其余块原样不动。 */
 export function replaceBlock(blocks: Block[], id: number, text: string): Block[] {
   const idx = blocks.findIndex((b) => b.id === id)

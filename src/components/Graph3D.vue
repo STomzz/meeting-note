@@ -77,10 +77,16 @@ function repaint() {
   graph.nodeColor(nodeColor).linkColor(linkColor)
 }
 
+/**
+ * 同步自转开关。
+ *
+ * 鼠标停在某个节点上时先停一下（看清它），移开就接着转；
+ * `autoRotate` 仍是总开关（用户主动暂停就不转）。
+ */
 function applyAutoRotate() {
   if (!graph) return
   const controls = graph.controls() as { autoRotate?: boolean; autoRotateSpeed?: number }
-  controls.autoRotate = autoRotate.value
+  controls.autoRotate = autoRotate.value && !hoverId
   controls.autoRotateSpeed = 0.7
 }
 
@@ -134,6 +140,7 @@ function mount() {
     .onNodeHover((node) => {
       hoverId = node ? node.id : ''
       if (el) el.style.cursor = node ? 'pointer' : 'grab'
+      applyAutoRotate()
       repaint()
     })
     .onNodeClick((node) => {
@@ -145,6 +152,11 @@ function mount() {
 
   g.graphData(data)
   applyAutoRotate()
+
+  // 开发模式给冒烟脚本一个把手（生产构建里会被摇掉）
+  if (import.meta.env.DEV) {
+    ;(window as unknown as Record<string, unknown>).__bnuGraph3D = g
+  }
 
   // 初始镜头：节点越多站得越远
   g.cameraPosition({ x: 0, y: 0, z: 260 + data.nodes.length * 1.5 })

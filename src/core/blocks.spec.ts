@@ -5,6 +5,7 @@ import {
   appendParagraph,
   blockAtLine,
   detectKind,
+  dropBlockTidy,
   insertBlockAfter,
   insertBlocksBefore,
   insertParagraphAfter,
@@ -193,6 +194,54 @@ describe('insertBlocksBefore（引用插到纪要标题之前）', () => {
     const blocks = splitBlocks('## 会议纪要（AI 整理）\n\n- 结论')
     const out = joinBlocks(insertBlocksBefore(blocks, 0, '/v a.wav'))
     expect(out).toBe('/v a.wav\n\n## 会议纪要（AI 整理）\n\n- 结论')
+  })
+})
+
+describe('dropBlockTidy（删 /v 引用行）', () => {
+  it('两侧各一个空行并成一个', () => {
+    const blocks = splitBlocks('正文\n\n/v 会议音频/a.wav\n\n后文')
+    const ref = blocks.find((b) => b.text.startsWith('/v'))!
+    expect(joinBlocks(dropBlockTidy(blocks, ref.id))).toBe('正文\n\n后文')
+  })
+
+  it('引用在文首时不留开头的空行', () => {
+    const blocks = splitBlocks('/v 会议音频/a.wav\n\n后文')
+    const ref = blocks.find((b) => b.text.startsWith('/v'))!
+    expect(joinBlocks(dropBlockTidy(blocks, ref.id))).toBe('后文')
+  })
+
+  it('引用在文末时保留结尾结构', () => {
+    const blocks = splitBlocks('正文\n\n/v 会议音频/a.wav')
+    const ref = blocks.find((b) => b.text.startsWith('/v'))!
+    // 原文件行是「正文 / 空行 / 引用行」，删掉引用行后就是「正文 / 空行」→ `正文\n`
+    expect(joinBlocks(dropBlockTidy(blocks, ref.id))).toBe('正文\n')
+  })
+
+  it('用户自己留的两个空行不会被吃掉', () => {
+    const blocks = splitBlocks('正文\n\n\n/v 会议音频/a.wav\n后文')
+    const ref = blocks.find((b) => b.text.startsWith('/v'))!
+    expect(joinBlocks(dropBlockTidy(blocks, ref.id))).toBe('正文\n\n\n后文')
+  })
+
+  it('连着两个引用删一个，另一个与正文都不动', () => {
+    const blocks = splitBlocks('正文\n\n/v a.wav\n/v b.wav\n\n后文')
+    const refs = blocks.filter((b) => b.text.startsWith('/v'))
+    const out = joinBlocks(dropBlockTidy(blocks, refs[0].id))
+    expect(out).toBe('正文\n\n/v b.wav\n\n后文')
+  })
+
+  it('只有一行引用时删完是空文档', () => {
+    const blocks = splitBlocks('/v a.wav')
+    expect(joinBlocks(dropBlockTidy(blocks, blocks[0].id))).toBe('')
+  })
+
+  it('只删这一块，别的块逐字节不动', () => {
+    const md = '会议\n\n/v a.wav\n\n## 会议纪要（AI 整理）\n\n- 结论'
+    const blocks = splitBlocks(md)
+    const ref = blocks.find((b) => b.text.startsWith('/v'))!
+    const out = joinBlocks(dropBlockTidy(blocks, ref.id))
+    expect(out).toContain('## 会议纪要（AI 整理）\n\n- 结论')
+    expect(out).not.toContain('/v a.wav')
   })
 })
 

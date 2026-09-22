@@ -115,8 +115,19 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
         this.message = ''
         this.progress = 0
       }
+      await this.loadRefs(noteId)
+    },
+
+    /**
+     * 只刷新「正文里引用了哪些音频」。
+     *
+     * 编辑器改完存盘后要跟着重算（工具栏的「未引用」是照存盘内容算的，删掉一行 `/v` 得让它变回未引用）。
+     */
+    async loadRefs(noteId?: string) {
+      const id = noteId || this.currentId
+      if (!id) return
       try {
-        this.refs = await meetingNoteAdapter().refs(noteId)
+        this.refs = await meetingNoteAdapter().refs(id)
         this.error = ''
       } catch (e) {
         this.error = String(e)

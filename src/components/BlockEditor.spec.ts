@@ -1,7 +1,8 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import MarkdownIt from 'markdown-it'
 import BlockEditor from './BlockEditor.vue'
+import type { RefOption } from '../core/refPicker'
 
 const md = new MarkdownIt({ html: false, linkify: true })
 const render = (body: string) => md.render(body)
@@ -11,8 +12,32 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = () => {}
 })
 
-function mountEditor(content: string) {
-  return mount(BlockEditor, { props: { content, render } })
+/** 两条候选：一条未引用、一条已引用（顺序就是父组件排好的顺序）。 */
+const OPTS: RefOption[] = [
+  {
+    path: '会议音频/周会/seg_0002.wav',
+    dir: '会议音频/周会',
+    file: 'seg_0002.wav',
+    label: '会议音频/周会/seg_0002.wav',
+    durationMs: 65000,
+    used: false,
+    own: true,
+    modifiedAt: 200,
+  },
+  {
+    path: '会议音频/周会/seg_0001.wav',
+    dir: '会议音频/周会',
+    file: 'seg_0001.wav',
+    label: '会议音频/周会/seg_0001.wav',
+    durationMs: 4000,
+    used: true,
+    own: true,
+    modifiedAt: 100,
+  },
+]
+
+function mountEditor(content: string, refOptions: RefOption[] = []) {
+  return mount(BlockEditor, { props: { content, render, refOptions } })
 }
 
 /** 取最后一次 emit 的 markdown。 */
@@ -118,8 +143,169 @@ describe('BlockEditor 块类型菜单', () => {
     const ta = wrapper.find('textarea')
     await ta.setValue('/')
     expect(wrapper.find('.blk-menu').exists()).toBe(true)
-    await ta.setValue('/v 会议音频/a.wav')
+    await ta.setValue('# 标题')
     expect(wrapper.find('.blk-menu').exists()).toBe(false)
+  })
+})
+
+describe('BlockEditor /v 录音选择器', () => {
+  it('输入 /v 弹出候选：已引用 / 未引用 + 时长', async () => {
+    const wrapper = mountEditor('', OPTS)
+    await wrapper.find('.empty-tip').trigger('mousedown')
+    const ta = wrapper.find('textarea')
+    await ta.setValue('/')
+    expect(wrapper.find('.menu-item').exists()).toBe(true)
+    await ta.setValue('/v')
+    // 块类型菜单让位给录音选择器
+    expect(wrapper.find('.menu-item').exists()).toBe(false)
+    const menu = wrapper.find('.ref-menu')
+    expect(menu.exists()).toBe(true)
+    const items = wrapper.findAll('.ref-item')
+    expect(items).toHaveLength(2)
+    expect(items[0].text()).toContain('未引用')
+    expect(items[0].text()).toContain('seg_0002.wav')
+    expect(items[0].text()).toContain('1:05')
+    expect(items[1].text()).toContain('已引用')
+  })
+
+  it('继续打字按文件名过滤', async () => {
+    const wrapper = mountEditor('', OPTS)
+    await wrapper.find('.empty-tip').trigger('mousedown')
+    const ta = wrapper.find('textarea')
+    await ta.setValue('/v seg_0001')
+    const items = wrapper.findAll('.ref-item')
+    expect(items).toHaveLength(1)
+    expect(items[0].text()).toContain('seg_0001.wav')
+  })
+
+  it('↑↓ 选择 + Enter 插入：正在输入的 /v 换成完整引用行', async () => {
+    const wrapper = mountEditor('', OPTS)
+    await wrapper.find('.empty-tip').trigger('mousedown')
+    const ta = wrapper.find('textarea')
+    await ta.setValue('/v')
+    await ta.trigger('keydown', { key: 'ArrowDown' })
+    expect(wrapper.findAll('.ref-item')[1].classes()).toContain('on')
+    await wrapper.find('textarea').trigger('keydown', { key: 'Enter' })
+    expect(lastEmitted(wrapper)).toBe('/v 会议音频/周会/seg_0001.wav')
+    expect(wrapper.find('.ref-menu').exists()).toBe(false)
+    expect(wrapper.find('textarea').exists()).toBe(false)
+  })
+
+  it('点候选也能插入（mousedown 在 blur 之前）', async () => {
+    const wrapper = mountEditor('', OPTS)
+    await wrapper.find('.empty-tip').trigger('mousedown')
+    await wrapper.find('textarea').setValue('/v')
+    await wrapper.findAll('.ref-item')[0].trigger('mousedown')
+    expect(lastEmitted(wrapper)).toBe('/v 会议音频/周会/seg_0002.wav')
+  })
+
+  it('段落里换行后写 /v 也能插（只替换那一行）', async () => {
+    const wrapper = mountEditor('前半段\n\n后半段', OPTS)
+    await wrapper.findAll('.blk')[0].trigger('click')
+    const ta = wrapper.find('textarea')
+    await ta.setValue('前半段\n/v')
+    await ta.trigger('keydown', { key: 'Enter' })
+    expect(lastEmitted(wrapper)).toContain('/v 会议音频/周会/seg_0002.wav')
+    expect(lastEmitted(wrapper)).toContain('前半段')
+  })
+
+  it('Esc 关掉选择器，不发内容', async () => {
+    const wrapper = mountEditor('', OPTS)
+    await wrapper.find('.empty-tip').trigger('mousedown')
+    const ta = wrapper.find('textarea')
+    await ta.setValue('/v')
+    const before = (wrapper.emitted('update:content') ?? []).length
+    await ta.trigger('keydown', { key: 'Escape' })
+    expect(wrapper.find('.ref-menu').exists()).toBe(false)
+    expect((wrapper.emitted('update:content') ?? []).length).toBe(before)
+    // 还在编辑这一块（Esc 只关弹层，不取消编辑）
+    expect(wrapper.find('textarea').exists()).toBe(true)
+  })
+
+  it('没有录音时给一句提示', async () => {
+    const wrapper = mountEditor('', [])
+    await wrapper.find('.empty-tip').trigger('mousedown')
+    await wrapper.find('textarea').setValue('/v')
+    expect(wrapper.find('.ref-empty').text()).toContain('会议音频/')
+    expect(wrapper.findAll('.ref-item')).toHaveLength(0)
+  })
+})
+
+describe('BlockEditor 引用行的「⋯」菜单', () => {
+  function refSlot(wrapper: ReturnType<typeof mountEditor>) {
+    const slot = wrapper.findAll('.blk-slot').find((s) => s.text().includes('seg_0001.wav'))
+    if (!slot) throw new Error('没找到引用块')
+    return slot
+  }
+
+  it('只有引用行才有「⋯」，点开有删除 / 复制路径', async () => {
+    const wrapper = mountEditor(MEETING, OPTS)
+    expect(wrapper.findAll('.tool-btn')).toHaveLength(1)
+    await refSlot(wrapper).find('.tool-btn').trigger('click')
+    const actions = wrapper.findAll('.act-item').map((b) => b.text())
+    expect(actions[0]).toContain('删除引用')
+    expect(actions[1]).toContain('复制音频路径')
+  })
+
+  it('删除引用：只删这一行，音频文件与其它内容都不动', async () => {
+    const wrapper = mountEditor(MEETING, OPTS)
+    await refSlot(wrapper).find('.tool-btn').trigger('click')
+    await wrapper.findAll('.act-item')[0].trigger('click')
+    const out = lastEmitted(wrapper)!
+    expect(out).not.toContain('/v ')
+    expect(out).toContain('正文第一段')
+    expect(out).toContain('## 会议纪要（AI 整理）')
+    expect(out).toContain('- 结论：继续观察')
+    // 空行合成一个，不留双空行
+    expect(out).toContain('正文第一段\n\n## 会议纪要（AI 整理）')
+    expect(wrapper.find('.ref-actions').exists()).toBe(false)
+    expect(wrapper.findAll('.tool-btn')).toHaveLength(0)
+  })
+
+  it('复制路径：菜单不关，按钮变成「已复制」', async () => {
+    const wrapper = mountEditor(MEETING, OPTS)
+    await refSlot(wrapper).find('.tool-btn').trigger('click')
+    await wrapper.findAll('.act-item')[1].trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('.act-item')[1].text()).toBe('已复制')
+    expect(lastEmitted(wrapper)).toBeUndefined()
+  })
+
+  it('只读形态没有「⋯」', async () => {
+    const wrapper = mount(BlockEditor, { props: { content: MEETING, render, editable: false, refOptions: OPTS } })
+    expect(wrapper.findAll('.tool-btn')).toHaveLength(0)
+  })
+})
+
+describe('BlockEditor 编辑态形态', () => {
+  it('输入框按块类型套字号 class（不是方框提示）', async () => {
+    const wrapper = mountEditor('# 标题\n\n- 一\n\n> 引用')
+    await wrapper.findAll('.blk')[0].trigger('click')
+    expect(wrapper.find('textarea').classes()).toContain('k-h1')
+    await wrapper.find('textarea').trigger('keydown', { key: 'Escape' })
+    await wrapper.findAll('.blk')[1].trigger('click')
+    expect(wrapper.find('textarea').classes()).toContain('k-ul')
+    await wrapper.find('textarea').trigger('keydown', { key: 'Escape' })
+    await wrapper.findAll('.blk')[2].trigger('click')
+    expect(wrapper.find('textarea').classes()).toContain('k-quote')
+    // 常驻提示行已经去掉
+    expect(wrapper.find('.blk-tip').exists()).toBe(false)
+  })
+
+  it('操作提示只在第一次进编辑时露一下', async () => {
+    vi.useFakeTimers()
+    try {
+      const wrapper = mountEditor('A\n\nB')
+      await wrapper.findAll('.blk')[0].trigger('click')
+      expect(wrapper.find('.blk-hint').text()).toContain('/v')
+      await wrapper.find('textarea').trigger('keydown', { key: 'Escape' })
+      vi.advanceTimersByTime(9000)
+      await wrapper.vm.$nextTick()
+      await wrapper.findAll('.blk')[0].trigger('click')
+      expect(wrapper.find('.blk-hint').exists()).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

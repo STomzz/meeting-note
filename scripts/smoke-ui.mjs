@@ -1,5 +1,5 @@
 /**
- * 真浏览器 UI 冒烟（笔记块编辑 + 图谱 2D/3D 切换）。
+ * 真浏览器 UI 冒烟（笔记块编辑 + `/v` 选择器 + 录音面板 + 图谱 2D/3D 切换）。
  *
  * 用途：改完前端后，在**真 Chrome** 里把关键交互点一遍（jsdom 测不出的那种：
  * 焦点/blur、v-for 里的模板 ref、canvas 尺寸、G6/three 的生命周期）。
@@ -62,7 +62,15 @@ mkdirSync(SHOTS, { recursive: true })
 const browser = await puppeteer.launch({
   executablePath: chrome,
   headless: true,
-  args: ['--no-sandbox', '--disable-dev-shm-usage', '--enable-unsafe-swiftshader'],
+  args: [
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
+    '--enable-unsafe-swiftshader',
+    // 录音面板要能真的走一遍：用 Chrome 自带的假麦克风
+    '--use-fake-ui-for-media-stream',
+    '--use-fake-device-for-media-stream',
+    '--autoplay-policy=no-user-gesture-required',
+  ],
 })
 const page = await browser.newPage()
 const errors = []
@@ -138,6 +146,25 @@ check(
   (await page.evaluate(() => document.querySelector('.blk-ta')?.value)) ===
     '随手写的要点：镜像拉取超时，改用镜像站。',
 )
+const editStyle = await page.evaluate(() => {
+  const el = document.querySelector('.blk-ta')
+  const cs = getComputedStyle(el)
+  return {
+    cls: el.className,
+    border: cs.borderTopWidth,
+    bg: cs.backgroundColor,
+    tip: document.querySelectorAll('.blk-tip').length,
+    hint: document.querySelectorAll('.blk-hint').length,
+  }
+})
+check(
+  '编辑态不是「输入框」：无边框、背景透明',
+  editStyle.border === '0px' && editStyle.bg === 'rgba(0, 0, 0, 0)',
+  JSON.stringify(editStyle),
+)
+check('编辑态按块类型套字号（class）', /k-[a-z0-9]+/.test(editStyle.cls), editStyle.cls)
+check('常驻的「输入 # 换块类型」提示行已去掉', editStyle.tip === 0)
+check('第一次编辑给一次性操作提示', editStyle.hint === 1)
 await setTextarea('.blk-ta', '随手写的要点：镜像拉取超时，改用镜像站（已改）。')
 await page.keyboard.down('Control')
 await page.keyboard.press('Enter')
@@ -166,6 +193,99 @@ const h2s = await page.evaluate(() => [...document.querySelectorAll('.blocks h2'
 check('渲染出新的二级标题', h2s.includes('测试小节'), JSON.stringify(h2s))
 check('回车后新段落仍在编辑（旧输入框的 blur 不关新会话）', (await count('.blk-ta')) === 1)
 await page.keyboard.press('Escape')
+
+// 一次性提示不常驻：等它自己消失
+await page.waitForFunction(() => !document.querySelector('.blk-hint'), { timeout: 12000 })
+check('操作提示会自动消失（不常驻）', (await count('.blk-hint')) === 0)
+
+console.log('== 笔记：/v 录音选择器 ==')
+const refsBefore = await count('.blocks .audio-ref')
+await click('.add-row')
+await sleep(300)
+await setTextarea('.blk-ta', '/v')
+await sleep(300)
+check('输入 /v 弹出录音选择器', (await count('.ref-menu')) === 1)
+const pickerCount = await count('.ref-item')
+check('选择器列出候选（带时长）', pickerCount >= 1, String(pickerCount))
+check('候选带「已引用 / 未引用」标签', ((await text('.ref-menu')) ?? '').includes('引用'))
+await page.screenshot({ path: `${SHOTS}/04-ref-picker.png` })
+await setTextarea('.blk-ta', '/v seg')
+await sleep(250)
+const filtered = await count('.ref-item')
+check('继续打字按文件名过滤', filtered >= 1 && filtered <= pickerCount, `${filtered}/${pickerCount}`)
+await page.keyboard.press('Enter')
+await sleep(500)
+const refsAfterInsert = await count('.blocks .audio-ref')
+check('Enter 选中后插入引用行（多一个播放器行）', refsAfterInsert === refsBefore + 1, `${refsBefore} -> ${refsAfterInsert}`)
+check('插入后回到排版（没有输入框）', (await count('.blk-ta')) === 0)
+
+console.log('== 笔记：引用行「⋯」→ 删除引用 ==')
+const barBefore = (await text('.editor-bar')) ?? ''
+const toolCount = await count('.blk-tools .tool-btn')
+check('只有引用行才有「⋯」按钮', toolCount === refsAfterInsert, `${toolCount} / ${refsAfterInsert}`)
+await page.evaluate(() => {
+  const slot = [...document.querySelectorAll('.blk-slot')].find((s) => (s.textContent || '').includes('seg_0002'))
+  slot?.querySelector('.tool-btn')?.click()
+})
+await sleep(350)
+check('点「⋯」出现引用操作菜单', (await count('.ref-actions')) === 1)
+const actions = (await text('.ref-actions')) ?? ''
+check('菜单含「删除引用 / 复制音频路径」', actions.includes('删除引用') && actions.includes('复制音频路径'), actions)
+await page.screenshot({ path: `${SHOTS}/05-ref-actions.png` })
+await page.evaluate(() => {
+  const item = [...document.querySelectorAll('.act-item')].find((b) => b.textContent.includes('删除引用'))
+  item?.click()
+})
+await sleep(500)
+check('删除后文档里少了一行引用', (await count('.blocks .audio-ref')) === refsAfterInsert - 1)
+const segs = (t) => Number(/(\d+)\s*段/.exec(t)?.[1] ?? -1)
+// 等自动保存落盘（工具栏的录音计数是照存盘内容算的）
+await page.waitForFunction(() => /已保存/.test(document.querySelector('.editor-bar')?.textContent ?? ''), {
+  timeout: 8000,
+})
+const barAfter = (await text('.editor-bar')) ?? ''
+if ((await count('.clips-panel')) === 0) {
+  await page.evaluate(() => {
+    const btn = [...document.querySelectorAll('.editor-bar .t-button')].find((b) => /\d+\s*段/.test(b.textContent))
+    btn?.click()
+  })
+  await sleep(400)
+}
+const clipRows = await count('.clips-panel .clip-row')
+check(
+  '音频文件没被删（片段总数不变、录音面板里还在）',
+  segs(barAfter) === segs(barBefore) && clipRows === segs(barAfter),
+  `${barBefore} -> ${barAfter}，片段行 ${clipRows}`,
+)
+check('删除引用不动其它内容', ((await text('.blocks')) ?? '').includes('会议纪要（AI 整理）'))
+
+console.log('== 录音面板（假麦克风）==')
+await click('.capsule')
+await sleep(400)
+check('展开录音面板', (await count('.panel')) === 1)
+await page.screenshot({ path: `${SHOTS}/06-recorder-idle.png` })
+await clickText('开始录音', '.t-button')
+await sleep(2600)
+const liveState = await page.evaluate(() => ({
+  timer: document.querySelector('.panel .timer')?.textContent ?? null,
+  chips: document.querySelectorAll('.panel .chip').length,
+  level: document.querySelector('.panel .level i')?.style.width ?? '',
+  stop: [...document.querySelectorAll('.panel .t-button')].map((b) => b.textContent.trim()),
+}))
+check('录音中有计时', !!liveState.timer && liveState.timer !== '0:00', String(liveState.timer))
+check('录音中有电平与分段信息', liveState.chips >= 2 && liveState.level.endsWith('%'), JSON.stringify(liveState))
+check('按钮变成「停止录音」', liveState.stop.some((t) => t.includes('停止录音')), JSON.stringify(liveState.stop))
+await page.screenshot({ path: `${SHOTS}/07-recorder-live.png` })
+await page.evaluate(() => document.querySelector('.panel .icon-btn')?.click())
+await sleep(600)
+check('收起后是录音中的胶囊（红点 + 计时）', (await count('.capsule.live')) === 1)
+await page.screenshot({ path: `${SHOTS}/08-capsule-live.png` })
+await click('.capsule.live')
+await sleep(300)
+await clickText('停止录音', '.t-button')
+await sleep(1200)
+const saved = (await text('.panel')) ?? ''
+check('停止后给出已保存卡片与「插入引用」', saved.includes('已保存') && saved.includes('插入引用'), saved.slice(0, 80))
 
 await clickText('预览', '.t-radio-button')
 await sleep(400)
@@ -215,6 +335,30 @@ check(
 check('3D 场景在渲染', state.g3d > 0)
 check('3D 模式下 2D 容器里没有画布（不会两个视图同屏）', state.twoDCanvases <= 0, JSON.stringify(state))
 await page.screenshot({ path: `${SHOTS}/12-graph-3d-return.png` })
+
+// 悬停节点暂停自转，移开继续（`__bnuGraph3D` 是开发模式的把手）
+const spot = await page.evaluate(() => {
+  const g = window.__bnuGraph3D
+  if (!g) return null
+  const node = g.graphData().nodes.filter((n) => Number.isFinite(n.x) && Number.isFinite(n.y))[0]
+  if (!node) return null
+  const p = g.graph2ScreenCoords(node.x, node.y, node.z)
+  const r = document.querySelector('.canvas3d').getBoundingClientRect()
+  return { x: r.x + p.x, y: r.y + p.y, rotate: g.controls().autoRotate }
+})
+if (spot) {
+  await page.mouse.move(spot.x, spot.y)
+  await sleep(400)
+  const hoverRotate = await page.evaluate(() => window.__bnuGraph3D.controls().autoRotate)
+  await page.mouse.move(spot.x, spot.y + 300)
+  await sleep(500)
+  const leaveRotate = await page.evaluate(() => window.__bnuGraph3D.controls().autoRotate)
+  check('悬停节点时暂停自转', spot.rotate === true && hoverRotate === false, `${spot.rotate} -> ${hoverRotate}`)
+  check('移开节点后继续自转', leaveRotate === true, String(leaveRotate))
+  await page.screenshot({ path: `${SHOTS}/14-graph-3d-hover.png` })
+} else {
+  check('悬停节点时暂停自转', false, '没拿到 3D 图实例或节点坐标')
+}
 
 await clickText('力导图', '.t-radio-button')
 await sleep(3500)

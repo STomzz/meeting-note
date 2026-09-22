@@ -26,6 +26,7 @@ import {
   unreferencedClips,
 } from '../core/meetingNote'
 import type { ClipInfo } from '../core/meetingNote'
+import { filterRefOptions, refOptions, type RefOption } from '../core/refPicker'
 import { ancestorsOf, buildTreeRows } from '../core/notesTree'
 import { lineRangeOffset } from '../core/lines'
 import type { NoteMeta } from '../core/types'
@@ -443,21 +444,40 @@ const slashOpen = ref(false)
 const slashFilter = ref('')
 const slashIndex = ref(0)
 
-const slashMatches = computed(() => {
-  const q = slashFilter.value.toLowerCase()
-  const own = new Set(currentClips.value.map((c) => c.path))
-  const unref = new Set(unrefClips.value.map((c) => c.path))
-  let list = [...meeting.clips]
-  list.sort((a, b) => {
-    const rank = (c: ClipInfo) => (own.has(c.path) ? 0 : 2) + (unref.has(c.path) ? 0 : 1)
-    return rank(a) - rank(b) || b.modifiedAt - a.modifiedAt
-  })
-  if (q) list = list.filter((c) => `${c.dir}/${c.file}`.toLowerCase().includes(q))
-  return list.slice(0, 8)
-})
+/** 录音候选（本笔记的、未引用的排前面，同档按修改时间新→旧）。 */
+const clipOptions = computed(() =>
+  refOptions(meeting.clips, {
+    ownDirs: new Set(currentClips.value.map((c) => c.dir)),
+    usedPaths: refPathSet.value,
+  }),
+)
+
+const slashMatches = computed(() => filterRefOptions(clipOptions.value, slashFilter.value))
+
+/** 块编辑器里的 `/v` 选择器用同一份候选。 */
+const editorRefOptions = computed(() => clipOptions.value)
+
 
 /** 是否用块编辑（edit / preview），false = 源码 textarea。 */
 const useBlockEditor = computed(() => editorMode.value !== 'source')
+
+// 每次存盘后刷新引用列表：删掉一行 `/v` 后，「未引用」要跟着变回未引用
+watch(
+  () => store.saveState,
+  (state) => {
+    if (state !== 'saved' || !store.currentId) return
+    if (meeting.currentId === store.currentId) void meeting.loadRefs(store.currentId)
+  },
+)
+// 块编辑模式进来时把片段列表准备好（源码模式是弹选择器时才懒加载）
+watch(
+  [useBlockEditor, () => store.currentId],
+  () => {
+    if (!useBlockEditor.value) return
+    if (!meeting.clips.length) void meeting.loadClips(store.currentId ?? undefined)
+  },
+  { immediate: true },
+)
 
 /** 块渲染：把一块 markdown 渲染成 HTML（`/v` 行换成播放器）。 */
 function renderBlock(body: string): string {
@@ -606,7 +626,7 @@ function onEditorKeydown(e: KeyboardEvent) {
 }
 
 /** 用选中的录音替换刚输入的 `/v`，并把完整引用行插到光标处。 */
-function applyClip(clip: ClipInfo) {
+function applyClip(clip: RefOption) {
   const el = editorEl.value
   if (!el) return
   const cursor = el.selectionStart
@@ -900,6 +920,7 @@ async function removeCurrent() {
               :content="store.content"
               :render="renderBlock"
               :editable="editorMode === 'edit'"
+              :ref-options="editorRefOptions"
               @update:content="store.setContent"
             />
             <textarea
@@ -927,7 +948,7 @@ async function removeCurrent() {
                 :class="{ on: i === slashIndex }"
                 @mousedown.prevent="applyClip(c)"
               >
-                <span v-if="isRef(c)" class="slash-tag">已引用</span>
+                <span v-if="c.used" class="slash-tag">已引用</span>
                 <span v-else class="slash-tag new">未引用</span>
                 <span class="slash-name" :title="`${c.dir}/${c.file}`">{{ c.dir }}/{{ c.file }}</span>
                 <span class="slash-meta">{{ formatDur(c.durationMs) }}</span>
