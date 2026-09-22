@@ -19,6 +19,13 @@ export interface SearchHit {
   snippet: string
 }
 
+/** 文件夹（左侧目录树用；空文件夹也会返回）。 */
+export interface FolderInfo {
+  path: string
+  /** 直接放在这个文件夹里的笔记数（不含子文件夹）。 */
+  noteCount: number
+}
+
 export interface ScanStats {
   indexed: number
   skipped: number
@@ -37,4 +44,12 @@ export interface NotesAdapter {
   create(folder: string, title: string): Promise<NoteMeta>
   remove(id: string): Promise<void>
   search(query: string, limit?: number): Promise<SearchHit[]>
+  /** 文件夹树：含空文件夹，排除隐藏目录与 `会议音频/`。 */
+  folders(): Promise<FolderInfo[]>
+  createFolder(path: string): Promise<string>
+  renameFolder(path: string, newName: string): Promise<string>
+  /** 移动笔记到另一个文件夹，返回新 id（重名自动加序号）。 */
+  moveNote(id: string, folder: string): Promise<string>
+  /** 重命名笔记（同目录），返回新 id。 */
+  renameNote(id: string, title: string): Promise<string>
 }

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
-import type { NoteMeta, NotesAdapter, ScanStats, SearchHit } from '../core/types'
+import type { FolderInfo, NoteMeta, NotesAdapter, ScanStats, SearchHit } from '../core/types'
 
 /** 真正的客户端实现：调用 src-tauri 里的 Rust 命令。 */
 export class TauriNotesAdapter implements NotesAdapter {
@@ -34,5 +34,20 @@ export class TauriNotesAdapter implements NotesAdapter {
   }
   search(query: string, limit = 30): Promise<SearchHit[]> {
     return invoke('search_notes', { query, limit })
+  }
+  folders(): Promise<FolderInfo[]> {
+    return invoke('list_folders')
+  }
+  createFolder(path: string): Promise<string> {
+    return invoke('create_folder', { path })
+  }
+  renameFolder(path: string, newName: string): Promise<string> {
+    return invoke('rename_folder', { path, newName })
+  }
+  moveNote(id: string, folder: string): Promise<string> {
+    return invoke('move_note', { id, folder })
+  }
+  renameNote(id: string, title: string): Promise<string> {
+    return invoke('rename_note', { id, title })
   }
 }

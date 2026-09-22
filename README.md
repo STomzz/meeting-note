@@ -1,8 +1,8 @@
 # BNU Notes（本地优先的笔记 + 会议客户端）
 
-Windows / Android 桌面客户端：笔记（Markdown）、知识图谱、会议（**一场会议 = 一篇 md**，
-用 `/v` 引用录音、一键转写 + 纪要）全部在本地，云端只当"模型 API"用——在设置里填 baseURL + Key，
-客户端直连。
+Windows / Android 桌面客户端：**笔记与会议合并成一个「会议笔记」栏目**——vault 里每篇 Markdown
+都能用文件夹树组织；开会时录音、用 `/v` 引用录音、一键转写 + 纪要。全部数据在本地，云端只当
+"模型 API"用——在设置里填 baseURL + Key，客户端直连。
 
 - 技术栈：**Tauri 2 + Vue 3 + TypeScript**，Rust 侧承载索引、加密与模型调用（`crates/bnu-core`）。
 - 本地数据：vault（Markdown 文件）+ SQLite（FTS5 全文索引、图谱、设置）；API Key 用本机密钥 AES-256-GCM 加密存储。
@@ -29,7 +29,7 @@ src-tauri/           Tauri 命令层（薄封装）
 src/core/            前端类型与契约
 src/platform/        适配器（Tauri 实现 / 浏览器 Mock）
 src/stores/          Pinia
-src/views/           笔记 / 问答 / 图谱 / 会议 / 设置
+src/views/           会议笔记 / 问答 / 图谱 / 设置
 docs/graph.md        知识图谱：抽取、存储、可视化与检索增强
 docs/models.md       四类模型端点、实测记录与注意事项
 ```
@@ -38,6 +38,6 @@ docs/models.md       四类模型端点、实测记录与注意事项
 
 - [docs/graph.md](docs/graph.md)：知识图谱（实体/关系抽取、防幻觉约束、G6 力导图、邻居扩展检索）。
 - [docs/models.md](docs/models.md)：模型端点配置、推荐模型、实测数据、上游限制。
-- [docs/meetings.md](docs/meetings.md)：会议模块——**会议 = 一篇 md**（`/v` 引用录音、一键处理转写 + 纪要）、录音面板、旧会议迁移与排障。
+- [docs/meetings.md](docs/meetings.md)：会议笔记——文件夹树、**会议 = 一篇 md**（`/v` 引用录音、一键处理转写 + 纪要）、录音归类、旧会议迁移与排障。
 - [docs/windows.md](docs/windows.md)：Windows 安装包怎么出、安装、数据位置与验收清单。
 - [docs/android.md](docs/android.md)：Android 工程、权限、release 签名与构建命令。

@@ -5,7 +5,10 @@ import {
   MINUTES_HEADING,
   MINUTES_HINT,
   appendRefLine,
+  clipCountsByNote,
   dirForNote,
+  dirForNoteLegacy,
+  dirsForNote,
   formatBytes,
   formatDur,
   insertRefAtCursor,
@@ -18,6 +21,8 @@ import {
   replaceAudioPlaceholders,
   slashCommandAt,
   splitMinutes,
+  unreferencedClips,
+  type ClipInfo,
   type ProcessOutcome,
   type ProcessProgress,
 } from './meetingNote'
@@ -174,12 +179,43 @@ describe('预览渲染（prepareAudioRefs + replaceAudioPlaceholders）', () => 
 })
 
 describe('dirForNote / 展示辅助', () => {
-  it('笔记 id 映射成音频目录名（与 Rust 对齐）', () => {
-    expect(dirForNote('会议/2026-09-22 周会.md')).toBe('2026-09-22 周会')
-    expect(dirForNote('会议/子目录/周会.md')).toBe('子目录_周会')
+  it('笔记 id 映射成音频目录（与 Rust 对齐：与笔记路径一一对应）', () => {
+    expect(dirForNote('会议/2026-09-22 周会.md')).toBe('会议/2026-09-22 周会')
+    expect(dirForNote('会议/子目录/周会.md')).toBe('会议/子目录/周会')
     expect(dirForNote('随手记.md')).toBe('随手记')
-    expect(dirForNote('会议/.md')).toBe('未命名会议')
+    expect(dirForNote('.md')).toBe('未命名')
     expect(AUDIO_DIR).toBe('会议音频')
+  })
+
+  it('旧版目录名保留（兼容 0.1.x 已录的音频）', () => {
+    expect(dirForNoteLegacy('会议/2026-09-22 周会.md')).toBe('2026-09-22 周会')
+    expect(dirForNoteLegacy('会议/子目录/周会.md')).toBe('子目录_周会')
+    expect(dirsForNote('会议/周会.md')).toEqual(['会议/周会', '周会'])
+    expect(dirsForNote('周会.md')).toEqual(['周会'])
+  })
+
+  it('未引用录音与列表徽章（新旧目录都算）', () => {
+    const mk = (dir: string, seq: number): ClipInfo => ({
+      dir,
+      file: `seg_${String(seq).padStart(4, '0')}.wav`,
+      path: `会议音频/${dir}/seg_${String(seq).padStart(4, '0')}.wav`,
+      seq,
+      bytes: 100,
+      durationMs: 1000,
+      sampleRate: 16000,
+      modifiedAt: seq,
+    })
+    const clips = [mk('会议/周会', 1), mk('会议/周会', 2), mk('周会', 1), mk('其它', 1)]
+    const unref = unreferencedClips(clips, [{ path: '会议音频/会议/周会/seg_0001.wav' }])
+    expect(unref.map((c) => c.path)).toEqual([
+      '会议音频/会议/周会/seg_0002.wav',
+      '会议音频/周会/seg_0001.wav',
+      '会议音频/其它/seg_0001.wav',
+    ])
+    expect(clipCountsByNote([{ id: '会议/周会.md' }, { id: '其它.md' }], clips)).toEqual({
+      '会议/周会.md': 3,
+      '其它.md': 1,
+    })
   })
 
   it('时长与体积格式化', () => {

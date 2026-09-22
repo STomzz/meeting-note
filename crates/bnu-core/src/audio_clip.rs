@@ -1,8 +1,11 @@
-//! vault 内的录音片段：`<vault>/会议音频/<目录>/seg_0001.wav`
+//! vault 内的录音片段：`<vault>/会议音频/<笔记路径>/seg_0001.wav`
 //!
 //! 与旧会议模块（应用数据目录 + `meetings` 表）不同，这里**文件即数据**：
-//! - 目录名由会议笔记的文件名推导（前端只传 `noteId`，避免两边各写一套规则）；
-//! - 分段按序号命名，序号 = 目录里已有的最大值 + 1；
+//! - 音频目录与笔记路径一一对应：`会议/周会.md` → `会议音频/会议/周会/seg_0001.wav`，
+//!   一眼能看出录音属于哪篇 md（前端只传 `noteId`，避免两边各写一套规则）；
+//! - 旧版（0.1.x）的扁平目录 `会议音频/周会/` 仍会被列出（见 [`dir_for_note_legacy`]），
+//!   保证历史引用与已有录音不失效；
+//! - 分段按序号命名，序号 = 新旧目录里已有的最大值 + 1；
 //! - 时长直接读 WAV 头算，不落库；
 //! - 所有路径都限制在 vault 内（拒绝绝对路径与 `..`）。
 
@@ -47,18 +50,64 @@ pub struct ClipStat {
     pub ref_line: String,
 }
 
-/// 会议笔记 id → 音频目录名：去掉 `会议/` 前缀与 `.md`，路径分隔换成 `_`。
+/// 笔记 id → 音频目录：与笔记路径一一对应（`会议/周会.md` → `会议/周会`）。
 pub fn dir_for_note(note_id: &str) -> String {
     let id = note_id.trim().trim_start_matches('/');
     let stem = id.strip_suffix(".md").unwrap_or(id);
+    let parts: Vec<String> = stem
+        .split(['/', '\\'])
+        .map(sanitize_segment)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return "未命名".to_string();
+    }
+    parts.join("/")
+}
+
+/// 旧版（0.1.x）目录名：去掉 `会议/` 前缀、路径分隔换成 `_`。
+///
+/// 只用于「把历史录音也列出来」的兼容逻辑，新录音一律写 [`dir_for_note`] 的新目录。
+pub fn dir_for_note_legacy(note_id: &str) -> String {
+    let id = note_id.trim().trim_start_matches('/');
+    let stem = id.strip_suffix(".md").unwrap_or(id);
     let stem = stem.strip_prefix("会议/").unwrap_or(stem);
-    let mut s: String =
-        stem.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
+    let mut s: String = stem
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect();
     s = s.trim().trim_matches('.').trim().to_string();
     if s.is_empty() {
         return "未命名会议".to_string();
     }
     s.chars().take(60).collect()
+}
+
+/// 单个路径段的安全文件名：去掉非法字符与首尾点/空格，限长 60。
+fn sanitize_segment(part: &str) -> String {
+    let s: String = part
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| {
+            if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let s = s.trim().trim_matches('.').trim();
+    s.chars().take(60).collect()
+}
+
+/// 一篇笔记可能存在的音频目录（新目录 + 旧版目录，去重）。
+pub fn dirs_for_note(note_id: &str) -> Vec<String> {
+    let mut dirs = vec![dir_for_note(note_id)];
+    let legacy = dir_for_note_legacy(note_id);
+    if !dirs.contains(&legacy) {
+        dirs.push(legacy);
+    }
+    dirs
 }
 
 /// 相对目录的安全校验：只允许 vault 内的相对路径。
@@ -105,13 +154,21 @@ pub fn seg_path(vault: &Path, dir: &str, seq: i64) -> Result<PathBuf> {
 
 /// vault 相对路径（统一 `/` 分隔）→ 用于写入 `/v` 引用与转写缓存键。
 pub fn rel_path(dir: &str, seq: i64) -> String {
-    format!("{AUDIO_DIR}/{}/{}", safe_rel(dir).unwrap_or_default(), seg_file(seq))
+    format!(
+        "{AUDIO_DIR}/{}/{}",
+        safe_rel(dir).unwrap_or_default(),
+        seg_file(seq)
+    )
 }
 
 /// 下一个可用序号（目录不存在 → 1）。
 pub fn next_seq(vault: &Path, dir: &str) -> i64 {
-    let Ok(path) = clip_dir(vault, dir, false) else { return 1 };
-    let Ok(rd) = std::fs::read_dir(&path) else { return 1 };
+    let Ok(path) = clip_dir(vault, dir, false) else {
+        return 1;
+    };
+    let Ok(rd) = std::fs::read_dir(&path) else {
+        return 1;
+    };
     let mut max = 0i64;
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -124,6 +181,54 @@ pub fn next_seq(vault: &Path, dir: &str) -> i64 {
         }
     }
     max + 1
+}
+
+/// 一篇笔记的下一个可用序号（新旧目录一起算，避免重号）。
+pub fn next_seq_for_note(vault: &Path, note_id: &str) -> i64 {
+    dirs_for_note(note_id)
+        .iter()
+        .map(|d| next_seq(vault, d))
+        .max()
+        .unwrap_or(1)
+}
+
+/// 开始一篇笔记的录音分段：写进新目录（与笔记路径一一对应）。
+pub fn start_for_note(vault: &Path, note_id: &str, sample_rate: u32) -> Result<ClipStat> {
+    let dir = dir_for_note(note_id);
+    let seq = next_seq_for_note(vault, note_id);
+    start(vault, &dir, seq, sample_rate)
+}
+
+/// 列出某篇笔记的录音（新目录 + 旧版目录，按目录与序号排序）。
+pub fn list_for_note(vault: &Path, note_id: &str) -> Result<Vec<ClipInfo>> {
+    let dirs = dirs_for_note(note_id);
+    let mut out: Vec<ClipInfo> = list(vault)?
+        .into_iter()
+        .filter(|c| dirs.contains(&c.dir))
+        .collect();
+    out.sort_by(|a, b| a.dir.cmp(&b.dir).then(a.seq.cmp(&b.seq)));
+    Ok(out)
+}
+
+/// 按 vault 相对路径删除一个分段（只允许 `会议音频/` 下、`seg_*.wav` 形式）。
+pub fn remove_path(vault: &Path, rel: &str) -> Result<()> {
+    let rel = rel.trim().replace('\\', "/");
+    let prefix = format!("{AUDIO_DIR}/");
+    let Some(rest) = rel.strip_prefix(&prefix) else {
+        return Err(anyhow!("只能删除 {AUDIO_DIR}/ 下的录音：{rel}"));
+    };
+    let Some((dir, file)) = rest.rsplit_once('/') else {
+        return Err(anyhow!("录音路径非法：{rel}"));
+    };
+    if !file.starts_with(SEG_PREFIX) || !file.ends_with(".wav") {
+        return Err(anyhow!("不是录音分段：{file}"));
+    }
+    let path = clip_dir(vault, dir, false)?.join(file);
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("删除录音分段失败: {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn stat_of(vault: &Path, dir: &str, seq: i64) -> Result<ClipStat> {
@@ -233,7 +338,7 @@ pub fn remove(vault: &Path, dir: &str, seq: i64) -> Result<()> {
     Ok(())
 }
 
-/// 列出 `会议音频/` 下的所有分段（深度 ≤ 3，按目录+序号排序）。
+/// 列出 `会议音频/` 下的所有分段（深度 ≤ 6，按目录+序号排序）。
 pub fn list(vault: &Path) -> Result<Vec<ClipInfo>> {
     let root = vault.join(AUDIO_DIR);
     let mut out: Vec<ClipInfo> = Vec::new();
@@ -245,7 +350,7 @@ pub fn list(vault: &Path) -> Result<Vec<ClipInfo>> {
 }
 
 fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<ClipInfo>) -> Result<()> {
-    if depth > 3 {
+    if depth > 6 {
         return Ok(());
     }
     for entry in std::fs::read_dir(dir)?.flatten() {
@@ -299,10 +404,53 @@ mod tests {
 
     #[test]
     fn note_id_maps_to_audio_dir() {
-        assert_eq!(dir_for_note("会议/2026-09-22 周会.md"), "2026-09-22 周会");
-        assert_eq!(dir_for_note("会议/子目录/周会.md"), "子目录_周会");
+        // 新目录：与笔记路径一一对应，一眼知道是哪篇 md 的音频
+        assert_eq!(
+            dir_for_note("会议/2026-09-22 周会.md"),
+            "会议/2026-09-22 周会"
+        );
+        assert_eq!(dir_for_note("会议/子目录/周会.md"), "会议/子目录/周会");
         assert_eq!(dir_for_note("随手记.md"), "随手记");
-        assert_eq!(dir_for_note("会议/.md"), "未命名会议");
+        assert_eq!(dir_for_note(".md"), "未命名");
+        // 旧目录：兼容 0.1.x 已录的历史音频
+        assert_eq!(
+            dir_for_note_legacy("会议/2026-09-22 周会.md"),
+            "2026-09-22 周会"
+        );
+        assert_eq!(dir_for_note_legacy("会议/子目录/周会.md"), "子目录_周会");
+        assert_eq!(dir_for_note_legacy("随手记.md"), "随手记");
+        assert_eq!(dir_for_note_legacy("会议/.md"), "未命名会议");
+    }
+
+    #[test]
+    fn note_audio_dirs_include_legacy_and_remove_checks_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        let note = "会议/周会.md";
+
+        // 旧版录音：写在扁平旧目录里
+        start(vault, "周会", 1, 16_000).unwrap();
+        close(vault, "周会", 1).unwrap();
+
+        // 新录音：写进与笔记路径对应的新目录，序号接在旧录音之后
+        let s = start_for_note(vault, note, 16_000).unwrap();
+        assert_eq!(s.dir, "会议/周会");
+        assert_eq!(s.seq, 2);
+        append(vault, &s.dir, s.seq, &[0u8; 3200]).unwrap();
+        close(vault, &s.dir, s.seq).unwrap();
+
+        let clips = list_for_note(vault, note).unwrap();
+        assert_eq!(clips.len(), 2, "新旧目录的录音都要列出来：{clips:?}");
+        assert!(clips.iter().any(|c| c.path == "会议音频/周会/seg_0001.wav"));
+        assert!(clips
+            .iter()
+            .any(|c| c.path == "会议音频/会议/周会/seg_0002.wav"));
+
+        // 按路径删除：只允许 会议音频/ 下的分段
+        remove_path(vault, "会议音频/会议/周会/seg_0002.wav").unwrap();
+        assert_eq!(list_for_note(vault, note).unwrap().len(), 1);
+        assert!(remove_path(vault, "../evil.wav").is_err());
+        assert!(remove_path(vault, "笔记.md").is_err());
     }
 
     #[test]

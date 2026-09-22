@@ -4,10 +4,9 @@ import { isTauri } from './platform'
 import RecorderPanel from './components/RecorderPanel.vue'
 
 const nav = [
-  { path: '/notes', label: '笔记', icon: '📝' },
+  { path: '/notes', label: '会议笔记', icon: '📝' },
   { path: '/chat', label: '问答', icon: '💬' },
   { path: '/graph', label: '图谱', icon: '🕸️' },
-  { path: '/meetings', label: '会议', icon: '🎙️' },
   { path: '/settings', label: '设置', icon: '⚙️' },
 ]
 

@@ -10,11 +10,37 @@ import {
 } from '../core/models'
 import { useSettingsStore } from '../stores/settings'
 import { useChatStore } from '../stores/chat'
+import { useNotesStore } from '../stores/notes'
+import { useMeetingNoteStore } from '../stores/meetingNote'
+import { useMeetingsStore } from '../stores/meetings'
 import { isTauri } from '../platform'
 
 const store = useSettingsStore()
 const chat = useChatStore()
+const notesStore = useNotesStore()
+const meeting = useMeetingNoteStore()
+const legacy = useMeetingsStore()
 const inTauri = isTauri()
+
+// 数据维护：旧会议导出 + 录音自检
+const migrating = ref(false)
+const migrateMsg = ref('')
+const showSelfCheck = ref(false)
+
+async function migrateLegacy() {
+  migrating.value = true
+  migrateMsg.value = ''
+  try {
+    const ids = await meeting.migrateLegacy()
+    migrateMsg.value = ids.length
+      ? `已导出 ${ids.length} 场旧会议到「会议/旧会议/」，录音也复制进了 会议音频/。`
+      : '没有可导出的旧会议（或都已导出过）。'
+  } catch (e) {
+    migrateMsg.value = `导出失败：${String(e)}`
+  } finally {
+    migrating.value = false
+  }
+}
 
 interface Draft {
   baseUrl: string
@@ -38,6 +64,7 @@ onMounted(async () => {
   fillFromConfig()
   devPrefill()
   void chat.loadStatus()
+  if (!notesStore.vault) void notesStore.init()
 })
 
 /** 开发模式便利：未配置的能力自动填入推荐端点与 .env.local 里的测试 Key（仍需手动点保存）。 */
@@ -295,9 +322,42 @@ function paramsPlaceholder(cap: Capability): string {
       </div>
 
       <div class="card">
-        <div class="card-title">存储与备份（P7 实现）</div>
+        <div class="card-title">数据维护</div>
         <div class="card-note">
-          笔记 vault 目录、zip 导出/导入、数据占用统计。全部数据只保存在本机。
+          vault 目录：<code>{{ notesStore.vault || '（未设置）' }}</code
+          >。笔记、录音（<code>会议音频/</code>，按笔记路径分类）、索引与密钥都只在本机。
+        </div>
+        <div class="index-row">
+          <t-button size="small" :loading="migrating" @click="migrateLegacy">
+            把旧版会议导出为笔记
+          </t-button>
+          <span class="stat">旧版录音会复制进 vault，转写与纪要一并带入</span>
+        </div>
+        <div v-if="migrateMsg" class="card-note">{{ migrateMsg }}</div>
+
+        <div class="index-row">
+          <t-button size="small" variant="outline" @click="showSelfCheck = !showSelfCheck">
+            录音自检（排障用）
+          </t-button>
+          <span class="stat">手机端录音异常时先跑这里</span>
+        </div>
+        <div v-if="showSelfCheck" class="selfcheck">
+          <t-button size="small" variant="outline" @click="legacy.runSelfCheck()">
+            检查环境
+          </t-button>
+          <t-button
+            size="small"
+            variant="outline"
+            :disabled="legacy.selfCheck.recording"
+            @click="legacy.startSelfCheckRecording(5)"
+          >
+            录 5 秒试听
+          </t-button>
+          <div v-for="(n, i) in legacy.selfCheck.notes" :key="i" class="stat">{{ n }}</div>
+          <div v-if="legacy.selfCheck.info" class="stat">
+            采样率 {{ legacy.selfCheck.info.sampleRate }} Hz · 峰值 {{ legacy.selfCheck.peak }}
+          </div>
+          <audio v-if="legacy.selfCheck.playbackUrl" :src="legacy.selfCheck.playbackUrl" controls />
         </div>
       </div>
     </div>
@@ -405,6 +465,14 @@ function paramsPlaceholder(cap: Capability): string {
 .stat {
   font-size: 12px;
   color: var(--text-3);
+}
+
+.selfcheck {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
 }
 
 .spacer {

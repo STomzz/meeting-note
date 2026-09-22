@@ -55,12 +55,17 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
     level: 0,
     recordInfo: null as RecorderInfo | null,
     recentClips: [] as ClipStat[],
+    lastClip: null as ClipStat | null,
     insertHint: '',
+    /** 录音增删版本号：界面用它触发「本笔记录音」徽章与列表刷新 */
+    clipRevision: 0,
     /** 等待编辑器插到光标处的引用（笔记正打开时走这条路，避免覆盖未保存编辑） */
     pendingRef: null as { noteId: string; text: string } | null,
 
     /** vault 里所有录音片段（`/v` 选择器用） */
     clips: [] as ClipInfo[],
+    /** vault 里所有录音片段（列表徽章用，独立于选择器状态） */
+    allClips: [] as ClipInfo[],
 
     error: '',
   }),
@@ -72,14 +77,13 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
     levelPercent(state): number {
       return Math.min(100, Math.round((state.level / 6000) * 100))
     },
-    /** 录音面板的目标笔记下拉项：会议笔记 + 当前打开的笔记。 */
-    targetOptions(state): { label: string; value: string }[] {
+    /** 录音面板的目标笔记下拉项：vault 里所有笔记（随笔记树一起更新）。 */
+    targetOptions(): { label: string; value: string }[] {
       const notesStore = useNotesStore()
-      const out = state.notes.map((n) => ({ label: `${n.title}（${n.noteId}）`, value: n.noteId }))
-      if (notesStore.currentId && !out.some((o) => o.value === notesStore.currentId)) {
-        out.unshift({ label: `当前笔记：${notesStore.currentId}`, value: notesStore.currentId })
-      }
-      return out
+      return notesStore.notes.map((n) => ({
+        label: n.folder ? `${n.title}（${n.folder}）` : n.title,
+        value: n.id,
+      }))
     },
     /** `/v` 选择器按剩余录制时长从新到旧排序。 */
     clipOptions(state): ClipInfo[] {
@@ -203,8 +207,8 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
       this.recorderOpen = open ?? !this.recorderOpen
       if (this.recorderOpen) {
         const notesStore = useNotesStore()
+        if (!notesStore.notes.length) await notesStore.refresh()
         if (!this.targetNoteId) this.targetNoteId = notesStore.currentId || this.currentId || ''
-        if (!this.notes.length) await this.loadList()
         try {
           this.clips = await meetingNoteAdapter().clipList()
         } catch (e) {
@@ -217,7 +221,7 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
       this.targetNoteId = noteId
     },
 
-    /** 开始录音；没有目标笔记时自动新建一场。 */
+    /** 开始录音；没有目标笔记时自动新建一场会议。 */
     async startRecording() {
       if (this.recording) return
       this.error = ''
@@ -225,11 +229,10 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
       let target = this.targetNoteId || notesStore.currentId || this.currentId
       try {
         if (!target) {
+          // 没有目标笔记：自动新建一场会议（`会议/<日期>-<时间>.md`）
           target = await this.create(defaultTitle())
-        } else if (!this.notes.some((n) => n.noteId === target)) {
-          // 目标不是会议笔记（比如随手记）：也能录，音频目录按笔记名推导
-          await this.loadList()
         }
+        if (!notesStore.notes.some((n) => n.id === target)) await notesStore.refresh()
         this.targetNoteId = target
         const info = await recorder.start({
           onChunk: (pcm) => void this.pushPcm(pcm),
@@ -256,6 +259,10 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
       }
     },
 
+    /**
+     * 停止录音：只保存分段并提示路径，**不自动写引用**。
+     * 引用由用户在笔记里用 `/v` 选择器插入（或「本笔记录音」里一键插入）。
+     */
     async stopRecording() {
       if (!this.recording) return
       const target = this.targetNoteId
@@ -269,17 +276,11 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
         this.recording = false
         if (target && seq > 0) {
           const stat = await meetingNoteAdapter().clipClose(target, seq)
-          this.recentClips = [stat, ...this.recentClips.filter((c) => c.seq !== stat.seq)]
-          const where = await this.insertRef(stat.refLine, target)
-          this.insertHint =
-            where === 'cursor'
-              ? '录音引用已插到笔记光标处（记得保存）'
-              : '录音引用已追加到笔记末尾'
-          await this.loadList()
-          const notesStore = useNotesStore()
-          if (notesStore.currentId === target && !notesStore.dirty && where !== 'cursor') {
-            await notesStore.openNote(target)
-          }
+          this.recentClips = [stat, ...this.recentClips.filter((c) => c.path !== stat.path)]
+          this.lastClip = stat
+          this.insertHint = `第 ${stat.seq} 段已保存：${stat.path}（用 /v 插入引用）`
+          this.clipRevision += 1
+          await this.loadClips(target)
           if (this.currentId === target) await this.openNote(target)
         }
       } catch (e) {
@@ -346,6 +347,8 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
         this.recordSeq = next.seq
         this.recordSegmentMs = 0
         this.insertHint = `第 ${stat.seq} 段已保存，继续录第 ${next.seq} 段`
+        this.clipRevision += 1
+        await this.loadClips(target)
       } catch (e) {
         this.error = String(e)
       }
@@ -366,11 +369,12 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
     },
 
     /** 丢弃一段录坏的录音（界面上要二次确认）。 */
-    async discardClip(clip: ClipStat) {
+    async discardClip(clip: { path: string }) {
       try {
-        await meetingNoteAdapter().clipDiscard(this.targetNoteId || this.currentId, clip.seq)
-        this.recentClips = this.recentClips.filter((c) => c.seq !== clip.seq)
-        await this.loadList()
+        await meetingNoteAdapter().clipDiscard(clip.path)
+        this.recentClips = this.recentClips.filter((c) => c.path !== clip.path)
+        this.clipRevision += 1
+        await this.loadClips(this.targetNoteId || this.currentId)
       } catch (e) {
         this.error = String(e)
       }
@@ -382,6 +386,16 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
       if (!target) return
       const where = await this.insertRef(clip.refLine, target)
       this.insertHint = where === 'cursor' ? '已插到光标处（记得保存）' : '已追加到笔记末尾'
+    },
+
+    /** 一次性插入多条引用行（「插入全部未引用」）。 */
+    async insertRefs(refLines: string[], noteId: string): Promise<'cursor' | 'end'> {
+      const text = refLines
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .join('\n')
+      if (!text) return 'end'
+      return this.insertRef(text, noteId)
     },
 
     /**
@@ -408,6 +422,15 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
     async loadClips(noteId?: string) {
       try {
         this.clips = await meetingNoteAdapter().clipList(noteId)
+      } catch (e) {
+        this.error = String(e)
+      }
+    },
+
+    /** 刷新全部录音片段（列表徽章 / 未引用提示用）。 */
+    async loadAllClips() {
+      try {
+        this.allClips = await meetingNoteAdapter().clipList()
       } catch (e) {
         this.error = String(e)
       }

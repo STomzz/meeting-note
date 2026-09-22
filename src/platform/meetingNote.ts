@@ -26,7 +26,8 @@ export interface MeetingNoteAdapter {
   clipStart(noteId: string, sampleRate: number): Promise<ClipStat>
   clipAppend(noteId: string, seq: number, pcmBase64: string): Promise<ClipStat>
   clipClose(noteId: string, seq: number): Promise<ClipStat>
-  clipDiscard(noteId: string, seq: number): Promise<void>
+  /** 按 vault 相对路径丢弃一段录音（只允许 `会议音频/` 下的分段）。 */
+  clipDiscard(path: string): Promise<void>
   clipList(noteId?: string): Promise<ClipInfo[]>
   /** vault 内音频的播放地址（预览模式返回 null）。 */
   audioSrc(relPath: string): Promise<string | null>
@@ -77,8 +78,8 @@ class TauriMeetingNoteAdapter implements MeetingNoteAdapter {
   clipClose(noteId: string, seq: number) {
     return invoke<ClipStat>('audio_clip_close', { noteId, seq })
   }
-  clipDiscard(noteId: string, seq: number) {
-    return invoke<void>('audio_clip_discard', { noteId, seq })
+  clipDiscard(relPath: string) {
+    return invoke<void>('audio_clip_discard', { path: relPath })
   }
   clipList(noteId?: string) {
     return invoke<ClipInfo[]>('audio_clip_list', { noteId: noteId ?? null })
@@ -119,13 +120,13 @@ class MockMeetingNoteAdapter implements MeetingNoteAdapter {
         '## 我的记录',
         '',
         '张三说镜像拉取超时，先换镜像站解决。',
-        '/v 会议音频/2026-09-22-示例周会/seg_0001.wav',
+        '/v 会议音频/会议/2026-09-22-示例周会/seg_0001.wav',
         '> 🎙 转写 00:00:00–00:02:06 · seg_0001.wav',
         '>',
         '> [00:00:00] 预览模式：这里是示例转写文本。',
         '',
         '我又补了一句：下周一补部署文档。',
-        '/v 会议音频/2026-09-22-示例周会/seg_0002.wav',
+        '/v 会议音频/会议/2026-09-22-示例周会/seg_0002.wav',
         '',
         '## 会议纪要（AI 整理）',
         '',
@@ -137,9 +138,9 @@ class MockMeetingNoteAdapter implements MeetingNoteAdapter {
 
   private clips: ClipInfo[] = [
     {
-      dir: '2026-09-22-示例周会',
+      dir: '会议/2026-09-22-示例周会',
       file: 'seg_0001.wav',
-      path: '会议音频/2026-09-22-示例周会/seg_0001.wav',
+      path: '会议音频/会议/2026-09-22-示例周会/seg_0001.wav',
       seq: 1,
       bytes: 4032000,
       durationMs: 126000,
@@ -147,9 +148,9 @@ class MockMeetingNoteAdapter implements MeetingNoteAdapter {
       modifiedAt: Math.floor(Date.now() / 1000) - 630,
     },
     {
-      dir: '2026-09-22-示例周会',
+      dir: '会议/2026-09-22-示例周会',
       file: 'seg_0002.wav',
-      path: '会议音频/2026-09-22-示例周会/seg_0002.wav',
+      path: '会议音频/会议/2026-09-22-示例周会/seg_0002.wav',
       seq: 2,
       bytes: 4032000,
       durationMs: 126000,
@@ -285,8 +286,9 @@ class MockMeetingNoteAdapter implements MeetingNoteAdapter {
     if (note) note.body = content
   }
   async clipStart(noteId: string, sampleRate: number) {
-    const dir = noteId.replace(/^会议\//, '').replace(/\.md$/, '')
-    const seq = this.clips.filter((c) => c.dir === dir).length + 1
+    const dir = mockDirFor(noteId)
+    const dirs = [dir, mockLegacyDirFor(noteId)]
+    const seq = this.clips.filter((c) => dirs.includes(c.dir)).reduce((m, c) => Math.max(m, c.seq), 0) + 1
     const clip: ClipInfo = {
       dir,
       file: `seg_${String(seq).padStart(4, '0')}.wav`,
@@ -310,18 +312,27 @@ class MockMeetingNoteAdapter implements MeetingNoteAdapter {
   async clipClose(noteId: string, seq: number) {
     return this.clipAppend(noteId, seq)
   }
-  async clipDiscard(noteId: string, seq: number) {
-    void noteId
-    this.clips = this.clips.filter((c) => c.seq !== seq)
+  async clipDiscard(path: string) {
+    this.clips = this.clips.filter((c) => c.path !== path)
   }
   async clipList(noteId?: string) {
     if (!noteId) return this.clips
-    const dir = noteId.replace(/^会议\//, '').replace(/\.md$/, '')
-    return this.clips.filter((c) => c.dir === dir)
+    const dirs = [mockDirFor(noteId), mockLegacyDirFor(noteId)]
+    return this.clips.filter((c) => dirs.includes(c.dir))
   }
   async audioSrc() {
     return null
   }
+}
+
+/** 预览模式：镜像 Rust 的音频目录规则（`会议/周会.md` → `会议/周会`）。 */
+function mockDirFor(noteId: string): string {
+  return noteId.trim().replace(/^\/+/, '').replace(/\.md$/, '')
+}
+
+/** 预览模式：旧版扁平目录（兼容展示历史录音）。 */
+function mockLegacyDirFor(noteId: string): string {
+  return mockDirFor(noteId).replace(/^会议\//, '').replace(/[\\/]/g, '_')
 }
 
 let adapter: MeetingNoteAdapter | null = null

@@ -1,17 +1,33 @@
 <script setup lang="ts">
+/**
+ * 会议笔记：vault 里所有 md 都在这里（会议只是其中一类）。
+ *
+ * - 左侧是文件夹树：点开文件夹才看到里面的笔记，右键可新建 / 重命名 / 移动；
+ * - 编辑器支持 `/v` 引用录音、预览播放、一键处理（转写 + 纪要）；
+ * - 录音面板在右下角，停止录音只保存文件，引用由 `/v` 或「本笔记录音」插入；
+ * - 处理前会提示还没写进笔记的录音，可一键插入或忽略。
+ */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { MessagePlugin } from 'tdesign-vue-next'
 import MarkdownIt from 'markdown-it'
 import { useNotesStore } from '../stores/notes'
 import { useMeetingNoteStore } from '../stores/meetingNote'
 import {
+  clipCountsByNote,
+  dirsForNote,
+  dirForNote,
+  formatBytes,
   formatDur,
   insertRefAtCursor,
   prepareAudioRefs,
   replaceAudioPlaceholders,
   parseRefs,
   slashCommandAt,
+  unreferencedClips,
 } from '../core/meetingNote'
 import type { ClipInfo } from '../core/meetingNote'
+import { ancestorsOf, buildTreeRows } from '../core/notesTree'
+import type { NoteMeta } from '../core/types'
 
 const store = useNotesStore()
 const meeting = useMeetingNoteStore()
@@ -19,28 +35,289 @@ const md = new MarkdownIt({ html: false, linkify: true })
 
 const query = ref('')
 const preview = ref(false)
+const editorEl = ref<HTMLTextAreaElement | null>(null)
+
+// ---------------------------------------------------------------- 目录树
+const expanded = ref<Set<string>>(new Set())
+const clipCounts = computed(() => clipCountsByNote(store.notes, meeting.allClips))
+const treeRows = computed(() =>
+  buildTreeRows(store.folders, store.notes, expanded.value, clipCounts.value),
+)
+
+function toggleFolder(path: string) {
+  const next = new Set(expanded.value)
+  if (next.has(path)) next.delete(path)
+  else next.add(path)
+  expanded.value = next
+}
+
+// ---------------------------------------------------------------- 右键菜单
+const menu = ref<{ x: number; y: number; kind: 'folder' | 'note'; path: string; name: string } | null>(
+  null,
+)
+
+function openMenu(e: MouseEvent, kind: 'folder' | 'note', path: string, name: string) {
+  menu.value = { x: e.clientX, y: e.clientY, kind, path, name }
+}
+
+// ---------------------------------------------------------------- 新建
 const showNew = ref(false)
 const newTitle = ref('')
 const newFolder = ref('')
 
-const editorEl = ref<HTMLTextAreaElement | null>(null)
+function startNewNote(folder = '') {
+  newFolder.value = folder
+  newTitle.value = ''
+  showNew.value = true
+  menu.value = null
+}
 
-/** vault 内音频的播放地址缓存（key = `/v` 里的路径原文） */
+async function createNote() {
+  const title = newTitle.value.trim()
+  if (!title) return
+  await store.createNote(newFolder.value.trim(), title)
+  const next = new Set(expanded.value)
+  if (newFolder.value.trim()) next.add(newFolder.value.trim())
+  expanded.value = next
+  showNew.value = false
+}
+
+const showNewFolder = ref(false)
+const newFolderName = ref('')
+const newFolderParent = ref('')
+
+function startNewFolder(parent = '') {
+  newFolderParent.value = parent
+  newFolderName.value = ''
+  showNewFolder.value = true
+  menu.value = null
+}
+
+async function createFolder() {
+  const name = newFolderName.value.trim()
+  if (!name) return
+  const path = newFolderParent.value ? `${newFolderParent.value}/${name}` : name
+  try {
+    const created = await store.createFolder(path)
+    const next = new Set(expanded.value)
+    for (const p of ancestorsOf(`${created}/x.md`)) next.add(p)
+    expanded.value = next
+    showNewFolder.value = false
+    MessagePlugin.success(`已新建文件夹 ${created}`)
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  }
+}
+
+// ---------------------------------------------------------------- 重命名 / 移动
+const renameTarget = ref<{ kind: 'folder' | 'note'; path: string } | null>(null)
+const renameValue = ref('')
+
+function startRename() {
+  const m = menu.value
+  if (!m) return
+  renameTarget.value = { kind: m.kind, path: m.path }
+  renameValue.value = m.name
+  menu.value = null
+}
+
+async function doRename() {
+  const target = renameTarget.value
+  const value = renameValue.value.trim()
+  if (!target || !value) return
+  try {
+    if (target.kind === 'folder') await store.renameFolder(target.path, value)
+    else await store.renameNote(target.path, value)
+    renameTarget.value = null
+    await meeting.loadAllClips()
+    MessagePlugin.success('已重命名')
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  }
+}
+
+const moveTarget = ref<NoteMeta | null>(null)
+const moveFolder = ref('')
+
+function startMove() {
+  const m = menu.value
+  if (!m || m.kind !== 'note') return
+  moveTarget.value = store.notes.find((n) => n.id === m.path) ?? null
+  moveFolder.value = moveTarget.value?.folder ?? ''
+  menu.value = null
+}
+
+async function doMove() {
+  const note = moveTarget.value
+  if (!note) return
+  try {
+    const next = await store.moveNote(note.id, moveFolder.value)
+    moveTarget.value = null
+    await meeting.loadAllClips()
+    if (next === note.id) MessagePlugin.info('笔记已在目标文件夹')
+    else MessagePlugin.success(`已移动到 ${next}`)
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  }
+}
+
+// ---------------------------------------------------------------- 打开笔记
+async function open(id: string) {
+  await store.openNote(id)
+  await meeting.openNote(id)
+  unrefDialog.value = false
+  preview.value = false
+  showClips.value = false
+  const next = new Set(expanded.value)
+  for (const p of ancestorsOf(id)) next.add(p)
+  expanded.value = next
+}
+
+function openHit(noteId: string) {
+  void open(noteId)
+}
+
+// ---------------------------------------------------------------- 录音片段
+const showClips = ref(false)
+const clipSrcMap = ref<Record<string, string | null>>({})
+const playing = ref('')
+const confirmDiscard = ref<ClipInfo | null>(null)
+
+/** 本笔记录音（新目录 + 旧版目录）。 */
+const currentClips = computed(() => {
+  if (!store.currentId) return []
+  const dirs = dirsForNote(store.currentId)
+  return meeting.allClips
+    .filter((c) => dirs.includes(c.dir))
+    .sort((a, b) => a.dir.localeCompare(b.dir) || a.seq - b.seq)
+})
+
+const refPathSet = computed(() => new Set(meeting.refs.map((r) => r.path)))
+const unrefClips = computed(() => unreferencedClips(currentClips.value, meeting.refs))
+
+function isRef(c: ClipInfo): boolean {
+  return refPathSet.value.has(c.path)
+}
+
+async function playClip(c: ClipInfo) {
+  if (playing.value === c.path) {
+    playing.value = ''
+    return
+  }
+  if (!(c.path in clipSrcMap.value)) {
+    clipSrcMap.value = { ...clipSrcMap.value, [c.path]: await meeting.clipSrc(c.path) }
+  }
+  if (!clipSrcMap.value[c.path]) {
+    MessagePlugin.info('这段音频暂不可播放（浏览器预览模式或文件缺失）')
+    return
+  }
+  playing.value = c.path
+}
+
+/** 直接在当前光标处插入若干引用行（编辑器打开时用）。 */
+function insertLinesNow(lines: string[]) {
+  if (!lines.length) return
+  const el = editorEl.value
+  let pos = el ? el.selectionStart : store.content.length
+  let body = store.content
+  for (const line of lines) {
+    const res = insertRefAtCursor(body, line, pos)
+    body = res.body
+    pos = res.cursor
+  }
+  store.setContent(body)
+  void nextTick(() => {
+    if (!editorEl.value) return
+    editorEl.value.focus()
+    editorEl.value.setSelectionRange(pos, pos)
+  })
+}
+
+async function insertClipNow(c: ClipInfo) {
+  insertLinesNow([`/v ${c.path}`])
+  await nextTick()
+  await store.save()
+  if (store.currentId) await meeting.openNote(store.currentId)
+  MessagePlugin.success('已插入引用（已保存）')
+}
+
+async function insertAllUnref() {
+  const lines = unrefClips.value.map((c) => `/v ${c.path}`)
+  insertLinesNow(lines)
+  await nextTick()
+  await store.save()
+  if (store.currentId) await meeting.openNote(store.currentId)
+  MessagePlugin.success(`已插入 ${lines.length} 条引用（已保存）`)
+}
+
+async function discardClip() {
+  const clip = confirmDiscard.value
+  confirmDiscard.value = null
+  if (!clip) return
+  await meeting.discardClip(clip)
+  await meeting.loadAllClips()
+  if (store.currentId) await meeting.openNote(store.currentId)
+}
+
+// ---------------------------------------------------------------- 一键处理
+const refCount = computed(() => parseRefs(store.content).length)
+const unrefDialog = ref(false)
+const unrefList = ref<ClipInfo[]>([])
+
+async function processCurrent() {
+  if (!store.currentId || meeting.processing) return
+  await store.save()
+  await meeting.openNote(store.currentId)
+  await meeting.loadAllClips()
+  const unref = unreferencedClips(currentClips.value, meeting.refs)
+  if (unref.length) {
+    unrefList.value = unref
+    unrefDialog.value = true
+    return
+  }
+  await runProcess()
+}
+
+async function runProcess() {
+  if (!store.currentId) return
+  await meeting.openNote(store.currentId)
+  await meeting.process(false)
+}
+
+async function insertUnrefAndProcess() {
+  const lines = unrefList.value.map((c) => `/v ${c.path}`)
+  insertLinesNow(lines)
+  unrefDialog.value = false
+  await nextTick()
+  await store.save()
+  await meeting.openNote(store.currentId)
+  await runProcess()
+}
+
+async function ignoreUnref() {
+  unrefDialog.value = false
+  await runProcess()
+}
+
+// ---------------------------------------------------------------- 编辑器
 const audioSrcMap = ref<Record<string, string | null>>({})
 const loadingSrc = new Set<string>()
 
-/** `/v` 选择器状态 */
 const slashOpen = ref(false)
 const slashFilter = ref('')
 const slashIndex = ref(0)
 
-const refCount = computed(() => parseRefs(store.content).length)
-
 const slashMatches = computed(() => {
   const q = slashFilter.value.toLowerCase()
-  const list = meeting.clipOptions
-  if (!q) return list.slice(0, 8)
-  return list.filter((c) => `${c.dir}/${c.file}`.toLowerCase().includes(q)).slice(0, 8)
+  const own = new Set(currentClips.value.map((c) => c.path))
+  const unref = new Set(unrefClips.value.map((c) => c.path))
+  let list = [...meeting.clips]
+  list.sort((a, b) => {
+    const rank = (c: ClipInfo) => (own.has(c.path) ? 0 : 2) + (unref.has(c.path) ? 0 : 1)
+    return rank(a) - rank(b) || b.modifiedAt - a.modifiedAt
+  })
+  if (q) list = list.filter((c) => `${c.dir}/${c.file}`.toLowerCase().includes(q))
+  return list.slice(0, 8)
 })
 
 const rendered = computed(() => renderMarkdown(store.content))
@@ -78,6 +355,7 @@ function resolveSrc(raw: string): string | null {
 
 onMounted(async () => {
   await store.init()
+  await meeting.loadAllClips()
   window.addEventListener('keydown', onKey)
 })
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
@@ -100,10 +378,19 @@ watch(
   },
 )
 
+/** 录音增删后：刷新徽章与引用状态。 */
+watch(
+  () => meeting.clipRevision,
+  async () => {
+    await meeting.loadAllClips()
+    if (store.currentId) await meeting.openNote(store.currentId)
+  },
+)
+
 function onKey(e: KeyboardEvent) {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
     e.preventDefault()
-    void store.save()
+    void saveCurrent()
   }
 }
 
@@ -159,41 +446,14 @@ function applyClip(clip: ClipInfo) {
   })
 }
 
-/** 编辑器里直接「一键处理」：先保存再处理，避免处理到旧内容。 */
-async function processCurrent() {
-  if (!store.currentId || meeting.processing) return
-  await store.save()
-  await meeting.openNote(store.currentId)
-  await meeting.process(false)
-}
-
-function fmt(ts: number): string {
-  if (!ts) return ''
-  const d = new Date(ts * 1000)
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
-
 async function onSearch() {
   await store.search(query.value)
 }
 
-function openHit(noteId: string) {
-  void store.openNote(noteId)
-}
-
-async function open(id: string) {
-  await store.openNote(id)
-  preview.value = false
-}
-
-async function create() {
-  const title = newTitle.value.trim()
-  if (!title) return
-  await store.createNote(newFolder.value.trim(), title)
-  showNew.value = false
-  newTitle.value = ''
-  newFolder.value = ''
+/** 保存后刷新引用状态（未引用计数/选择器标签依赖它）。 */
+async function saveCurrent() {
+  await store.save()
+  if (store.currentId) await meeting.openNote(store.currentId)
 }
 
 async function removeCurrent() {
@@ -201,16 +461,18 @@ async function removeCurrent() {
   const ok = window.confirm(`确定删除「${store.current?.title ?? store.currentId}」？文件会从磁盘删除。`)
   if (!ok) return
   await store.removeNote(store.currentId)
+  await meeting.loadAllClips()
 }
 </script>
 
 <template>
   <div class="page">
     <header class="page-header">
-      <span class="page-title">笔记</span>
+      <span class="page-title">会议笔记</span>
       <span class="page-sub" :title="store.vault">{{ store.vault }}</span>
       <span v-if="store.scanMessage" class="scan-msg">{{ store.scanMessage }}</span>
       <span class="spacer" />
+      <t-button size="small" variant="outline" @click="meeting.toggleRecorder(true)">🎙 录音</t-button>
       <t-button size="small" :loading="store.scanning" @click="store.scan()">扫描 vault</t-button>
     </header>
 
@@ -225,34 +487,14 @@ async function removeCurrent() {
             @enter="onSearch"
             @clear="onSearch"
           />
-          <t-button size="small" theme="primary" @click="showNew = true">新建</t-button>
         </div>
-
-        <div class="chips">
-          <span
-            class="chip"
-            :class="{ on: store.folderFilter === '' }"
-            @click="store.folderFilter = ''"
-            >全部</span
-          >
-          <span
-            v-for="f in store.folders"
-            :key="f.path || '(根)'"
-            class="chip"
-            :class="{ on: store.folderFilter === f.path }"
-            @click="store.folderFilter = f.path"
-            >{{ f.path || '根目录' }} {{ f.count }}</span
-          >
-        </div>
-        <div v-if="store.tags.length" class="chips">
-          <span
-            v-for="t in store.tags"
-            :key="t"
-            class="chip tag"
-            :class="{ on: store.tagFilter === t }"
-            @click="store.tagFilter = store.tagFilter === t ? '' : t"
-            >#{{ t }}</span
-          >
+        <div class="list-actions">
+          <t-button size="small" theme="primary" @click="startNewNote(store.current?.folder ?? '')">
+            新建笔记
+          </t-button>
+          <t-button size="small" variant="outline" @click="startNewFolder(store.current?.folder ?? '')">
+            新建文件夹
+          </t-button>
         </div>
 
         <div class="note-list">
@@ -269,24 +511,35 @@ async function removeCurrent() {
               <div class="hit-snippet">{{ h.snippet }}</div>
               <div class="note-meta">{{ h.noteId }} · L{{ h.startLine }}-{{ h.endLine }}</div>
             </div>
+            <div v-if="!store.hits.length" class="empty">没有匹配的笔记</div>
           </template>
 
-          <!-- 笔记列表 -->
+          <!-- 文件夹树 -->
           <template v-else>
-            <div class="list-label">{{ store.visibleNotes.length }} 篇笔记</div>
+            <div class="list-label">{{ store.notes.length }} 篇笔记</div>
             <div
-              v-for="n in store.visibleNotes"
-              :key="n.id"
-              class="note-item"
-              :class="{ active: n.id === store.currentId }"
-              @click="open(n.id)"
+              v-for="row in treeRows"
+              :key="`${row.kind}:${row.path}`"
+              class="tree-row"
+              :class="{ active: row.kind === 'note' && row.path === store.currentId }"
+              :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
+              @click="row.kind === 'folder' ? toggleFolder(row.path) : open(row.path)"
+              @contextmenu.prevent="openMenu($event, row.kind, row.path, row.name)"
             >
-              <div class="note-title">{{ n.title }}</div>
-              <div class="note-meta">
-                {{ n.folder || '根目录' }} · {{ fmt(n.updatedAt) }}
-              </div>
+              <template v-if="row.kind === 'folder'">
+                <span class="tree-caret">{{ row.expanded ? '▾' : '▸' }}</span>
+                <span class="tree-icon">📁</span>
+                <span class="tree-name">{{ row.name }}</span>
+                <span class="tree-count">{{ row.count }}</span>
+              </template>
+              <template v-else>
+                <span class="tree-caret" />
+                <span class="tree-icon">📄</span>
+                <span class="tree-name">{{ row.name }}</span>
+                <span v-if="row.count" class="tree-badge">🎙 {{ row.count }}</span>
+              </template>
             </div>
-            <div v-if="!store.visibleNotes.length" class="empty">还没有笔记，点「新建」开始</div>
+            <div v-if="!treeRows.length" class="empty">还没有笔记，点「新建笔记」开始</div>
           </template>
         </div>
       </aside>
@@ -299,6 +552,16 @@ async function removeCurrent() {
             <span v-if="store.dirty" class="dirty">未保存</span>
             <span class="spacer" />
             <t-button
+              v-if="currentClips.length"
+              size="small"
+              variant="outline"
+              @click="showClips = !showClips"
+            >
+              🎙 {{ currentClips.length }} 段<template v-if="unrefClips.length">
+                · {{ unrefClips.length }} 未引用</template
+              >
+            </t-button>
+            <t-button
               v-if="refCount"
               size="small"
               variant="outline"
@@ -307,7 +570,7 @@ async function removeCurrent() {
             >
               一键处理（{{ refCount }} 段录音）
             </t-button>
-            <t-button size="small" :disabled="!store.dirty" theme="primary" @click="store.save()"
+            <t-button size="small" :disabled="!store.dirty" theme="primary" @click="saveCurrent()"
               >保存</t-button
             >
             <t-button size="small" variant="outline" @click="preview = !preview">
@@ -317,6 +580,48 @@ async function removeCurrent() {
               >删除</t-button
             >
           </div>
+
+          <!-- 本笔记录音 -->
+          <div v-if="showClips && currentClips.length" class="clips-panel">
+            <div class="clips-head">
+              <span class="clips-title">
+                本笔记录音 · <code>会议音频/{{ dirForNote(store.currentId) }}</code>
+              </span>
+              <span class="spacer" />
+              <t-button
+                v-if="unrefClips.length"
+                size="small"
+                theme="primary"
+                variant="outline"
+                @click="insertAllUnref"
+              >
+                插入全部未引用（{{ unrefClips.length }}）
+              </t-button>
+            </div>
+            <div v-for="c in currentClips" :key="c.path" class="clip-row">
+              <span class="clip-name">{{ c.file }}</span>
+              <span class="clip-meta">
+                {{ formatDur(c.durationMs) }} · {{ formatBytes(c.bytes) }} ·
+                {{ isRef(c) ? '已引用' : '未引用' }}
+              </span>
+              <t-button size="small" variant="text" @click="playClip(c)">
+                {{ playing === c.path ? '停止' : '试听' }}
+              </t-button>
+              <t-button v-if="!isRef(c)" size="small" variant="text" @click="insertClipNow(c)">
+                插入
+              </t-button>
+              <t-button size="small" variant="text" theme="danger" @click="confirmDiscard = c">
+                丢弃
+              </t-button>
+              <audio
+                v-if="playing === c.path && clipSrcMap[c.path]"
+                :src="clipSrcMap[c.path] ?? ''"
+                controls
+                autoplay
+              />
+            </div>
+          </div>
+
           <div v-if="meeting.processing || meeting.message" class="editor-progress">
             <t-progress :percentage="meeting.progress" :label="false" />
             <span class="editor-progress-text">{{ meeting.message }}</span>
@@ -348,7 +653,9 @@ async function removeCurrent() {
                 :class="{ on: i === slashIndex }"
                 @mousedown.prevent="applyClip(c)"
               >
-                <span class="slash-name">{{ c.dir }}/{{ c.file }}</span>
+                <span v-if="isRef(c)" class="slash-tag">已引用</span>
+                <span v-else class="slash-tag new">未引用</span>
+                <span class="slash-name" :title="`${c.dir}/${c.file}`">{{ c.dir }}/{{ c.file }}</span>
                 <span class="slash-meta">{{ formatDur(c.durationMs) }}</span>
               </div>
             </div>
@@ -358,25 +665,135 @@ async function removeCurrent() {
       </section>
     </div>
 
+    <!-- 右键菜单 -->
+    <div v-if="menu" class="ctx-backdrop" @click="menu = null" @contextmenu.prevent="menu = null" />
+    <div v-if="menu" class="ctx" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }">
+      <template v-if="menu.kind === 'folder'">
+        <div class="ctx-item" @click="startNewNote(menu.path)">在此新建笔记</div>
+        <div class="ctx-item" @click="startNewFolder(menu.path)">新建子文件夹</div>
+      </template>
+      <div class="ctx-item" @click="startRename">
+        {{ menu.kind === 'folder' ? '重命名文件夹' : '重命名笔记' }}
+      </div>
+      <div v-if="menu.kind === 'note'" class="ctx-item" @click="startMove">移动到…</div>
+    </div>
+
+    <!-- 新建笔记 -->
     <t-dialog
       v-model:visible="showNew"
       header="新建笔记"
       :confirm-btn="{ content: '创建', disabled: !newTitle.trim() }"
-      @confirm="create"
+      @confirm="createNote"
     >
       <div class="dialog-row">
         <span class="dialog-label">标题</span>
-        <t-input v-model="newTitle" placeholder="例如：周会纪要" />
+        <t-input v-model="newTitle" placeholder="例如：周会纪要" @enter="createNote" />
       </div>
       <div class="dialog-row">
         <span class="dialog-label">文件夹</span>
-        <t-input v-model="newFolder" placeholder="可留空，例如：工作" />
+        <t-select v-model="newFolder" :options="store.folderOptions" size="small" />
       </div>
+    </t-dialog>
+
+    <!-- 新建文件夹 -->
+    <t-dialog
+      v-model:visible="showNewFolder"
+      header="新建文件夹"
+      :confirm-btn="{ content: '创建', disabled: !newFolderName.trim() }"
+      @confirm="createFolder"
+    >
+      <div class="dialog-row">
+        <span class="dialog-label">名称</span>
+        <t-input v-model="newFolderName" placeholder="例如：项目 A" @enter="createFolder" />
+      </div>
+      <div class="dialog-row">
+        <span class="dialog-label">上级</span>
+        <t-select v-model="newFolderParent" :options="store.folderOptions" size="small" />
+      </div>
+    </t-dialog>
+
+    <!-- 重命名 -->
+    <t-dialog
+      :visible="!!renameTarget"
+      :header="renameTarget?.kind === 'folder' ? '重命名文件夹' : '重命名笔记'"
+      :confirm-btn="{ content: '重命名', disabled: !renameValue.trim() }"
+      @confirm="doRename"
+      @cancel="renameTarget = null"
+      @close="renameTarget = null"
+    >
+      <div class="dialog-row">
+        <span class="dialog-label">新名字</span>
+        <t-input v-model="renameValue" @enter="doRename" />
+      </div>
+      <div v-if="renameTarget?.kind === 'note'" class="dialog-hint">
+        只改文件名；笔记里的内容与录音引用不受影响，别处对这篇笔记的链接不会自动更新。
+      </div>
+    </t-dialog>
+
+    <!-- 移动 -->
+    <t-dialog
+      :visible="!!moveTarget"
+      header="移动到文件夹"
+      :confirm-btn="{ content: '移动' }"
+      @confirm="doMove"
+      @cancel="moveTarget = null"
+      @close="moveTarget = null"
+    >
+      <div class="dialog-row">
+        <span class="dialog-label">目标</span>
+        <t-select v-model="moveFolder" :options="store.folderOptions" size="small" />
+      </div>
+      <div class="dialog-hint">重名时自动加序号；录音留在原目录，引用不会失效。</div>
+    </t-dialog>
+
+    <!-- 未引用录音提醒 -->
+    <t-dialog
+      v-model:visible="unrefDialog"
+      header="还有录音没写进笔记"
+      :footer="false"
+      width="520px"
+    >
+      <p class="unref-text">
+        这段笔记的目录里还有 <b>{{ unrefList.length }}</b> 段录音没有 `/v` 引用，
+        直接处理的话它们不会被转写：
+      </p>
+      <ul class="unref-list">
+        <li v-for="c in unrefList" :key="c.path">
+          {{ c.dir }}/{{ c.file }}（{{ formatDur(c.durationMs) }}）
+        </li>
+      </ul>
+      <div class="dialog-actions">
+        <t-button theme="primary" @click="insertUnrefAndProcess">插入并处理</t-button>
+        <t-button variant="outline" @click="ignoreUnref">忽略并继续</t-button>
+        <t-button variant="text" @click="unrefDialog = false">取消</t-button>
+      </div>
+    </t-dialog>
+
+    <!-- 丢弃录音 -->
+    <t-dialog
+      :visible="!!confirmDiscard"
+      header="丢弃这段录音？"
+      :confirm-btn="{ content: '丢弃', theme: 'danger' }"
+      @confirm="discardClip"
+      @cancel="confirmDiscard = null"
+      @close="confirmDiscard = null"
+    >
+      <p>
+        将删除文件 <code>{{ confirmDiscard?.path }}</code>
+        （{{ confirmDiscard ? formatDur(confirmDiscard.durationMs) : '' }}），已写入笔记的引用需要自己删。
+      </p>
     </t-dialog>
   </div>
 </template>
 
 <style scoped>
+.page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .notes {
   flex: 1;
   min-height: 0;
@@ -384,8 +801,8 @@ async function removeCurrent() {
 }
 
 .list-pane {
-  width: 300px;
-  flex: 0 0 300px;
+  width: 320px;
+  flex: 0 0 320px;
   border-right: 1px solid var(--border);
   background: var(--panel);
   display: flex;
@@ -396,35 +813,14 @@ async function removeCurrent() {
 .list-head {
   display: flex;
   gap: 8px;
-  padding: 12px;
-  border-bottom: 1px solid var(--border);
+  padding: 12px 12px 8px;
 }
 
-.chips {
+.list-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 8px 12px 0;
-}
-
-.chip {
-  font-size: 12px;
-  color: var(--text-2);
-  background: #f2f3f5;
-  border-radius: 10px;
-  padding: 2px 8px;
-  cursor: pointer;
-  user-select: none;
-}
-
-.chip.on {
-  background: var(--primary);
-  color: #fff;
-}
-
-.chip.tag {
-  background: #eef3ff;
-  color: var(--primary);
+  gap: 8px;
+  padding: 0 12px 8px;
+  border-bottom: 1px solid var(--border);
 }
 
 .note-list {
@@ -438,6 +834,54 @@ async function removeCurrent() {
   font-size: 12px;
   color: var(--text-3);
   padding: 6px 6px 8px;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  user-select: none;
+}
+
+.tree-row:hover {
+  background: #f5f6f8;
+}
+
+.tree-row.active {
+  background: #eef3ff;
+}
+
+.tree-caret {
+  width: 12px;
+  color: var(--text-3);
+  font-size: 10px;
+  flex: 0 0 12px;
+}
+
+.tree-icon {
+  font-size: 13px;
+}
+
+.tree-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-count,
+.tree-badge {
+  font-size: 11px;
+  color: var(--text-3);
+  flex: 0 0 auto;
+}
+
+.tree-badge {
+  color: var(--primary);
 }
 
 .note-item {
@@ -497,6 +941,41 @@ async function removeCurrent() {
   border-bottom: 1px solid var(--border);
 }
 
+.clips-panel {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 16px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #fafbfc;
+}
+
+.clips-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.clips-title {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.clip-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.clip-name {
+  font-family: ui-monospace, monospace;
+}
+
+.clip-meta {
+  color: var(--text-3);
+}
+
 .editor-progress {
   display: flex;
   align-items: center;
@@ -516,7 +995,7 @@ async function removeCurrent() {
   position: absolute;
   left: 24px;
   bottom: 24px;
-  width: 420px;
+  width: 460px;
   max-width: calc(100% - 48px);
   max-height: 260px;
   overflow: auto;
@@ -553,6 +1032,20 @@ async function removeCurrent() {
 .slash-item.on,
 .slash-item:hover {
   background: rgba(0, 82, 217, 0.08);
+}
+
+.slash-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+
+.slash-tag.new {
+  color: var(--primary);
+  border-color: var(--primary);
 }
 
 .slash-name {
@@ -660,6 +1153,35 @@ async function removeCurrent() {
   color: var(--text-3);
 }
 
+/* 右键菜单 */
+.ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+}
+
+.ctx {
+  position: fixed;
+  z-index: 1001;
+  min-width: 150px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+  padding: 4px;
+}
+
+.ctx-item {
+  font-size: 13px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.ctx-item:hover {
+  background: #f2f3f5;
+}
+
 .dialog-row {
   display: flex;
   align-items: center;
@@ -672,5 +1194,34 @@ async function removeCurrent() {
   font-size: 13px;
   color: var(--text-2);
   flex: 0 0 52px;
+}
+
+.dialog-hint {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.7;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.unref-text {
+  font-size: 13px;
+  line-height: 1.8;
+  margin: 0 0 6px;
+}
+
+.unref-list {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-2);
+  font-family: ui-monospace, monospace;
+  max-height: 180px;
+  overflow: auto;
 }
 </style>

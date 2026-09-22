@@ -59,7 +59,10 @@ pub fn note_id(rel: &str) -> String {
 pub fn ensure_safe_id(id: &str) -> Result<()> {
     anyhow::ensure!(!id.is_empty(), "笔记 id 不能为空");
     anyhow::ensure!(!id.contains('\0'), "笔记 id 非法");
-    anyhow::ensure!(!id.starts_with('/') && !id.starts_with('\\'), "笔记 id 不能是绝对路径");
+    anyhow::ensure!(
+        !id.starts_with('/') && !id.starts_with('\\'),
+        "笔记 id 不能是绝对路径"
+    );
     anyhow::ensure!(!id.contains(':'), "笔记 id 非法");
     for part in id.split(['/', '\\']) {
         anyhow::ensure!(part != "..", "笔记 id 不能包含 ..");
@@ -266,8 +269,7 @@ pub fn write_note(conn: &Connection, root: &Path, id: &str, content: &str) -> Re
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, content)
-        .with_context(|| format!("写入笔记失败: {}", path.display()))?;
+    std::fs::write(&path, content).with_context(|| format!("写入笔记失败: {}", path.display()))?;
     index_file(conn, root, &path)
 }
 
@@ -298,10 +300,210 @@ pub fn delete_note(conn: &Connection, root: &Path, id: &str) -> Result<()> {
     ensure_safe_id(id)?;
     let path = root.join(id);
     if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("删除笔记失败: {}", path.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("删除笔记失败: {}", path.display()))?;
     }
     remove_from_index(conn, id)
+}
+
+// ------------------------------------------------------------ 文件夹与移动
+
+/// 文件夹信息（左侧目录树用；空文件夹也会返回）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderInfo {
+    pub path: String,
+    /// 直接放在这个文件夹里的笔记数（不含子文件夹）。
+    pub note_count: i64,
+}
+
+/// 校验 vault 内相对目录：统一 `/`，拒绝绝对路径、`..`、隐藏名与非法字符。
+pub fn safe_dir_rel(rel: &str) -> Result<String> {
+    let rel = rel.trim().trim_matches('/').replace('\\', "/");
+    anyhow::ensure!(!rel.is_empty(), "文件夹名不能为空");
+    anyhow::ensure!(
+        !rel.contains('\0') && !rel.contains(':'),
+        "文件夹名含非法字符：{rel}"
+    );
+    for part in rel.split('/') {
+        anyhow::ensure!(!part.is_empty(), "文件夹路径非法：{rel}");
+        anyhow::ensure!(
+            part != "." && part != "..",
+            "文件夹路径不能包含 . / ..：{rel}"
+        );
+        anyhow::ensure!(!part.starts_with('.'), "文件夹名不能以 . 开头：{rel}");
+        anyhow::ensure!(
+            !part
+                .chars()
+                .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | '\\') || c.is_control()),
+            "文件夹名含非法字符：{rel}"
+        );
+    }
+    Ok(rel)
+}
+
+/// `会议音频/` 是录音数据目录，不允许当笔记文件夹用。
+fn ensure_not_audio_dir(rel: &str) -> Result<()> {
+    let audio = crate::audio_clip::AUDIO_DIR;
+    anyhow::ensure!(
+        rel != audio && !rel.starts_with(&format!("{audio}/")),
+        "「{audio}」是录音数据目录，不能作为笔记文件夹"
+    );
+    Ok(())
+}
+
+/// 新建文件夹（支持多级），返回规范化相对路径。
+pub fn create_folder(root: &Path, rel: &str) -> Result<String> {
+    let rel = safe_dir_rel(rel)?;
+    ensure_not_audio_dir(&rel)?;
+    let path = root.join(&rel);
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("创建文件夹失败: {}", path.display()))?;
+    Ok(rel)
+}
+
+/// 列出 vault 里的文件夹（隐藏目录与 `会议音频/` 除外；空文件夹也返回）。
+pub fn list_folders(conn: &Connection, root: &Path) -> Result<Vec<FolderInfo>> {
+    let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT folder, COUNT(*) FROM notes WHERE folder <> '' GROUP BY folder")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for (folder, count) in rows.flatten() {
+            counts.insert(folder, count);
+        }
+    }
+    let audio = crate::audio_clip::AUDIO_DIR;
+    let mut out: Vec<FolderInfo> = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                return false;
+            }
+            if e.file_type().is_dir() && rel_path(root, e.path()) == audio {
+                return false;
+            }
+            true
+        })
+        .flatten()
+    {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let rel = rel_path(root, entry.path());
+        out.push(FolderInfo {
+            path: rel.clone(),
+            note_count: counts.get(&rel).copied().unwrap_or(0),
+        });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// 重命名文件夹（只改最后一段名字），返回新路径。
+pub fn rename_folder(conn: &Connection, root: &Path, rel: &str, new_name: &str) -> Result<String> {
+    let rel = safe_dir_rel(rel)?;
+    ensure_not_audio_dir(&rel)?;
+    let name = safe_dir_rel(new_name)?;
+    anyhow::ensure!(!name.contains('/'), "新名字只能是一层文件夹名：{new_name}");
+    let old = root.join(&rel);
+    anyhow::ensure!(old.is_dir(), "文件夹不存在：{rel}");
+    let parent = folder_of(&rel);
+    let new_rel = if parent.is_empty() {
+        name
+    } else {
+        format!("{parent}/{name}")
+    };
+    ensure_not_audio_dir(&new_rel)?;
+    let new_path = root.join(&new_rel);
+    anyhow::ensure!(!new_path.exists(), "同名文件夹已存在：{new_rel}");
+    std::fs::rename(&old, &new_path)
+        .with_context(|| format!("重命名文件夹失败: {}", old.display()))?;
+    scan_vault(conn, root)?;
+    Ok(new_rel)
+}
+
+/// 把笔记移动到另一个文件夹（保留文件名，重名自动加序号），返回新 id。
+pub fn move_note(conn: &Connection, root: &Path, id: &str, folder: &str) -> Result<String> {
+    ensure_safe_id(id)?;
+    let folder = folder.trim();
+    let folder = if folder.is_empty() {
+        String::new()
+    } else {
+        safe_dir_rel(folder)?
+    };
+    if !folder.is_empty() {
+        ensure_not_audio_dir(&folder)?;
+    }
+    let old = root.join(id);
+    anyhow::ensure!(old.is_file(), "笔记不存在：{id}");
+    if folder_of(id) == folder {
+        return Ok(id.to_string());
+    }
+    let file = old
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let stem = Path::new(&file)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if !folder.is_empty() {
+        std::fs::create_dir_all(root.join(&folder))?;
+    }
+    let mut candidate = if folder.is_empty() {
+        file.clone()
+    } else {
+        format!("{folder}/{file}")
+    };
+    let mut n = 2;
+    while root.join(&candidate).exists() {
+        candidate = if folder.is_empty() {
+            format!("{stem}-{n}.md")
+        } else {
+            format!("{folder}/{stem}-{n}.md")
+        };
+        n += 1;
+    }
+    std::fs::rename(&old, root.join(&candidate))
+        .with_context(|| format!("移动笔记失败: {}", old.display()))?;
+    scan_vault(conn, root)?;
+    Ok(candidate)
+}
+
+/// 重命名笔记（同目录，仅换标题；重名自动加序号），返回新 id。
+pub fn rename_note(conn: &Connection, root: &Path, id: &str, title: &str) -> Result<String> {
+    ensure_safe_id(id)?;
+    let old = root.join(id);
+    anyhow::ensure!(old.is_file(), "笔记不存在：{id}");
+    let folder = folder_of(id);
+    let base = safe_filename(title);
+    let mut candidate = if folder.is_empty() {
+        format!("{base}.md")
+    } else {
+        format!("{folder}/{base}.md")
+    };
+    if candidate == id {
+        return Ok(id.to_string());
+    }
+    let mut n = 2;
+    while root.join(&candidate).exists() {
+        candidate = if folder.is_empty() {
+            format!("{base}-{n}.md")
+        } else {
+            format!("{folder}/{base}-{n}.md")
+        };
+        n += 1;
+    }
+    std::fs::rename(&old, root.join(&candidate))
+        .with_context(|| format!("重命名笔记失败: {}", old.display()))?;
+    scan_vault(conn, root)?;
+    Ok(candidate)
 }
 
 /// 查询词 >= 3 字符时返回 FTS5 MATCH 表达式；更短返回 `None`（调用方走 LIKE 兜底）。
@@ -493,7 +695,11 @@ mod tests {
             "工作/周会.md",
             "---\ntags: [会议]\n---\n# 周会纪要\n\n讨论了镜像拉取超时的问题，决定改用镜像站。\n",
         );
-        write(root, "读书.md", "# 读书笔记\n\n今天读了 Rust 所有权相关章节。\n");
+        write(
+            root,
+            "读书.md",
+            "# 读书笔记\n\n今天读了 Rust 所有权相关章节。\n",
+        );
 
         let stats = scan_vault(&conn, root).unwrap();
         assert_eq!(stats.indexed, 2);
@@ -542,7 +748,13 @@ mod tests {
         let n2 = create_note(&conn, root, "随手记", "我的想法").unwrap();
         assert_eq!(n2.id, "随手记/我的想法-2.md");
 
-        write_note(&conn, root, &n.id, "# 我的想法\n\n换成了新的正文，包含关键词：向量检索。\n").unwrap();
+        write_note(
+            &conn,
+            root,
+            &n.id,
+            "# 我的想法\n\n换成了新的正文，包含关键词：向量检索。\n",
+        )
+        .unwrap();
         let hits = search(&conn, "向量检索", 10).unwrap();
         assert_eq!(hits.len(), 1);
 
@@ -565,7 +777,11 @@ mod tests {
     fn long_chinese_question_falls_back_to_grams() {
         let (dir, conn) = setup();
         let root = dir.path();
-        write(root, "a.md", "# 周会\n\n镜像拉取超时的问题由张伟跟进，下周给结论。\n");
+        write(
+            root,
+            "a.md",
+            "# 周会\n\n镜像拉取超时的问题由张伟跟进，下周给结论。\n",
+        );
         write(root, "b.md", "# 读书\n\n今天读了 Rust 所有权相关章节。\n");
         scan_vault(&conn, root).unwrap();
 
@@ -585,5 +801,92 @@ mod tests {
         let expr = fts_relaxed_expr("镜像拉取超时的问题是谁跟进").unwrap();
         assert!(expr.contains("\"镜像拉\"") && expr.contains("OR"), "{expr}");
         assert!(fts_relaxed_expr("图").is_none(), "太短的词交给 LIKE 兜底");
+    }
+
+    #[test]
+    fn folders_create_list_rename_and_move() {
+        let (dir, conn) = setup();
+        let root = dir.path();
+        write(root, "工作/周会.md", "# 周会\n\n讨论了镜像站。\n");
+        write(root, "根笔记.md", "# 根笔记\n\n正文。\n");
+        write(root, "备份/根笔记.md", "# 占位\n\n占位。\n");
+
+        // 新建（多级）空文件夹
+        assert_eq!(create_folder(root, "项目/子目录").unwrap(), "项目/子目录");
+        assert!(root.join("项目/子目录").is_dir());
+        assert!(
+            create_folder(root, "会议音频/恶意").is_err(),
+            "录音目录不能当笔记文件夹"
+        );
+        assert!(create_folder(root, "../逃逸").is_err());
+        assert!(create_folder(root, ".隐藏").is_err());
+
+        // 列表：空文件夹也在；隐藏目录与会议音频排除
+        std::fs::create_dir_all(root.join("会议音频/x")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        scan_vault(&conn, root).unwrap();
+        let folders = list_folders(&conn, root).unwrap();
+        let paths: Vec<&str> = folders.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            paths.contains(&"工作") && paths.contains(&"项目") && paths.contains(&"项目/子目录"),
+            "{paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.starts_with("会议音频") || p.starts_with(".git")),
+            "{paths:?}"
+        );
+        assert_eq!(
+            folders
+                .iter()
+                .find(|f| f.path == "工作")
+                .unwrap()
+                .note_count,
+            1
+        );
+
+        // 移动：目标已有同名文件 → 自动加序号；同目录移动保持原 id
+        assert_eq!(
+            move_note(&conn, root, "根笔记.md", "备份").unwrap(),
+            "备份/根笔记-2.md"
+        );
+        assert_eq!(
+            move_note(&conn, root, "工作/周会.md", "工作").unwrap(),
+            "工作/周会.md"
+        );
+        assert!(!root.join("根笔记.md").exists());
+        assert!(root.join("备份/根笔记-2.md").is_file());
+
+        // 重命名文件夹：名字只允许一层；重名要报错
+        assert_eq!(
+            rename_folder(&conn, root, "项目", "新项目").unwrap(),
+            "新项目"
+        );
+        assert!(root.join("新项目/子目录").is_dir());
+        assert!(
+            rename_folder(&conn, root, "新项目", "工作").is_err(),
+            "重名文件夹应报错"
+        );
+        assert!(
+            rename_folder(&conn, root, "新项目", "a/b").is_err(),
+            "不允许带路径"
+        );
+
+        // 重命名笔记：索引里旧 id 消失、新 id 出现
+        let rid = rename_note(&conn, root, "工作/周会.md", "周会（重命名）").unwrap();
+        assert_eq!(rid, "工作/周会（重命名）.md");
+        let ids: Vec<String> = list_notes(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert!(ids.contains(&rid), "{ids:?}");
+        assert!(!ids.contains(&"工作/周会.md".to_string()), "{ids:?}");
+        assert_eq!(
+            search(&conn, "镜像站", 10).unwrap().len(),
+            1,
+            "重命名后全文索引仍可用"
+        );
     }
 }

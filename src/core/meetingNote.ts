@@ -216,7 +216,20 @@ export function replaceAudioPlaceholders(html: string, tag: (raw: string) => str
   return html.replace(AUDIO_PLACEHOLDER_RE, (_m, raw: string) => tag(raw))
 }
 
-/** 会议笔记 id → 音频目录名（镜像 Rust `audio_clip::dir_for_note`，仅供预览/展示用）。 */export function dirForNote(noteId: string): string {
+/** 会议笔记 id → 音频目录（镜像 Rust `audio_clip::dir_for_note`，与笔记路径一一对应）。 */
+export function dirForNote(noteId: string): string {
+  const id = noteId.trim().replace(/^\/+/, '')
+  const stem = id.endsWith('.md') ? id.slice(0, -3) : id
+  const parts = stem
+    .split(/[\\/]/)
+    .map(sanitizeSegment)
+    .filter(Boolean)
+  if (!parts.length) return '未命名'
+  return parts.join('/')
+}
+
+/** 旧版（0.1.x）目录名（镜像 Rust `dir_for_note_legacy`，用于兼容列出历史录音）。 */
+export function dirForNoteLegacy(noteId: string): string {
   const id = noteId.trim().replace(/^\/+/, '')
   let stem = id.endsWith('.md') ? id.slice(0, -3) : id
   if (stem.startsWith(`${MEETING_DIR}/`)) stem = stem.slice(MEETING_DIR.length + 1)
@@ -227,6 +240,49 @@ export function replaceAudioPlaceholders(html: string, tag: (raw: string) => str
     .trim()
   if (!safe) return '未命名会议'
   return Array.from(safe).slice(0, 60).join('')
+}
+
+/** 一篇笔记可能存在的音频目录（新目录 + 旧版目录，去重）。 */
+export function dirsForNote(noteId: string): string[] {
+  const dirs = [dirForNote(noteId)]
+  const legacy = dirForNoteLegacy(noteId)
+  if (!dirs.includes(legacy)) dirs.push(legacy)
+  return dirs
+}
+
+function sanitizeSegment(part: string): string {
+  const s = part
+    .replace(/[<>:"|?*\\]/g, '-')
+    .replace(/[\u0000-\u001f]/g, '')
+    .trim()
+    .replace(/^\.+|\.+$/g, '')
+    .trim()
+  return Array.from(s).slice(0, 60).join('')
+}
+
+/** 还没写进笔记的录音（按 vault 相对路径比对）。 */
+export function unreferencedClips(clips: ClipInfo[], refs: Array<{ path: string }>): ClipInfo[] {
+  const used = new Set(refs.map((r) => normalizeRel(r.path)))
+  return clips.filter((c) => !used.has(normalizeRel(c.path)))
+}
+
+function normalizeRel(p: string): string {
+  return p.trim().replace(/\\/g, '/').replace(/^\.?\/+/, '')
+}
+
+/** 每篇笔记的录音数量（新目录 + 旧版目录），用于列表徽章。 */
+export function clipCountsByNote(
+  notes: Array<{ id: string }>,
+  clips: ClipInfo[],
+): Record<string, number> {
+  const byDir = new Map<string, number>()
+  for (const c of clips) byDir.set(c.dir, (byDir.get(c.dir) ?? 0) + 1)
+  const out: Record<string, number> = {}
+  for (const n of notes) {
+    const count = dirsForNote(n.id).reduce((sum, d) => sum + (byDir.get(d) ?? 0), 0)
+    if (count) out[n.id] = count
+  }
+  return out
 }
 
 /** 一键处理的进度百分比（粗略，按音频条数 + 阶段估算）。 */

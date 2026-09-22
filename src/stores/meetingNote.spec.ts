@@ -53,7 +53,12 @@ function fakeAdapter() {
   const notes = new Map<string, string>([[NOTE_ID, NOTE_BODY]])
   const clips: ClipInfo[] = []
   const stat = (c: ClipInfo): ClipStat => ({ ...c, refLine: `/v ${c.path}` })
-  const calls = { closed: [] as number[], appended: 0, discarded: [] as number[], processed: [] as string[] }
+  const calls = {
+    closed: [] as number[],
+    appended: 0,
+    discarded: [] as string[],
+    processed: [] as string[],
+  }
   let progressCb: ((p: ProcessProgress) => void) | null = null
 
   const adapter: MeetingNoteAdapter = {
@@ -156,8 +161,8 @@ function fakeAdapter() {
       calls.closed.push(seq)
       return stat(clips.find((c) => c.seq === seq)!)
     },
-    clipDiscard: async (_noteId, seq) => {
-      calls.discarded.push(seq)
+    clipDiscard: async (path: string) => {
+      calls.discarded.push(path)
     },
     clipList: async () => clips,
     audioSrc: async (p) => `asset://${p}`,
@@ -237,7 +242,7 @@ describe('会议笔记 store（引用插入）', () => {
 })
 
 describe('会议笔记 store（录音面板）', () => {
-  it('开始 → 落盘 → 停止：自动收尾分段并插入引用', async () => {
+  it('开始 → 落盘 → 停止：收尾分段、保存文件，但不自动插入引用', async () => {
     const store = useMeetingNoteStore()
     await store.loadList()
     await store.openNote(NOTE_ID)
@@ -249,9 +254,7 @@ describe('会议笔记 store（录音面板）', () => {
     expect(store.recording).toBe(true)
     expect(store.recordSeq).toBe(1)
 
-    // 模拟 1 秒采集（触发一次落盘）+ 音量回调
-    rec.level?.(1234)
-    expect(store.levelPercent).toBeGreaterThan(0)
+    // 模拟 1 秒采集（触发一次落盘）
     rec.chunk?.(new Int16Array(16000))
     await store.pushPcm(new Int16Array(16000))
     await store.flushBuffer(true)
@@ -261,11 +264,27 @@ describe('会议笔记 store（录音面板）', () => {
     expect(store.recording).toBe(false)
     expect(fake.calls.closed).toEqual([1])
     expect(store.recentClips).toHaveLength(1)
-    expect(store.insertHint).toContain('引用')
-    expect(fake.notes.get(NOTE_ID)!).toContain('seg_0001.wav')
+    expect(store.insertHint).toContain('已保存')
+    expect(store.insertHint).toContain('seg_0001.wav')
+    expect(fake.notes.get(NOTE_ID)).toBe(NOTE_BODY)
   })
 
-  it('丢弃录坏的片段', async () => {
+  it('插入引用（笔记正打开时给编辑器，不覆盖未保存内容）', async () => {
+    const store = useMeetingNoteStore()
+    const notes = useNotesStore()
+    notes.currentId = NOTE_ID
+    notes.setContent('# 周会\n\n草稿\n')
+    const where = await store.insertRefs(
+      ['/v 会议音频/周会/seg_0001.wav', '/v 会议音频/周会/seg_0002.wav'],
+      NOTE_ID,
+    )
+    expect(where).toBe('cursor')
+    expect(store.pendingRef?.text).toContain('seg_0001.wav')
+    expect(store.pendingRef?.text).toContain('seg_0002.wav')
+    store.clearPendingRef()
+  })
+
+  it('丢弃录坏的片段（按路径）', async () => {
     const store = useMeetingNoteStore()
     await store.loadList()
     await store.openNote(NOTE_ID)
@@ -274,7 +293,7 @@ describe('会议笔记 store（录音面板）', () => {
     await store.stopRecording()
     const clip = store.recentClips[0]
     await store.discardClip(clip)
-    expect(fake.calls.discarded).toEqual([1])
+    expect(fake.calls.discarded).toEqual([clip.path])
     expect(store.recentClips).toHaveLength(0)
   })
 

@@ -9,7 +9,7 @@ use bnu_core::meeting_note::{
 use bnu_core::meetings::{self, Meeting, MeetingDetail, Segment, SegmentStat};
 use bnu_core::minutes::{self, MinutesOutcome};
 use bnu_core::models::{self, ModelConfig, PublicModelConfig};
-use bnu_core::notes::{self, NoteMeta, ScanStats, SearchHit};
+use bnu_core::notes::{self, FolderInfo, NoteMeta, ScanStats, SearchHit};
 use bnu_core::qa::{self, Answer};
 use bnu_core::rate_limit::{RateLimiter, RATE_LIMIT_PER_MINUTE};
 use bnu_core::retrieval::{self, RetrievalStatus};
@@ -42,8 +42,10 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 fn read_setting(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
-        .ok()
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+        r.get(0)
+    })
+    .ok()
 }
 
 fn write_setting(conn: &Connection, key: &str, value: &str) -> SqlResult<()> {
@@ -113,7 +115,11 @@ fn write_note(id: String, content: String, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
-fn create_note(folder: String, title: String, state: State<'_, AppState>) -> Result<NoteMeta, String> {
+fn create_note(
+    folder: String,
+    title: String,
+    state: State<'_, AppState>,
+) -> Result<NoteMeta, String> {
     let root = state.vault.lock().unwrap().clone();
     let conn = state.conn.lock().unwrap();
     notes::create_note(&conn, &root, &folder, &title).map_err(err)
@@ -136,6 +142,49 @@ fn search_notes(
     notes::search(&conn, &query, limit.unwrap_or(30)).map_err(err)
 }
 
+/// vault 里的文件夹（含空文件夹；排除隐藏目录与 `会议音频/`）。
+#[tauri::command]
+fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderInfo>, String> {
+    let root = state.vault.lock().map_err(err)?.clone();
+    let conn = state.conn.lock().map_err(err)?;
+    notes::list_folders(&conn, &root).map_err(err)
+}
+
+/// 新建文件夹（支持多级），返回规范化相对路径。
+#[tauri::command]
+fn create_folder(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    let root = state.vault.lock().map_err(err)?.clone();
+    notes::create_folder(&root, &path).map_err(err)
+}
+
+/// 重命名文件夹（只改最后一段），返回新路径。
+#[tauri::command]
+fn rename_folder(
+    path: String,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = state.vault.lock().map_err(err)?.clone();
+    let conn = state.conn.lock().map_err(err)?;
+    notes::rename_folder(&conn, &root, &path, &new_name).map_err(err)
+}
+
+/// 移动笔记到另一个文件夹，返回新 id。
+#[tauri::command]
+fn move_note(id: String, folder: String, state: State<'_, AppState>) -> Result<String, String> {
+    let root = state.vault.lock().map_err(err)?.clone();
+    let conn = state.conn.lock().map_err(err)?;
+    notes::move_note(&conn, &root, &id, &folder).map_err(err)
+}
+
+/// 重命名笔记（同目录），返回新 id。
+#[tauri::command]
+fn rename_note(id: String, title: String, state: State<'_, AppState>) -> Result<String, String> {
+    let root = state.vault.lock().map_err(err)?.clone();
+    let conn = state.conn.lock().map_err(err)?;
+    notes::rename_note(&conn, &root, &id, &title).map_err(err)
+}
+
 // ---------------------------------------------------------------------------
 // 模型配置
 // ---------------------------------------------------------------------------
@@ -149,7 +198,10 @@ fn get_model_config(state: State<'_, AppState>) -> Result<PublicModelConfig, Str
 }
 
 #[tauri::command]
-fn save_model_config(input: ModelConfig, state: State<'_, AppState>) -> Result<PublicModelConfig, String> {
+fn save_model_config(
+    input: ModelConfig,
+    state: State<'_, AppState>,
+) -> Result<PublicModelConfig, String> {
     let conn = state.conn.lock().unwrap();
     let mut cfg = models::load_config(&conn, &state.secret).map_err(err)?;
     cfg.merge(input);
@@ -163,7 +215,9 @@ async fn test_model(capability: String, state: State<'_, AppState>) -> Result<St
         let conn = state.conn.lock().unwrap();
         models::load_config(&conn, &state.secret).map_err(err)?
     };
-    models::test_capability(&capability, &cfg).await.map_err(err)
+    models::test_capability(&capability, &cfg)
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]
@@ -273,7 +327,11 @@ fn meeting_rename(id: String, title: String, state: State<'_, AppState>) -> Resu
 
 /// 删除会议；`deleteFiles` 为 true 时同时删除音频目录（界面上需二次确认）。
 #[tauri::command]
-fn meeting_delete(id: String, delete_files: bool, state: State<'_, AppState>) -> Result<(), String> {
+fn meeting_delete(
+    id: String,
+    delete_files: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let dir = {
         let conn = state.conn.lock().map_err(err)?;
         meetings::delete(&conn, &id).map_err(err)?;
@@ -323,7 +381,11 @@ fn meeting_append_pcm(
 }
 
 #[tauri::command]
-fn meeting_close_segment(id: String, seq: i64, state: State<'_, AppState>) -> Result<Segment, String> {
+fn meeting_close_segment(
+    id: String,
+    seq: i64,
+    state: State<'_, AppState>,
+) -> Result<Segment, String> {
     let conn = state.conn.lock().map_err(err)?;
     meetings::close_segment(&conn, &state.meetings_root, &id, seq).map_err(err)
 }
@@ -374,12 +436,18 @@ async fn meeting_generate_minutes(
         let conn = state.conn.lock().map_err(err)?;
         models::load_config(&conn, &state.secret).map_err(err)?
     };
-    let outcome = minutes::generate(&state.conn, &cfg, &id).await.map_err(err)?;
+    let outcome = minutes::generate(&state.conn, &cfg, &id)
+        .await
+        .map_err(err)?;
 
     let (vault, title, created_at) = {
         let conn = state.conn.lock().map_err(err)?;
         let m = meetings::get(&conn, &id).map_err(err)?;
-        (state.vault.lock().map_err(err)?.clone(), m.title, m.created_at)
+        (
+            state.vault.lock().map_err(err)?.clone(),
+            m.title,
+            m.created_at,
+        )
     };
     let date_str = date
         .filter(|d| !d.trim().is_empty())
@@ -480,7 +548,7 @@ fn meeting_note_migrate_legacy(state: State<'_, AppState>) -> Result<Vec<String>
     meeting_note::export_legacy(&conn, &vault, &state.meetings_root).map_err(err)
 }
 
-/// 开始一段会议录音（落在 vault 的 `会议音频/<笔记名>/` 下，序号自动递增）。
+/// 开始一段会议录音（目录与笔记路径一一对应，如 `会议音频/会议/周会/`）。
 #[tauri::command]
 fn audio_clip_start(
     note_id: String,
@@ -488,9 +556,7 @@ fn audio_clip_start(
     state: State<'_, AppState>,
 ) -> Result<ClipStat, String> {
     let vault = state.vault.lock().map_err(err)?.clone();
-    let dir = audio_clip::dir_for_note(&note_id);
-    let seq = audio_clip::next_seq(&vault, &dir);
-    audio_clip::start(&vault, &dir, seq, sample_rate).map_err(err)
+    audio_clip::start_for_note(&vault, &note_id, sample_rate).map_err(err)
 }
 
 #[tauri::command]
@@ -517,16 +583,11 @@ fn audio_clip_close(
     audio_clip::close(&vault, &dir, seq).map_err(err)
 }
 
-/// 丢弃一个分段（界面上的「重录」）。
+/// 丢弃一段录音（按 vault 相对路径；界面上的「重录 / 录坏了删掉」）。
 #[tauri::command]
-fn audio_clip_discard(
-    note_id: String,
-    seq: i64,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+fn audio_clip_discard(path: String, state: State<'_, AppState>) -> Result<(), String> {
     let vault = state.vault.lock().map_err(err)?.clone();
-    let dir = audio_clip::dir_for_note(&note_id);
-    audio_clip::remove(&vault, &dir, seq).map_err(err)
+    audio_clip::remove_path(&vault, &path).map_err(err)
 }
 
 /// 列出 vault 里的录音分段（`noteId` 为空则列出全部，供 `/v` 选择器用）。
@@ -536,12 +597,10 @@ fn audio_clip_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<ClipInfo>, String> {
     let vault = state.vault.lock().map_err(err)?.clone();
-    let mut all = audio_clip::list(&vault).map_err(err)?;
     if let Some(note_id) = note_id.filter(|s| !s.trim().is_empty()) {
-        let dir = audio_clip::dir_for_note(&note_id);
-        all.retain(|c| c.dir == dir);
+        return audio_clip::list_for_note(&vault, &note_id).map_err(err);
     }
-    Ok(all)
+    audio_clip::list(&vault).map_err(err)
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +765,11 @@ pub fn run() {
             create_note,
             delete_note,
             search_notes,
+            list_folders,
+            create_folder,
+            rename_folder,
+            move_note,
+            rename_note,
             get_model_config,
             save_model_config,
             test_model,
