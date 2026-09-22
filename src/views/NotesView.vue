@@ -1,9 +1,20 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
 import { useNotesStore } from '../stores/notes'
+import { useMeetingNoteStore } from '../stores/meetingNote'
+import {
+  formatDur,
+  insertRefAtCursor,
+  prepareAudioRefs,
+  replaceAudioPlaceholders,
+  parseRefs,
+  slashCommandAt,
+} from '../core/meetingNote'
+import type { ClipInfo } from '../core/meetingNote'
 
 const store = useNotesStore()
+const meeting = useMeetingNoteStore()
 const md = new MarkdownIt({ html: false, linkify: true })
 
 const query = ref('')
@@ -12,7 +23,58 @@ const showNew = ref(false)
 const newTitle = ref('')
 const newFolder = ref('')
 
-const rendered = computed(() => md.render(store.content || ''))
+const editorEl = ref<HTMLTextAreaElement | null>(null)
+
+/** vault 内音频的播放地址缓存（key = `/v` 里的路径原文） */
+const audioSrcMap = ref<Record<string, string | null>>({})
+const loadingSrc = new Set<string>()
+
+/** `/v` 选择器状态 */
+const slashOpen = ref(false)
+const slashFilter = ref('')
+const slashIndex = ref(0)
+
+const refCount = computed(() => parseRefs(store.content).length)
+
+const slashMatches = computed(() => {
+  const q = slashFilter.value.toLowerCase()
+  const list = meeting.clipOptions
+  if (!q) return list.slice(0, 8)
+  return list.filter((c) => `${c.dir}/${c.file}`.toLowerCase().includes(q)).slice(0, 8)
+})
+
+const rendered = computed(() => renderMarkdown(store.content))
+
+/** 预览：把 `/v 音频` 行渲染成播放器（src 异步取，取不到时先显示文件名）。 */
+function renderMarkdown(body: string): string {
+  const html = md.render(prepareAudioRefs(body))
+  return replaceAudioPlaceholders(html, (raw) => {
+    const src = resolveSrc(raw)
+    if (!src) return `<p class="audio-ref">🎧 <code>${escapeHtml(raw)}</code>（暂不可播放）</p>`
+    return `<p class="audio-ref"><audio controls preload="metadata" src="${escapeHtml(src)}"></audio><span class="audio-name">${escapeHtml(raw)}</span></p>`
+  })
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function resolveSrc(raw: string): string | null {
+  const cached = audioSrcMap.value[raw]
+  if (cached !== undefined) return cached
+  if (!loadingSrc.has(raw)) {
+    loadingSrc.add(raw)
+    void meeting.clipSrc(raw).then((src) => {
+      audioSrcMap.value = { ...audioSrcMap.value, [raw]: src }
+      loadingSrc.delete(raw)
+    })
+  }
+  return null
+}
 
 onMounted(async () => {
   await store.init()
@@ -20,11 +82,89 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
+/** 录音面板写入的引用：插到光标处（预览模式下追加到正文末尾）。 */
+watch(
+  () => meeting.pendingRef,
+  async (pending) => {
+    if (!pending || pending.noteId !== store.currentId) return
+    const el = editorEl.value
+    const cursor = el ? el.selectionStart : store.content.length
+    const res = insertRefAtCursor(store.content, pending.text, cursor)
+    store.setContent(res.body)
+    meeting.clearPendingRef()
+    await nextTick()
+    if (editorEl.value) {
+      editorEl.value.focus()
+      editorEl.value.setSelectionRange(res.cursor, res.cursor)
+    }
+  },
+)
+
 function onKey(e: KeyboardEvent) {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
     e.preventDefault()
     void store.save()
   }
+}
+
+/** 输入时检测行首 `/v`、`/video`，弹出录音选择器。 */
+function onEditorInput(e: Event) {
+  const el = e.target as HTMLTextAreaElement
+  store.setContent(el.value)
+  const hit = slashCommandAt(el.value, el.selectionStart)
+  if (!hit) {
+    slashOpen.value = false
+    return
+  }
+  slashFilter.value = hit.filter
+  slashIndex.value = 0
+  slashOpen.value = true
+  if (!meeting.clips.length) void meeting.loadClips()
+}
+
+function onEditorKeydown(e: KeyboardEvent) {
+  if (!slashOpen.value) return
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    slashIndex.value = Math.min(slashIndex.value + 1, slashMatches.value.length - 1)
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    slashIndex.value = Math.max(slashIndex.value - 1, 0)
+  } else if (e.key === 'Enter' || e.key === 'Tab') {
+    const clip = slashMatches.value[slashIndex.value]
+    if (clip) {
+      e.preventDefault()
+      applyClip(clip)
+    }
+  } else if (e.key === 'Escape') {
+    slashOpen.value = false
+  }
+}
+
+/** 用选中的录音替换刚输入的 `/v`，并把完整引用行插到光标处。 */
+function applyClip(clip: ClipInfo) {
+  const el = editorEl.value
+  if (!el) return
+  const cursor = el.selectionStart
+  const hit = slashCommandAt(store.content, cursor)
+  const start = hit ? hit.start : cursor
+  const cleaned = store.content.slice(0, start) + store.content.slice(cursor)
+  const res = insertRefAtCursor(cleaned, `/v ${clip.path}`, start)
+  store.setContent(res.body)
+  slashOpen.value = false
+  void nextTick(() => {
+    if (!editorEl.value) return
+    editorEl.value.focus()
+    editorEl.value.setSelectionRange(res.cursor, res.cursor)
+  })
+}
+
+/** 编辑器里直接「一键处理」：先保存再处理，避免处理到旧内容。 */
+async function processCurrent() {
+  if (!store.currentId || meeting.processing) return
+  await store.save()
+  await meeting.openNote(store.currentId)
+  await meeting.process(false)
 }
 
 function fmt(ts: number): string {
@@ -158,6 +298,15 @@ async function removeCurrent() {
             <span class="doc-path">{{ store.currentId }}</span>
             <span v-if="store.dirty" class="dirty">未保存</span>
             <span class="spacer" />
+            <t-button
+              v-if="refCount"
+              size="small"
+              variant="outline"
+              :loading="meeting.processing"
+              @click="processCurrent"
+            >
+              一键处理（{{ refCount }} 段录音）
+            </t-button>
             <t-button size="small" :disabled="!store.dirty" theme="primary" @click="store.save()"
               >保存</t-button
             >
@@ -168,15 +317,41 @@ async function removeCurrent() {
               >删除</t-button
             >
           </div>
+          <div v-if="meeting.processing || meeting.message" class="editor-progress">
+            <t-progress :percentage="meeting.progress" :label="false" />
+            <span class="editor-progress-text">{{ meeting.message }}</span>
+          </div>
           <div class="editor-body">
             <textarea
               v-if="!preview"
+              ref="editorEl"
               class="editor"
               :value="store.content"
               spellcheck="false"
-              @input="store.setContent(($event.target as HTMLTextAreaElement).value)"
+              @input="onEditorInput"
+              @keydown="onEditorKeydown"
+              @click="slashOpen = false"
+              @blur="slashOpen = false"
             />
             <div v-else class="preview markdown-body" v-html="rendered" />
+            <div v-if="slashOpen" class="slash">
+              <div class="slash-head">
+                插入录音引用（↑↓ 选择，Enter 插入，Esc 取消）
+              </div>
+              <div v-if="!slashMatches.length" class="slash-empty">
+                还没有录音。用右下角 🎙 录一段，或先录到 <code>会议音频/</code> 下。
+              </div>
+              <div
+                v-for="(c, i) in slashMatches"
+                :key="c.path"
+                class="slash-item"
+                :class="{ on: i === slashIndex }"
+                @mousedown.prevent="applyClip(c)"
+              >
+                <span class="slash-name">{{ c.dir }}/{{ c.file }}</span>
+                <span class="slash-meta">{{ formatDur(c.durationMs) }}</span>
+              </div>
+            </div>
           </div>
         </template>
         <div v-else class="empty">从左侧选择一篇笔记，或新建一篇</div>
@@ -322,6 +497,94 @@ async function removeCurrent() {
   border-bottom: 1px solid var(--border);
 }
 
+.editor-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.editor-progress-text {
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* `/v` 录音选择器 */
+.slash {
+  position: absolute;
+  left: 24px;
+  bottom: 24px;
+  width: 420px;
+  max-width: calc(100% - 48px);
+  max-height: 260px;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  z-index: 5;
+}
+
+.slash-head {
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.slash-empty {
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 10px;
+  line-height: 1.8;
+}
+
+.slash-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.slash-item.on,
+.slash-item:hover {
+  background: rgba(0, 82, 217, 0.08);
+}
+
+.slash-name {
+  flex: 1;
+  font-family: ui-monospace, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slash-meta {
+  color: var(--text-3);
+}
+
+.preview :deep(.audio-ref) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
+
+.preview :deep(.audio-ref audio) {
+  width: 100%;
+  max-width: 520px;
+}
+
+.preview :deep(.audio-ref .audio-name) {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: ui-monospace, monospace;
+}
+
 .doc-title {
   font-weight: 600;
   font-size: 14px;
@@ -341,6 +604,7 @@ async function removeCurrent() {
   flex: 1;
   min-height: 0;
   display: flex;
+  position: relative;
 }
 
 .editor {

@@ -173,8 +173,50 @@ export function insertRefAtCursor(
   return { body: `${before}${insert}${after}`, cursor: pos + insert.length }
 }
 
-/** 会议笔记 id → 音频目录名（镜像 Rust `audio_clip::dir_for_note`，仅供预览/展示用）。 */
-export function dirForNote(noteId: string): string {
+/**
+ * 找光标前正在输入的 `/v` 命令（编辑器里弹录音选择器用）。
+ *
+ * 返回 `start`（**替换范围起点**：含行首缩进、不含换行符，从这里到光标整段会被引用行替换）
+ * 与 `filter`（已输入的部分路径）。
+ */
+export function slashCommandAt(
+  text: string,
+  cursor: number,
+): { start: number; token: string; filter: string } | null {
+  const pos = Math.max(0, Math.min(cursor, text.length))
+  const before = text.slice(0, pos)
+  const hit = /(?:^|\n)[ \t]*\/(v|video)(?=[ \t]|$)([^\n]*)$/.exec(before)
+  if (!hit) return null
+  const start = before.length - hit[0].length + (hit[0].startsWith('\n') ? 1 : 0)
+  return { start, token: `/${hit[1]}`, filter: hit[2].trim() }
+}
+
+/** `/v` 音频引用的渲染占位符（markdown-it 渲染完再替换成播放器）。 */
+export const AUDIO_PLACEHOLDER_RE = /§§AUDIO:([^§]+)§§/g
+
+/**
+ * 预览渲染前的准备：把 `/v 路径` 行换成占位符并拼回纪要段。
+ *
+ * 返回可以直接喂给 markdown-it 的文本；渲染后用 `replaceAudioPlaceholders` 换成播放器。
+ */
+export function prepareAudioRefs(body: string): string {
+  const { head, minutes } = splitMinutes(body)
+  const prepared = head
+    .split('\n')
+    .map((line) => {
+      const hit = parseRefLine(line)
+      return hit ? `\n\n§§AUDIO:${hit.raw}§§\n\n` : line
+    })
+    .join('\n')
+  return minutes ? `${prepared}\n\n${minutes}` : prepared
+}
+
+/** 把渲染结果里的占位符换成 `<audio>`（`tag` 返回要插入的 HTML）。 */
+export function replaceAudioPlaceholders(html: string, tag: (raw: string) => string): string {
+  return html.replace(AUDIO_PLACEHOLDER_RE, (_m, raw: string) => tag(raw))
+}
+
+/** 会议笔记 id → 音频目录名（镜像 Rust `audio_clip::dir_for_note`，仅供预览/展示用）。 */export function dirForNote(noteId: string): string {
   const id = noteId.trim().replace(/^\/+/, '')
   let stem = id.endsWith('.md') ? id.slice(0, -3) : id
   if (stem.startsWith(`${MEETING_DIR}/`)) stem = stem.slice(MEETING_DIR.length + 1)

@@ -140,6 +140,16 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
     async process(force = false): Promise<ProcessOutcome | null> {
       const noteId = this.currentId
       if (!noteId || this.processing) return null
+      // 处理的是磁盘上的文件：正打开且未保存时先存盘，别让模型读到旧内容
+      const notesStore = useNotesStore()
+      if (notesStore.currentId === noteId && notesStore.dirty) {
+        try {
+          await notesStore.save()
+        } catch (e) {
+          this.error = `保存笔记失败：${String(e)}`
+          return null
+        }
+      }
       this.processing = true
       this.force = force
       this.progress = 0
@@ -161,7 +171,6 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
         await this.openNote(noteId)
         await this.loadList()
         // 笔记内容被改写了：正打开同一篇且没有未保存修改时刷新编辑区
-        const notesStore = useNotesStore()
         if (notesStore.currentId === noteId && !notesStore.dirty) await notesStore.openNote(noteId)
         return out
       } catch (e) {

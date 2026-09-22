@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import MarkdownIt from 'markdown-it'
 import {
   AUDIO_DIR,
   MINUTES_HEADING,
@@ -12,7 +13,10 @@ import {
   outcomeSummary,
   parseRefLine,
   parseRefs,
+  prepareAudioRefs,
   progressPercent,
+  replaceAudioPlaceholders,
+  slashCommandAt,
   splitMinutes,
   type ProcessOutcome,
   type ProcessProgress,
@@ -93,6 +97,79 @@ describe('appendRefLine / insertRefAtCursor', () => {
     const body = `# 会\n\n手写\n\n${MINUTES_HEADING}\n\n纪要\n`
     const res = insertRefAtCursor(body, '/v a.wav', body.length)
     expect(res.body.indexOf('/v a.wav')).toBeLessThan(res.body.indexOf(MINUTES_HEADING))
+  })
+})
+
+describe('slashCommandAt（编辑器 `/v` 选择器）', () => {
+  it('识别行首的 /v 与已输入的部分路径', () => {
+    const text = '# 会\n\n手写\n/v 会议音频/周'
+    const hit = slashCommandAt(text, text.length)
+    expect(hit).not.toBeNull()
+    expect(text.slice(hit!.start, text.length)).toBe('/v 会议音频/周')
+    expect(hit!.token).toBe('/v')
+    expect(hit!.filter).toBe('会议音频/周')
+  })
+
+  it('支持 /video 与缩进行（缩进一并被替换）', () => {
+    const text = '  /video seg_0001'
+    const hit = slashCommandAt(text, text.length)
+    expect(hit!.token).toBe('/video')
+    expect(hit!.start).toBe(0)
+    expect(hit!.filter).toBe('seg_0001')
+  })
+
+  it('不是行首命令就不弹（/very good、正文里的 /v）', () => {
+    expect(slashCommandAt('/very good', 6)).toBeNull()
+    expect(slashCommandAt('请参考 /v a.wav', 10)).toBeNull()
+    expect(slashCommandAt('/v 路径\n下一行', 12)).toBeNull()
+  })
+
+  it('配合 insertRefAtCursor：替换输入的 token 并落到光标处', () => {
+    const text = '# 会\n\n手写\n/v 会议音频/周'
+    const hit = slashCommandAt(text, text.length)!
+    const cursor = text.length
+    const cleaned = text.slice(0, hit.start) + text.slice(cursor)
+    const res = insertRefAtCursor(cleaned, '/v 会议音频/周会/seg_0001.wav', hit.start)
+    expect(res.body).toBe('# 会\n\n手写\n/v 会议音频/周会/seg_0001.wav\n')
+    expect(res.body.slice(0, res.cursor)).toContain('seg_0001.wav')
+  })
+})
+
+describe('预览渲染（prepareAudioRefs + replaceAudioPlaceholders）', () => {
+  // 用真实的 markdown-it 跑一遍：验证占位符不会被转义 / 拆块
+  const md = new MarkdownIt({ html: false, linkify: true })
+
+  it('引用行渲染成播放器，转写块保持引用块样式', () => {
+    const body = [
+      '# 会',
+      '',
+      '手写一句。',
+      '/v 会议音频/周会/seg_0001.wav',
+      '> 🎙 转写 00:00:00–00:01:00 · seg_0001.wav',
+      '>',
+      '> 甲：内容',
+      '',
+      MINUTES_HEADING,
+      '',
+      '纪要正文',
+      '',
+    ].join('\n')
+    const html = replaceAudioPlaceholders(
+      md.render(prepareAudioRefs(body)),
+      (raw) => `<p class="audio-ref"><audio src="asset://${raw}"></audio></p>`,
+    )
+    expect(html).toContain('<audio src="asset://会议音频/周会/seg_0001.wav">')
+    expect(html).toContain('<blockquote>')
+    expect(html).toContain('甲：内容')
+    expect(html).toContain('手写一句。')
+    expect(html).toContain('纪要正文')
+    expect(html).not.toContain('§§AUDIO')
+    expect(html).not.toContain('&lt;audio')
+  })
+
+  it('没有引用时原样渲染', () => {
+    const html = md.render(prepareAudioRefs('# 标题\n\n正文\n'))
+    expect(html).toContain('<h1>标题</h1>')
   })
 })
 
