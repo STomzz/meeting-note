@@ -416,6 +416,16 @@ pub fn sse_payload(line: &str) -> Option<&str> {
     Some(rest.trim_end_matches(['\r', '\n']))
 }
 
+/// 从字节缓冲里取出一整行（含换行）。
+///
+/// 必须按字节缓冲、**成行后再解码**：网络分块可能把多字节汉字截成两半，
+/// 若对每个分块单独 `from_utf8_lossy` 会产生替换字符（乱码）。
+fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+    let pos = buf.iter().position(|b| *b == b'\n')?;
+    let line: Vec<u8> = buf.drain(..=pos).collect();
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
 /// 流式对话补全。
 ///
 /// `on_event` 返回 `false` 表示调用方要求中止：此时停止读取，`finish_reason` 记为 `cancelled`，
@@ -448,14 +458,13 @@ where
 
     let mut stream = resp.bytes_stream();
     let mut acc = ChatStreamAccum::default();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut cancelled = false;
 
     'outer: while let Some(chunk) = stream.next().await {
         let bytes = chunk.context("读取流式响应失败")?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(pos) = buf.find('\n') {
-            let line: String = buf.drain(..=pos).collect();
+        buf.extend_from_slice(&bytes);
+        while let Some(line) = take_line(&mut buf) {
             let Some(data) = sse_payload(&line) else { continue };
             if let Some(ev) = acc.feed(data) {
                 if !on_event(ev) {
@@ -470,7 +479,8 @@ where
     }
     // 收尾：最后一行可能没有换行符
     if !cancelled && !acc.done {
-        if let Some(data) = sse_payload(&buf) {
+        let tail = String::from_utf8_lossy(&buf);
+        if let Some(data) = sse_payload(&tail) {
             let _ = acc.feed(data);
         }
     }
@@ -825,6 +835,25 @@ mod tests {
         assert_eq!(sse_payload("data: {\"a\":1}\r"), Some("{\"a\":1}"));
         assert_eq!(sse_payload("event: ping"), None);
         assert_eq!(sse_payload(": comment"), None);
+    }
+
+    #[test]
+    fn take_line_keeps_multibyte_chars_intact_across_chunks() {
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n";
+        // 在「你」(3 字节) 的中间切开：模拟网络分块
+        let cut = full.find('你').unwrap() + 1;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&full.as_bytes()[..cut]);
+        assert!(take_line(&mut buf).is_none(), "行未收全时不应返回");
+        buf.extend_from_slice(&full.as_bytes()[cut..]);
+        let line = take_line(&mut buf).unwrap();
+        assert!(line.contains("你好"), "不应出现替换字符: {line:?}");
+        assert!(!line.contains('\u{FFFD}'), "不应出现替换字符: {line:?}");
+        let mut acc = ChatStreamAccum::default();
+        assert_eq!(
+            acc.feed(sse_payload(&line).unwrap()),
+            Some(ChatStreamEvent::Delta("你好".into()))
+        );
     }
 
     #[test]
