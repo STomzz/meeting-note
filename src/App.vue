@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { isTauri } from './platform'
+import RecorderPanel from './components/RecorderPanel.vue'
 
 const nav = [
   { path: '/notes', label: '笔记', icon: '📝' },
@@ -37,5 +38,7 @@ const modeText = computed(() => (isTauri() ? '桌面客户端模式' : '浏览�
     <main class="main">
       <router-view />
     </main>
+    <!-- 浮动录音面板：任意页面都能录音并写入会议笔记 -->
+    <RecorderPanel />
   </div>
 </template>

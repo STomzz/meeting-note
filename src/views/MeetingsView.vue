@@ -1,190 +1,93 @@
 <script setup lang="ts">
-// P5：会议 —— 分段录音（可播放）→ 直连 ASR 转写 → 直连 LLM 生成纪要
+/**
+ * 会议（P7）：会议 = vault 里的一篇 Markdown 笔记。
+ *
+ * - 新建会议就是新建一篇 md（`会议/<日期>-<标题>.md`），随手写、随时插入 `/v 音频` 引用；
+ * - 点「一键处理」：转写引用的音频（静音切段 + 限流）→ 写回转写块 → 生成纪要段；
+ * - 音频存在 vault 的 `会议音频/` 下，跟着笔记一起备份，可随时试听；
+ * - 旧版会议（录音在前的那种）可以一次性导出成会议笔记。
+ */
 import { computed, onMounted, ref } from 'vue'
-import MarkdownIt from 'markdown-it'
-import { MessagePlugin } from 'tdesign-vue-next'
 import { useRouter } from 'vue-router'
+import { useMeetingNoteStore } from '../stores/meetingNote'
 import { useMeetingsStore } from '../stores/meetings'
 import { useNotesStore } from '../stores/notes'
-import {
-  fmtDateTime,
-  fmtDuration,
-  MEETING_STATUS_LABEL,
-  MEETING_STATUS_THEME,
-  SEGMENT_STATUS_LABEL,
-  type MeetingSegment,
-} from '../core/meetings'
+import { formatBytes, formatDur } from '../core/meetingNote'
+import type { AudioRef } from '../core/meetingNote'
 
-const meetings = useMeetingsStore()
+const store = useMeetingNoteStore()
+const legacy = useMeetingsStore()
 const notes = useNotesStore()
 const router = useRouter()
-const md = new MarkdownIt({ html: false, linkify: true })
 
-const audioRef = ref<HTMLAudioElement | null>(null)
-const playingSeq = ref(0)
-const renameVisible = ref(false)
-const renameTitle = ref('')
-const deleteVisible = ref(false)
-const deleteFiles = ref(true)
-const selfCheckVisible = ref(false)
-const minutesVisible = ref(false)
+const showNew = ref(false)
+const newTitle = ref('')
+const showLegacy = ref(false)
+const showSelfCheck = ref(false)
+const migrating = ref(false)
+const migrateMsg = ref('')
+const force = ref(false)
+const playing = ref('')
+const srcCache = ref<Record<string, string | null>>({})
 
-const current = computed(() => meetings.current)
-const hasSegments = computed(() => (current.value?.segments.length ?? 0) > 0)
-const canTranscribe = computed(
-  () => hasSegments.value && !meetings.recording && !meetings.transcribing,
-)
-const pendingSegments = computed(
-  () => current.value?.segments.filter((s) => s.status !== 'done').length ?? 0,
-)
+const refs = computed(() => store.refs)
+const canProcess = computed(() => !!store.currentId && !store.processing)
+const missing = computed(() => refs.value.filter((r) => !r.exists).length)
 
 onMounted(async () => {
-  await meetings.loadList()
-  if (!meetings.current && meetings.meetings.length) {
-    await meetings.open(meetings.meetings[0].id)
-  }
+  await store.loadList()
+  if (!store.currentId && store.notes.length) await store.openNote(store.notes[0].noteId)
 })
 
-function statusLabel(s: string) {
-  return MEETING_STATUS_LABEL[s] ?? s
-}
-function statusTheme(s: string) {
-  return MEETING_STATUS_THEME[s] ?? 'default'
-}
-function segmentLabel(s: string) {
-  return SEGMENT_STATUS_LABEL[s] ?? s
+async function create() {
+  const title = newTitle.value.trim()
+  if (!title) return
+  await store.create(title)
+  showNew.value = false
+  newTitle.value = ''
 }
 
-async function startNew() {
-  const id = await meetings.startRecording()
-  if (id) void MessagePlugin.success('开始录音（每 4 分钟自动分段）')
+async function openInEditor(noteId: string) {
+  await notes.openNote(noteId)
+  await router.push('/notes')
 }
 
-async function stop() {
-  await meetings.stopRecording()
-  void MessagePlugin.info('已停止录音')
-}
-
-async function openMeeting(id: string) {
-  if (meetings.recording && id !== meetings.recordMeetingId) {
-    void MessagePlugin.warning('正在录音，先停止录音再切换会议')
+async function play(refItem: AudioRef) {
+  if (!refItem.exists || !refItem.path) return
+  if (playing.value === refItem.path) {
+    playing.value = ''
     return
   }
-  stopPlayback()
-  await meetings.open(id)
-}
-
-function play(seg: MeetingSegment) {
-  const src = meetings.segmentSrc(seg)
-  if (!src) {
-    void MessagePlugin.warning('预览模式无法播放真实录音');
-    return
+  if (!(refItem.path in srcCache.value)) {
+    srcCache.value[refItem.path] = await store.clipSrc(refItem.path)
   }
-  if (playingSeq.value === seg.seq) {
-    stopPlayback()
-    return
-  }
-  playingSeq.value = seg.seq
-  const el = audioRef.value
-  if (el) {
-    el.src = src
-    el.currentTime = 0
-    void el.play().catch((e) => {
-      playingSeq.value = 0
-      void MessagePlugin.error(`播放失败：${String(e)}`)
-    })
-  }
+  playing.value = refItem.path
+  window.setTimeout(() => {
+    if (playing.value === refItem.path) playing.value = ''
+  }, Math.min(Math.max(refItem.durationMs, 4000), 15 * 60 * 1000))
 }
 
-function stopPlayback() {
-  playingSeq.value = 0
-  const el = audioRef.value
-  if (el) {
-    el.pause()
-    el.removeAttribute('src')
-  }
-}
-
-async function transcribe() {
-  await meetings.transcribe()
-  if (meetings.error) void MessagePlugin.error(meetings.error)
-  else void MessagePlugin.success(meetings.transcribeMessage)
-}
-
-async function generateMinutes() {
-  await meetings.generateMinutes()
-  if (meetings.error) void MessagePlugin.error(meetings.error)
-  else {
-    void MessagePlugin.success(meetings.minutesMessage)
-    minutesVisible.value = true
-  }
-}
-
-function openMinutesDialog() {
-  minutesVisible.value = true
-}
-
-function openRename() {
-  renameTitle.value = current.value?.meeting.title ?? ''
-  renameVisible.value = true
-}
-
-async function confirmRename() {
-  const id = current.value?.meeting.id
-  if (!id) return
-  await meetings.rename(id, renameTitle.value)
-  renameVisible.value = false
-}
-
-function openDelete() {
-  deleteFiles.value = true
-  deleteVisible.value = true
-}
-
-async function confirmDelete() {
-  const id = current.value?.meeting.id
-  if (!id) return
-  await meetings.remove(id, deleteFiles.value)
-  deleteVisible.value = false
-  void MessagePlugin.success(deleteFiles.value ? '已删除会议与录音文件' : '已删除会议记录（保留录音文件）')
-}
-
-async function showDir() {
-  const id = current.value?.meeting.id
-  if (!id) return
-  const dir = await meetings.openDir(id)
-  if (dir) void MessagePlugin.info(dir)
-}
-
-/** 打开自动保存的纪要笔记。 */
-async function openNote() {
-  const noteId = current.value?.meeting.noteId
-  if (!noteId) {
-    void MessagePlugin.info('还没有生成纪要笔记')
-    return
-  }
+async function migrate() {
+  migrating.value = true
+  migrateMsg.value = ''
   try {
-    if (!notes.notes.length) await notes.init()
-    await notes.openNote(noteId)
-    await router.push({ path: '/notes' })
+    const ids = await store.migrateLegacy()
+    migrateMsg.value = ids.length
+      ? `已导出 ${ids.length} 场旧会议到「会议/旧会议/」，录音也复制进了 会议音频/。`
+      : '没有可导出的旧会议（或都已导出过）。'
+    await legacy.loadList()
   } catch (e) {
-    void MessagePlugin.error(String(e))
+    migrateMsg.value = `导出失败：${String(e)}`
+  } finally {
+    migrating.value = false
   }
 }
 
-function copyTranscript() {
-  const text = current.value?.transcript ?? ''
-  if (!text) return
-  void navigator.clipboard?.writeText(text)
-  void MessagePlugin.success('已复制转写文本')
-}
-
-function render(text: string) {
-  return md.render(text || '')
-}
-
-async function selfCheckRun() {
-  await meetings.runSelfCheck()
+function fmtTime(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 </script>
 
@@ -192,285 +95,224 @@ async function selfCheckRun() {
   <div class="page">
     <header class="page-header">
       <span class="page-title">会议</span>
-      <span class="page-sub">录音 → 转写 → 纪要，音频与文本都保存在本机</span>
+      <span class="page-sub">
+        会议就是一篇 Markdown：随手写、用 <code>/v 音频文件名</code> 引用录音，会后一键处理
+      </span>
       <span class="spacer" />
-      <t-button size="small" variant="outline" @click="selfCheckVisible = true">录音自检</t-button>
-      <t-button v-if="!meetings.recording" theme="primary" size="small" @click="startNew">
-        开始录音
-      </t-button>
-      <t-button v-else theme="danger" size="small" @click="stop">
-        停止录音（{{ fmtDuration(meetings.displayDurationMs) }}）
-      </t-button>
+      <t-button size="small" variant="outline" @click="store.toggleRecorder(true)">🎙 录音</t-button>
+      <t-button size="small" variant="outline" @click="store.loadList()">刷新</t-button>
+      <t-button size="small" theme="primary" @click="showNew = true">新建会议</t-button>
     </header>
 
     <div class="body">
       <aside class="list">
-        <div v-if="meetings.listError" class="list-err">{{ meetings.listError }}</div>
-        <div v-if="!meetings.meetings.length" class="list-empty">
-          还没有会议。<br />点右上角「开始录音」新建一场。
+        <div v-if="store.listError" class="list-err">{{ store.listError }}</div>
+        <label class="scan-all">
+          <t-checkbox
+            :checked="store.scanAll"
+            @change="(v: unknown) => store.loadList(!!v)"
+          />
+          <span>同时显示别处含录音的笔记</span>
+        </label>
+        <div v-if="!store.notes.length && !store.loading" class="list-empty">
+          还没有会议笔记。<br />点右上角「新建会议」开始，或直接在笔记里写
+          <code>/v 音频文件名</code>。
         </div>
         <div
-          v-for="m in meetings.meetings"
-          :key="m.id"
+          v-for="n in store.notes"
+          :key="n.noteId"
           class="item"
-          :class="{ active: m.id === current?.meeting.id }"
-          @click="openMeeting(m.id)"
+          :class="{ active: n.noteId === store.currentId }"
+          @click="store.openNote(n.noteId)"
         >
-          <div class="item-title">{{ m.title }}</div>
+          <div class="item-title">{{ n.title }}</div>
           <div class="item-meta">
-            <t-tag size="small" :theme="statusTheme(m.status)" variant="light">
-              {{ statusLabel(m.status) }}
-            </t-tag>
-            <span>{{ fmtDateTime(m.createdAt) }}</span>
+            <span>{{ n.audioTotal }} 段录音</span>
+            <span>已转写 {{ n.transcribed }}</span>
+            <span v-if="n.audioMissing" class="warn">缺 {{ n.audioMissing }}</span>
           </div>
           <div class="item-meta">
-            <span>{{ fmtDuration(m.durationMs) }}</span>
-            <span v-if="m.segments">· {{ m.transcribedSegments }}/{{ m.segments }} 段已转写</span>
+            <span :class="{ ok: n.hasMinutes }">{{ n.hasMinutes ? '已有纪要' : '待处理' }}</span>
+            <span>{{ formatDur(n.durationMs) }}</span>
+            <span>{{ formatBytes(n.audioBytes) }}</span>
           </div>
         </div>
       </aside>
 
       <section class="detail">
-        <div v-if="!current" class="detail-empty">
-          <div class="empty-title">选择左侧会议，或开始一段新录音</div>
+        <div v-if="!store.current" class="detail-empty">
+          <div class="empty-title">选择左侧会议笔记</div>
           <div class="empty-sub">
-            录音按 4 分钟自动分段（WAV，原采样率保存）；转写会按静音切成 8~45 秒的片段送 ASR，
-            单段失败只影响那一段，可重试。
+            一场会议 = 一篇 md。开会时用右下角的 🎙 录音，录音引用会自动写进笔记；
+            会后点「一键处理」自动转写并生成纪要。
           </div>
         </div>
 
         <template v-else>
           <div class="detail-head">
             <div class="title-row">
-              <span class="meeting-title">{{ current.meeting.title }}</span>
-              <t-tag size="small" :theme="statusTheme(current.meeting.status)" variant="light">
-                {{ statusLabel(current.meeting.status) }}
-              </t-tag>
+              <span class="meeting-title">{{ store.current.title }}</span>
+              <span class="path">{{ store.current.noteId }}</span>
               <span class="spacer" />
-              <t-button size="small" variant="text" @click="openRename">重命名</t-button>
-              <t-button size="small" variant="text" @click="showDir">音频目录</t-button>
-              <t-button size="small" variant="text" theme="danger" @click="openDelete">删除</t-button>
+              <t-button size="small" variant="outline" @click="openInEditor(store.current.noteId)">
+                打开笔记
+              </t-button>
             </div>
             <div class="stat-row">
-              <span>{{ fmtDateTime(current.meeting.createdAt) }}</span>
-              <span>时长 {{ fmtDuration(meetings.displayDurationMs) }}</span>
-              <span>{{ current.segments.length }} 段</span>
-              <span v-if="current.meeting.asrModel">ASR {{ current.meeting.asrModel }}</span>
-              <span v-if="current.meeting.chatModel">对话 {{ current.meeting.chatModel }}</span>
+              <span>{{ refs.length }} 段引用</span>
+              <span>{{ refs.filter((r) => r.hasTranscript).length }} 段已转写</span>
+              <span v-if="missing" class="warn">{{ missing }} 段找不到文件</span>
+              <span>{{ formatDur(store.current.durationMs) }}</span>
+              <span :class="{ ok: store.current.hasMinutes }">
+                {{ store.current.hasMinutes ? '已有纪要' : '还没有纪要' }}
+              </span>
             </div>
           </div>
 
-          <!-- 录音中 -->
-          <div v-if="meetings.recording" class="recording-panel">
-            <div class="rec-head">
-              <span class="dot" />
-              <span>正在录音 · 第 {{ meetings.recordSeq }} 段</span>
-              <span class="rec-time">{{ fmtDuration(meetings.recordElapsedMs) }}</span>
-            </div>
-            <div class="level">
-              <div class="level-bar" :style="{ width: `${meetings.levelPercent}%` }" />
-            </div>
-            <div class="rec-hint">
-              采样率 {{ meetings.recordInfo?.sampleRate ?? '—' }} Hz ·
-              数据每 1 秒写入磁盘 ·
-              {{ meetings.recordSegmentMs >= 180000 ? '即将分段' : '到达 4 分钟自动分段' }}
-            </div>
-          </div>
+          <t-alert v-if="store.error" theme="error" :message="store.error" class="alert" />
 
-          <t-alert v-if="meetings.error" theme="error" :message="meetings.error" class="alert" />
-
-          <!-- 分段列表 -->
           <div class="section">
             <div class="section-head">
-              <span class="section-title">录音分段</span>
+              <span class="section-title">音频引用</span>
               <span class="spacer" />
+              <t-checkbox v-model="force">强制重新转写（忽略缓存）</t-checkbox>
               <t-button
+                v-if="!store.processing"
                 size="small"
                 theme="primary"
-                :disabled="!canTranscribe"
-                :loading="meetings.transcribing"
-                @click="transcribe"
+                :disabled="!canProcess"
+                @click="store.process(force)"
               >
-                {{ current.meeting.hasTranscript ? '重新转写未完成段' : '开始转写' }}
+                一键处理
               </t-button>
-              <t-button
-                v-if="meetings.transcribing"
-                size="small"
-                variant="outline"
-                @click="meetings.cancelTranscribe()"
-              >
-                取消
-              </t-button>
+              <template v-else>
+                <t-button size="small" theme="danger" variant="outline" @click="store.cancelProcess()">
+                  取消
+                </t-button>
+              </template>
             </div>
 
-            <div v-if="meetings.transcribing || meetings.transcribeMessage" class="progress">
-              <t-progress
-                theme="line"
-                :percentage="meetings.transcribeProgress"
-                :label="false"
-                size="small"
+            <div v-if="store.processing || store.message" class="progress">
+              <t-progress :percentage="store.progress" :label="false" />
+              <span class="progress-text">{{ store.message }}</span>
+            </div>
+
+            <div v-if="!refs.length" class="hint">
+              这篇笔记还没有音频引用。用 <code>/v 会议音频/…</code> 或右下角录音面板录制，
+              停止时会自动插入引用。
+            </div>
+            <div v-for="r in refs" :key="`${r.line}-${r.raw}`" class="clip-row">
+              <span class="line">L{{ r.line }}</span>
+              <span class="clip-path" :class="{ bad: !r.exists }">
+                {{ r.raw }}
+                <span v-if="!r.exists" class="warn">（找不到文件）</span>
+              </span>
+              <span class="clip-meta">
+                {{ r.exists ? `${formatDur(r.durationMs)} · ${formatBytes(r.bytes)}` : '—' }}
+              </span>
+              <span class="tag" :class="{ ok: r.hasTranscript }">
+                {{ r.hasTranscript ? '已转写' : '未转写' }}
+              </span>
+              <t-button size="small" variant="text" :disabled="!r.exists" @click="play(r)">
+                {{ playing === r.path ? '停止' : '试听' }}
+              </t-button>
+              <audio
+                v-if="playing === r.path && srcCache[r.path]"
+                :src="srcCache[r.path] as string"
+                autoplay
+                controls
+                class="player"
               />
-              <span class="progress-text">{{ meetings.transcribeMessage }}</span>
             </div>
-
-            <div v-if="!current.segments.length" class="hint">还没有录音分段</div>
-            <div
-              v-for="seg in current.segments"
-              :key="seg.id"
-              class="segment"
-              :class="{ playing: playingSeq === seg.seq }"
-            >
-              <t-button
-                size="small"
-                variant="outline"
-                :disabled="seg.bytes === 0"
-                @click="play(seg)"
-              >
-                {{ playingSeq === seg.seq ? '停止' : '播放' }}
-              </t-button>
-              <span class="seg-title">第 {{ seg.seq }} 段</span>
-              <span class="seg-meta">{{ fmtDuration(seg.durationMs) }}</span>
-              <span class="seg-meta">{{ (seg.bytes / 1024 / 1024).toFixed(1) }} MB</span>
-              <span class="seg-meta">{{ seg.srcRate }} Hz</span>
-              <t-tag size="small" variant="light">{{ segmentLabel(seg.status) }}</t-tag>
-              <span class="spacer" />
-              <span v-if="seg.error" class="seg-err">{{ seg.error }}</span>
-            </div>
-            <audio ref="audioRef" class="hidden-audio" @ended="stopPlayback" />
           </div>
 
-          <!-- 转写 -->
+          <div v-if="store.outcome" class="section">
+            <div class="section-head">
+              <span class="section-title">上次处理结果</span>
+            </div>
+            <div class="outcome">
+              <div>
+                转写 {{ store.outcome.audioDone }} 段、复用缓存 {{ store.outcome.audioSkipped }} 段、失败
+                {{ store.outcome.audioFailed }} 段；转写 {{ store.outcome.transcriptChars }} 字，纪要
+                {{ store.outcome.minutesChars }} 字
+                <span v-if="store.outcome.model">（{{ store.outcome.model }}）</span>
+                ，用时 {{ (store.outcome.elapsedMs / 1000).toFixed(1) }}s
+              </div>
+              <div v-if="store.outcome.cancelled" class="warn">处理被取消</div>
+              <div v-for="(e, i) in store.outcome.errors" :key="i" class="warn">{{ e }}</div>
+            </div>
+          </div>
+
           <div class="section">
-            <div class="section-head">
-              <span class="section-title">转写文本</span>
-              <span v-if="pendingSegments" class="section-sub">{{ pendingSegments }} 段待转写</span>
+            <div class="section-head" @click="showLegacy = !showLegacy">
+              <span class="section-title">旧版会议（录音在前的那种）</span>
               <span class="spacer" />
               <t-button
                 size="small"
                 variant="outline"
-                :disabled="!current.meeting.hasTranscript"
-                @click="copyTranscript"
+                :loading="migrating"
+                @click.stop="migrate()"
               >
-                复制
+                导出为笔记
               </t-button>
-              <t-button
-                size="small"
-                theme="primary"
-                :disabled="!current.meeting.hasTranscript || meetings.generating"
-                :loading="meetings.generating"
-                @click="generateMinutes"
-              >
-                生成纪要
-              </t-button>
-              <t-button
-                size="small"
-                variant="outline"
-                :disabled="!current.meeting.hasMinutes"
-                @click="openMinutesDialog"
-              >
-                查看纪要
-              </t-button>
+              <span class="chev">{{ showLegacy ? '收起' : '展开' }}</span>
             </div>
-            <div v-if="meetings.minutesMessage" class="hint">{{ meetings.minutesMessage }}</div>
-            <pre v-if="current.transcript" class="transcript">{{ current.transcript }}</pre>
-            <div v-else class="hint">
-              还没有转写文本。点上方「开始转写」（需要先在设置里配置语音转写端点）。
+            <div v-if="migrateMsg" class="hint">{{ migrateMsg }}</div>
+            <div v-if="showLegacy">
+              <div v-if="!legacy.meetings.length" class="hint">
+                没有旧版会议。迁移会把旧的录音复制进 <code>会议音频/</code>，转写按时间戳分摊到各分段，
+                旧纪要进「会议纪要」段（已存在的笔记会跳过）。
+              </div>
+              <div v-for="m in legacy.meetings" :key="m.id" class="legacy-row">
+                <span class="legacy-title">{{ m.title }}</span>
+                <span class="clip-meta">{{ m.segments }} 段 · {{ m.status }}</span>
+                <span class="clip-meta">{{ fmtTime(m.createdAt) }}</span>
+              </div>
             </div>
           </div>
 
-          <div v-if="current.meeting.noteId" class="section">
-            <div class="section-head">
-              <span class="section-title">纪要笔记</span>
+          <div class="section">
+            <div class="section-head" @click="showSelfCheck = !showSelfCheck">
+              <span class="section-title">录音自检（排障用）</span>
               <span class="spacer" />
-              <t-button size="small" variant="outline" @click="openNote">
-                打开笔记 {{ current.meeting.noteId }}
+              <span class="chev">{{ showSelfCheck ? '收起' : '展开' }}</span>
+            </div>
+            <div v-if="showSelfCheck" class="selfcheck">
+              <t-button size="small" variant="outline" @click="legacy.runSelfCheck()">
+                检查环境
               </t-button>
+              <t-button
+                size="small"
+                variant="outline"
+                :disabled="legacy.selfCheck.recording"
+                @click="legacy.startSelfCheckRecording(5)"
+              >
+                录 5 秒试听
+              </t-button>
+              <div v-for="(n, i) in legacy.selfCheck.notes" :key="i" class="hint">{{ n }}</div>
+              <div v-if="legacy.selfCheck.info" class="hint">
+                采样率 {{ legacy.selfCheck.info.sampleRate }} Hz ·
+                峰值 {{ legacy.selfCheck.peak }}
+              </div>
+              <audio v-if="legacy.selfCheck.playbackUrl" :src="legacy.selfCheck.playbackUrl" controls />
             </div>
           </div>
         </template>
       </section>
     </div>
 
-    <!-- 重命名 -->
     <t-dialog
-      v-model:visible="renameVisible"
-      header="重命名会议"
-      :on-confirm="confirmRename"
-      :confirm-btn="{ content: '保存' }"
+      v-model:visible="showNew"
+      header="新建会议"
+      :confirm-btn="{ content: '创建', disabled: !newTitle.trim() }"
+      @confirm="create"
     >
-      <t-input v-model="renameTitle" placeholder="会议标题" />
-    </t-dialog>
-
-    <!-- 删除（明确询问是否删除音频文件） -->
-    <t-dialog
-      v-model:visible="deleteVisible"
-      header="删除会议"
-      theme="danger"
-      :on-confirm="confirmDelete"
-      :confirm-btn="{ content: '删除', theme: 'danger' }"
-    >
-      <p class="dlg-text">将删除会议「{{ current?.meeting.title }}」的记录（含转写与纪要记录）。</p>
-      <t-checkbox v-model="deleteFiles">同时删除录音文件（不可恢复）</t-checkbox>
-      <p class="dlg-path">音频目录：{{ current?.dir }}</p>
-    </t-dialog>
-
-    <!-- 纪要 -->
-    <t-dialog
-      v-model:visible="minutesVisible"
-      header="会议纪要"
-      width="820px"
-      :footer="false"
-      class="minutes-dialog"
-    >
-      <div v-if="current?.minutesMd" class="minutes" v-html="render(current.minutesMd)" />
-      <div v-else class="hint">还没有纪要</div>
-    </t-dialog>
-
-    <!-- 录音自检（Desktop / Android spike 共用） -->
-    <t-dialog
-      v-model:visible="selfCheckVisible"
-      header="录音自检"
-      width="620px"
-      :footer="false"
-    >
-      <div class="check-body">
-        <div class="check-row">
-          <t-button size="small" variant="outline" :loading="meetings.selfCheck.running" @click="selfCheckRun">
-            运行环境自检
-          </t-button>
-          <t-button
-            size="small"
-            theme="primary"
-            :loading="meetings.selfCheck.recording"
-            @click="meetings.startSelfCheckRecording(5)"
-          >
-            录 5 秒并回放
-          </t-button>
-        </div>
-
-        <div v-if="meetings.selfCheck.notes.length" class="check-notes">
-          <div v-for="(n, i) in meetings.selfCheck.notes" :key="i" class="check-note">{{ n }}</div>
-        </div>
-
-        <div v-if="meetings.selfCheck.recording || meetings.selfCheck.playbackUrl" class="check-result">
-          <div class="level">
-            <div class="level-bar" :style="{ width: `${meetings.levelPercent}%` }" />
-          </div>
-          <div class="check-meta">
-            <span v-if="meetings.selfCheck.recording">录制中… {{ meetings.selfCheck.seconds }}/5 s</span>
-            <template v-else>
-              <span>采样率 {{ meetings.selfCheck.info?.sampleRate }} Hz</span>
-              <span>· 峰值 {{ meetings.selfCheck.peak }}</span>
-              <span>· 时长约 5 s</span>
-            </template>
-          </div>
-          <audio v-if="meetings.selfCheck.playbackUrl" :src="meetings.selfCheck.playbackUrl" controls />
-        </div>
-
-        <div class="check-tip">
-          自检只在本机进行：验证 WebView 是否有麦克风权限、能否取到 PCM、以及采集到的音频能否回放。
-          在 Android 上这一步过了，就说明「前台录音」链路可用。
-        </div>
+      <div class="dialog-row">
+        <span class="dialog-label">标题</span>
+        <t-input v-model="newTitle" placeholder="例如：周会" @enter="create" />
+      </div>
+      <div class="dialog-hint">
+        会创建 <code>会议/&lt;日期&gt;-&lt;标题&gt;.md</code>，并在文件末尾留好「会议纪要」段。
       </div>
     </t-dialog>
   </div>
@@ -484,11 +326,11 @@ async function selfCheckRun() {
 }
 
 .list {
-  width: 260px;
+  width: 280px;
   flex: none;
   border-right: 1px solid var(--border);
   overflow: auto;
-  padding: 8px;
+  padding: 10px 8px;
 }
 
 .list-empty,
@@ -501,6 +343,15 @@ async function selfCheckRun() {
 
 .list-err {
   color: #d54941;
+}
+
+.scan-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 4px 10px 8px;
 }
 
 .item {
@@ -530,7 +381,7 @@ async function selfCheckRun() {
 .item-meta {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   font-size: 11px;
   color: var(--text-3);
   flex-wrap: wrap;
@@ -544,7 +395,7 @@ async function selfCheckRun() {
 }
 
 .detail-empty {
-  max-width: 520px;
+  max-width: 540px;
   margin: 60px auto;
   text-align: center;
 }
@@ -558,19 +409,17 @@ async function selfCheckRun() {
 .empty-sub {
   font-size: 12px;
   color: var(--text-3);
-  line-height: 1.9;
+  line-height: 2;
 }
 
 .detail-head {
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 10px;
-  margin-bottom: 14px;
+  margin-bottom: 12px;
 }
 
 .title-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
 
 .meeting-title {
@@ -578,86 +427,45 @@ async function selfCheckRun() {
   font-weight: 600;
 }
 
+.path {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: ui-monospace, monospace;
+}
+
 .stat-row {
   display: flex;
   gap: 12px;
-  flex-wrap: wrap;
   font-size: 12px;
   color: var(--text-3);
   margin-top: 6px;
+  flex-wrap: wrap;
 }
 
-.recording-panel {
-  border: 1px solid rgba(213, 73, 65, 0.3);
-  background: rgba(213, 73, 65, 0.05);
-  border-radius: 10px;
-  padding: 10px 12px;
-  margin-bottom: 14px;
+.ok {
+  color: #2ba471;
 }
 
-.rec-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #d54941;
-  animation: pulse 1.2s infinite;
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.25;
-  }
-}
-
-.rec-time {
-  margin-left: auto;
-  font-variant-numeric: tabular-nums;
-}
-
-.level {
-  height: 6px;
-  border-radius: 3px;
-  background: #ebedf0;
-  overflow: hidden;
-  margin: 8px 0 6px;
-}
-
-.level-bar {
-  height: 100%;
-  background: linear-gradient(90deg, #00a870, #e37318, #d54941);
-  transition: width 0.12s linear;
-}
-
-.rec-hint {
-  font-size: 11px;
-  color: var(--text-3);
+.warn {
+  color: #d54941;
 }
 
 .alert {
-  margin-bottom: 14px;
+  margin-bottom: 12px;
 }
 
 .section {
-  margin-bottom: 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 12px;
 }
 
 .section-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: 10px;
+  cursor: default;
 }
 
 .section-title {
@@ -665,24 +473,21 @@ async function selfCheckRun() {
   font-weight: 600;
 }
 
-.section-sub {
-  font-size: 11px;
+.chev {
+  font-size: 12px;
   color: var(--text-3);
+  cursor: pointer;
 }
 
 .progress {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 8px;
-}
-
-.progress :deep(.t-progress) {
-  flex: 1;
+  margin-top: 10px;
 }
 
 .progress-text {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-3);
   white-space: nowrap;
 }
@@ -691,136 +496,108 @@ async function selfCheckRun() {
   font-size: 12px;
   color: var(--text-3);
   line-height: 1.9;
+  margin-top: 8px;
 }
 
-.segment {
+.clip-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  margin-bottom: 6px;
+  gap: 10px;
   font-size: 12px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border);
+  flex-wrap: wrap;
 }
 
-.segment.playing {
-  border-color: #0052d9;
-  background: rgba(0, 82, 217, 0.05);
+.clip-row:last-child {
+  border-bottom: none;
 }
 
-.seg-title {
-  font-weight: 500;
-}
-
-.seg-meta {
+.line {
+  font-family: ui-monospace, monospace;
   color: var(--text-3);
+  width: 32px;
+  flex: none;
 }
 
-.seg-err {
+.clip-path {
+  flex: 1;
+  min-width: 200px;
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+
+.clip-path.bad {
   color: #d54941;
-  font-size: 11px;
-  max-width: 320px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  text-decoration: line-through;
+}
+
+.clip-meta {
+  color: var(--text-3);
   white-space: nowrap;
 }
 
-.hidden-audio {
-  display: none;
-}
-
-.transcript {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 12px 14px;
-  font-size: 13px;
-  line-height: 1.9;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: inherit;
-  max-height: 420px;
-  overflow: auto;
-  margin: 0;
-}
-
-.minutes {
-  font-size: 13px;
-  line-height: 1.9;
-  max-height: 60vh;
-  overflow: auto;
-}
-
-.minutes :deep(h1) {
-  font-size: 18px;
-}
-
-.minutes :deep(h2) {
-  font-size: 15px;
-  margin-top: 18px;
-}
-
-.minutes :deep(table) {
-  border-collapse: collapse;
-}
-
-.minutes :deep(th),
-.minutes :deep(td) {
-  border: 1px solid var(--border);
-  padding: 4px 8px;
-}
-
-.dlg-text {
-  font-size: 13px;
-  margin: 0 0 10px;
-}
-
-.dlg-path {
+.tag {
   font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(134, 144, 156, 0.15);
   color: var(--text-3);
-  margin-top: 8px;
-  word-break: break-all;
+  white-space: nowrap;
 }
 
-.check-body {
+.tag.ok {
+  background: rgba(43, 164, 113, 0.12);
+  color: #2ba471;
+}
+
+.player {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.outcome {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 2;
+  margin-top: 6px;
+}
+
+.legacy-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.legacy-title {
+  flex: 1;
+}
+
+.selfcheck {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-}
-
-.check-row {
-  display: flex;
-  gap: 8px;
-}
-
-.check-notes {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px;
-  font-size: 12px;
-  line-height: 1.9;
-  word-break: break-all;
-}
-
-.check-result {
-  border: 1px dashed var(--border);
-  border-radius: 8px;
-  padding: 10px;
-}
-
-.check-meta {
-  display: flex;
   gap: 6px;
-  font-size: 12px;
-  color: var(--text-2);
+  align-items: flex-start;
+  margin-top: 8px;
+}
+
+.dialog-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin-bottom: 8px;
 }
 
-.check-tip {
-  font-size: 11px;
+.dialog-label {
+  width: 48px;
+  font-size: 13px;
   color: var(--text-3);
-  line-height: 1.9;
+}
+
+.dialog-hint {
+  font-size: 12px;
+  color: var(--text-3);
 }
 </style>
