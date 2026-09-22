@@ -50,9 +50,24 @@ export const useChatStore = defineStore('chat', {
       if (!q || this.asking) return
       const entry: ChatEntry = { id: seq++, question: q, pending: true }
       this.entries.push(entry)
+      await this.run(entry)
+    },
+
+    /** 重新生成：清掉该条答案原地重跑（历史与顺序不变）。 */
+    async askAgain(entry: ChatEntry) {
+      if (this.asking) return
+      entry.answer = undefined
+      entry.error = ''
+      entry.pending = true
+      await this.run(entry)
+    },
+
+    /** 公共执行：置 pending → 请求 → 收尾刷新状态。 */
+    async run(entry: ChatEntry) {
       this.asking = true
       try {
-        entry.answer = await retrievalAdapter().ask(q)
+        entry.answer = await retrievalAdapter().ask(entry.question)
+        entry.error = ''
       } catch (e) {
         entry.error = String(e)
       } finally {
