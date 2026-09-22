@@ -83,6 +83,12 @@ async function migrate() {
   }
 }
 
+/** 旧会议列表按需加载（不占打开页面的时间）。 */
+async function toggleLegacy() {
+  showLegacy.value = !showLegacy.value
+  if (showLegacy.value) await legacy.loadList()
+}
+
 function fmtTime(ts: number): string {
   if (!ts) return ''
   const d = new Date(ts * 1000)
@@ -244,7 +250,7 @@ function fmtTime(ts: number): string {
           </div>
 
           <div class="section">
-            <div class="section-head" @click="showLegacy = !showLegacy">
+            <div class="section-head" @click="toggleLegacy()">
               <span class="section-title">旧版会议（录音在前的那种）</span>
               <span class="spacer" />
               <t-button
