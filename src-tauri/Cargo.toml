@@ -1,6 +1,6 @@
 [package]
 name = "bnu-notes"
-version = "0.2.2"
+version = "0.3.0"
 description = "BNU Notes —— 本地知识库 + 会议纪要客户端"
 authors = ["bnuwsl"]
 edition = "2021"
