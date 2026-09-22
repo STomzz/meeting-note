@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { Graph } from '@antv/g6'
 import { useRouter } from 'vue-router'
@@ -21,6 +21,26 @@ const router = useRouter()
 
 const container = ref<HTMLDivElement | null>(null)
 let graph: Graph | null = null
+
+/** 3D 星球视图按需加载：不切过去就不下载 three.js */
+const Graph3D = defineAsyncComponent(() => import('../components/Graph3D.vue'))
+
+const VIEW_KEY = 'bnu-notes-graph-view'
+const viewMode = ref<'2d' | '3d'>(localStorage.getItem(VIEW_KEY) === '3d' ? '3d' : '2d')
+
+watch(viewMode, async (mode) => {
+  try {
+    localStorage.setItem(VIEW_KEY, mode)
+  } catch {
+    // 存不了不影响本次切换
+  }
+  if (mode === '2d') {
+    await nextTick()
+    await renderGraph()
+    await nextTick()
+    await fit()
+  }
+})
 
 const kindChips = computed(() => (store.kindOptions.length ? store.kindOptions : ALL_KINDS))
 
@@ -217,7 +237,7 @@ async function reextract(noteId: string, title: string) {
 onMounted(async () => {
   await store.bindProgress()
   await store.refresh()
-  await mountGraph()
+  if (viewMode.value === '2d') await mountGraph()
   themeObserver = new MutationObserver(() => void remountGraph())
   themeObserver.observe(document.documentElement, {
     attributes: true,
@@ -271,6 +291,10 @@ function openMention(m: EntityMention) {
       <t-button v-if="store.extracting" size="small" theme="danger" variant="outline" @click="store.cancel()">
         中断
       </t-button>
+      <t-radio-group v-model="viewMode" size="small" variant="default-filled" class="view-switch">
+        <t-radio-button value="2d">力导图</t-radio-button>
+        <t-radio-button value="3d">3D 星球</t-radio-button>
+      </t-radio-group>
       <t-button size="small" variant="text" :loading="store.loading" @click="store.refresh()">刷新</t-button>
     </header>
 
@@ -317,16 +341,19 @@ function openMention(m: EntityMention) {
         节点 {{ store.visible.nodes.length }}/{{ store.snapshot.nodes.length }} · 边
         {{ store.visible.edges.length }}
       </span>
-      <t-button size="small" variant="text" @click="zoom(1.2)">放大</t-button>
-      <t-button size="small" variant="text" @click="zoom(0.8)">缩小</t-button>
-      <t-button size="small" variant="text" @click="fit()">适应窗口</t-button>
-      <t-button size="small" variant="text" :disabled="!store.selectedId" @click="focusSelected()">
-        定位选中
-      </t-button>
+      <template v-if="viewMode === '2d'">
+        <t-button size="small" variant="text" @click="zoom(1.2)">放大</t-button>
+        <t-button size="small" variant="text" @click="zoom(0.8)">缩小</t-button>
+        <t-button size="small" variant="text" @click="fit()">适应窗口</t-button>
+        <t-button size="small" variant="text" :disabled="!store.selectedId" @click="focusSelected()">
+          定位选中
+        </t-button>
+      </template>
     </div>
 
     <div class="body">
-      <div ref="container" class="canvas" />
+      <div v-show="viewMode === '2d'" ref="container" class="canvas" />
+      <Graph3D v-if="viewMode === '3d'" />
 
       <aside class="detail">
         <div v-if="!store.hasGraph" class="empty">
@@ -428,6 +455,10 @@ function openMention(m: EntityMention) {
 }
 .banner-bar {
   width: 180px;
+}
+
+.view-switch {
+  flex: none;
 }
 
 .toolbar {

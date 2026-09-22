@@ -37,7 +37,7 @@ docs/models.md       四类模型端点、实测记录与注意事项
 
 ## 文档
 
-- [docs/graph.md](docs/graph.md)：知识图谱（实体/关系抽取、防幻觉约束、G6 力导图、邻居扩展检索）。
+- [docs/graph.md](docs/graph.md)：知识图谱（实体/关系抽取、防幻觉约束、2D 力导 + 3D 星球视图、邻居扩展检索）。
 - [docs/models.md](docs/models.md)：模型端点配置、推荐模型、实测数据、上游限制。
 - [docs/meetings.md](docs/meetings.md)：会议笔记——文件夹树、**会议 = 一篇 md**（`/v` 引用录音、一键处理转写 + 纪要）、录音归类、旧会议迁移与排障。
 - [docs/windows.md](docs/windows.md)：Windows 安装包怎么出、安装、数据位置与验收清单。
