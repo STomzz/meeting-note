@@ -373,3 +373,95 @@ async fn live_graph_extract_and_query() {
     assert!(!detail.neighbors.is_empty() && !detail.mentions.is_empty());
 }
 
+/// 端到端：抽取图谱 → 邻居扩展生效（检索与问答的 trace 都带标注）。
+#[tokio::test]
+#[ignore]
+async fn live_graph_enhanced_retrieval() {
+    use bnu_core::{db, graph, notes, qa, retrieval, vectors};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    let cfg = live_config();
+    assert_key(&cfg);
+
+    // A 命中查询；B 语义相近；C 只与 A/B 共享实体「张伟」（多跳目标）
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("A.md"), "# 周会\n\n镜像拉取超时的问题由张伟跟进，下周给结论。\n").unwrap();
+    std::fs::write(
+        dir.path().join("B.md"),
+        "# 部署记录\n\n张伟在 gpu-node3 上用 hf-mirror.com 验证断点续传，问题已解决。\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("C.md"),
+        "# 读书笔记\n\n张伟摘抄：沈括在《梦溪笔谈》里记录过指南针的用法。\n",
+    )
+    .unwrap();
+
+    let conn = db::open_memory().unwrap();
+    notes::scan_vault(&conn, dir.path()).unwrap();
+    let m = Mutex::new(conn);
+
+    let cancel = AtomicBool::new(false);
+    let out = graph::extract_all(&m, &cfg, false, &|_| {}, &cancel).await.unwrap();
+    println!("抽取：实体 {} 关系 {} 失败 {}｜{:?}", out.entities, out.relations, out.notes_failed, out.errors);
+    assert!(out.entities > 0, "图谱没有抽到实体");
+
+    if let Some(ec) = cfg.embedding.as_ref() {
+        let p = vectors::build(&m, ec, 16, 64).await.unwrap();
+        println!("向量索引：{} 条（dim {}）", p.embedded, p.dim);
+    }
+
+    // ① 机制证明：只用全文 + 只取 1 条候选，看图谱能否把「共享实体」的另两篇补回来
+    let pure = retrieval::RetrieveOptions {
+        top_k: 5,
+        candidate_k: 1,
+        use_vectors: false,
+        use_rerank: false,
+        ..Default::default()
+    };
+    let (chunks, trace) = retrieval::retrieve(&m, &cfg, "镜像拉取超时", &pure).await.unwrap();
+    println!(
+        "[机制] mode={} fts={}｜图谱 entities={} hits={} added={}",
+        trace.mode, trace.fts_hits, trace.graph_entities, trace.graph_hits, trace.graph_added
+    );
+    for c in &chunks {
+        println!("  [{}] {} sources={:?}", c.chunk_id, c.note_id, c.sources);
+    }
+    assert_eq!(trace.fts_hits, 1, "全文应只命中 A.md");
+    assert!(trace.graph_entities > 0, "命中片段没有关联实体 → 图谱没参与");
+    assert!(trace.graph_hits > 0, "图谱邻居扩展没有召回候选（检查抽取是否漏了「张伟」）");
+    assert!(trace.graph_added > 0, "扩展候选没进入最终结果");
+    assert!(trace.mode.ends_with("+graph"), "mode 应标注 +graph：{}", trace.mode);
+    assert!(
+        chunks.iter().any(|c| c.sources == vec!["graph".to_string()]),
+        "应有片段来源标注为 graph"
+    );
+
+    // ② 完整链路（向量 + 重排 + 图谱）
+    let opts = retrieval::RetrieveOptions { top_k: 5, candidate_k: 2, ..Default::default() };
+    let (chunks, trace) = retrieval::retrieve(
+        &m,
+        &cfg,
+        "镜像拉取超时的问题是谁跟进、怎么解决的？",
+        &opts,
+    )
+    .await
+    .unwrap();
+    println!(
+        "[完整] mode={} fts={} vector={}｜图谱 entities={} hits={} added={}",
+        trace.mode, trace.fts_hits, trace.vector_hits, trace.graph_entities, trace.graph_hits, trace.graph_added
+    );
+    for c in &chunks {
+        println!("  [{}] {} 第 {}-{} 行 sources={:?}", c.chunk_id, c.note_id, c.start_line, c.end_line, c.sources);
+    }
+    assert!(trace.graph_entities > 0, "混合检索下图谱也应参与");
+
+    let answer = qa::answer(&m, &cfg, "镜像拉取超时的问题是谁跟进、怎么解决的？", 5).await.unwrap();
+    println!(
+        "问答：mode={} graph_added={} 耗时={}ms\n{}",
+        answer.trace.mode, answer.trace.graph_added, answer.elapsed_ms, answer.answer
+    );
+    assert!(!answer.answer.is_empty());
+}
+

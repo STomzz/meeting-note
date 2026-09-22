@@ -18,6 +18,9 @@ use std::time::Instant;
 /// RRF 平滑常数（经验值 60）。
 pub const RRF_K: f32 = 60.0;
 
+/// 图谱扩展这一路的 RRF 权重（低于全文/向量，避免喧宾夺主）。
+pub const GRAPH_WEIGHT: f32 = 0.5;
+
 /// 检索到的片段。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,11 +40,17 @@ pub struct RetrievedChunk {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrievalTrace {
-    /// fts | hybrid | hybrid+rerank
+    /// fts | hybrid | hybrid+rerank（+graph 表示图谱扩展参与）
     pub mode: String,
     pub fts_hits: usize,
     pub vector_hits: usize,
     pub reranked: bool,
+    /// 图谱扩展召回的候选片段数
+    pub graph_hits: usize,
+    /// 最终结果里来自图谱扩展的片段数（>0 表示增强生效）
+    pub graph_added: usize,
+    /// 本次用到的种子实体数（命中片段的实体）
+    pub graph_entities: usize,
     /// 降级原因（用户可见）
     pub degraded: Vec<String>,
     pub elapsed_ms: u64,
@@ -58,6 +67,10 @@ pub struct RetrieveOptions {
     pub use_rerank: bool,
     /// 重排得分下限：低于该值的片段会被丢弃（至少保留最高分那条），避免把不相关内容塞进提示词
     pub min_rerank_score: f32,
+    /// 是否用知识图谱做邻居扩展（图谱为空时自然无效，不会报错）
+    pub expand_entities: bool,
+    /// 图谱扩展最多补多少条候选
+    pub expand_k: usize,
 }
 
 impl Default for RetrieveOptions {
@@ -68,6 +81,8 @@ impl Default for RetrieveOptions {
             use_vectors: true,
             use_rerank: true,
             min_rerank_score: 0.05,
+            expand_entities: true,
+            expand_k: 4,
         }
     }
 }
@@ -155,6 +170,71 @@ pub fn rrf(lists: &[(&[i64], f32)]) -> Vec<i64> {
     out.into_iter().map(|(id, _)| id).collect()
 }
 
+/// 这批片段涉及的实体 id（去重）。
+pub fn entities_for_chunks(conn: &Connection, chunk_ids: &[i64]) -> Result<Vec<i64>> {
+    if chunk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT DISTINCT entity_id FROM chunk_entities WHERE chunk_id IN ({}) ORDER BY entity_id",
+        placeholders(chunk_ids.len(), 1)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(chunk_ids.iter()), |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// 生成 `?1, ?2, ...` 形式的占位符（SQLite 不支持数组参数）。
+fn placeholders(n: usize, start: usize) -> String {
+    (0..n).map(|i| format!("?{}", start + i)).collect::<Vec<_>>().join(", ")
+}
+
+/// 图谱邻居扩展：从命中片段出发，经「共享实体」找回其它相关片段。
+///
+/// 打分 = Σ 共享实体数 / 该实体出现的块数 —— 出现在越少块里的实体越"专指"，
+/// 权重越高，避免「会议」「项目」这类高频实体把整个库都拉进来。
+/// 图谱为空（没抽取过）时返回空，调用方自然降级，不报错。
+pub fn graph_expand(conn: &Connection, seed_ids: &[i64], limit: usize) -> Result<Vec<i64>> {
+    if seed_ids.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let n = seed_ids.len();
+    let sql = format!(
+        r#"WITH sel AS (
+               SELECT entity_id, COUNT(*) AS shared
+               FROM chunk_entities WHERE chunk_id IN ({seed_ph}) GROUP BY entity_id
+           ), links AS (
+               SELECT entity_id, COUNT(*) AS n FROM chunk_entities GROUP BY entity_id
+           )
+           SELECT ce.chunk_id, SUM(sel.shared * 1.0 / links.n) AS score
+           FROM chunk_entities ce
+           JOIN sel ON sel.entity_id = ce.entity_id
+           JOIN links ON links.entity_id = ce.entity_id
+           WHERE ce.chunk_id NOT IN ({seed_ph})
+           GROUP BY ce.chunk_id
+           ORDER BY score DESC, ce.chunk_id
+           LIMIT ?{limit_ph}"#,
+        seed_ph = placeholders(n, 1),
+        limit_ph = 2 * n + 1,
+    );
+    let params_iter = seed_ids
+        .iter()
+        .copied()
+        .chain(seed_ids.iter().copied())
+        .chain(std::iter::once(limit.clamp(1, 200) as i64));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// 按 id 顺序取回片段正文。
 pub fn hydrate(conn: &Connection, ids: &[i64], scores: &HashMap<i64, f32>) -> Result<Vec<RetrievedChunk>> {
     if ids.is_empty() {
@@ -199,6 +279,9 @@ pub struct RetrievalStatus {
     pub has_rerank: bool,
     /// 向量索引是否可用于检索（已配置嵌入模型且已有向量）
     pub vector_ready: bool,
+    /// 图谱实体/关系数（0 表示还没抽取过）
+    pub graph_entities: i64,
+    pub graph_relations: i64,
 }
 
 /// 汇总当前检索能力与索引状态。
@@ -222,6 +305,8 @@ pub fn status(conn: &Connection, cfg: &ModelConfig) -> Result<RetrievalStatus> {
         has_chat: cfg.chat.is_some(),
         has_embedding: cfg.embedding.is_some(),
         has_rerank: cfg.rerank.is_some(),
+        graph_entities: conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))?,
+        graph_relations: conn.query_row("SELECT COUNT(*) FROM relations", [], |r| r.get(0))?,
     })
 }
 
@@ -280,9 +365,31 @@ pub async fn retrieve(
 
     // 3) RRF 融合
     let lists: Vec<(&[i64], f32)> = vec![(fts_hits.as_slice(), 1.0), (vector_hits.as_slice(), 1.0)];
-    let scores = rrf_scores(&lists);
+    let mut scores = rrf_scores(&lists);
     let mut ids = rrf(&lists);
     ids.truncate(opts.candidate_k);
+
+    // 3.5) 图谱邻居扩展：把命中片段经共享实体牵连出的片段并入融合（权重更低）
+    let mut graph_hits: Vec<i64> = Vec::new();
+    if opts.expand_entities && opts.expand_k > 0 && !ids.is_empty() {
+        let (entities, expanded) = {
+            let c = lock(conn)?;
+            (entities_for_chunks(&c, &ids)?, graph_expand(&c, &ids, opts.expand_k)?)
+        };
+        trace.graph_entities = entities.len();
+        if !expanded.is_empty() {
+            graph_hits = expanded;
+            trace.graph_hits = graph_hits.len();
+            let lists: Vec<(&[i64], f32)> = vec![
+                (fts_hits.as_slice(), 1.0),
+                (vector_hits.as_slice(), 1.0),
+                (graph_hits.as_slice(), GRAPH_WEIGHT),
+            ];
+            scores = rrf_scores(&lists);
+            ids = rrf(&lists);
+            ids.truncate(opts.candidate_k + opts.expand_k);
+        }
+    }
 
     // 4) 重排（可选）
     let mut reranked = false;
@@ -332,20 +439,28 @@ pub async fn retrieve(
         if vector_hits.contains(&ch.chunk_id) {
             sources.push("vector".to_string());
         }
+        if graph_hits.contains(&ch.chunk_id) {
+            sources.push("graph".to_string());
+        }
         if reranked {
             sources.push("rerank".to_string());
         }
         ch.sources = sources;
     }
+    trace.graph_added = chunks.iter().filter(|c| c.sources.iter().any(|s| s == "graph")).count();
 
     trace.reranked = reranked;
-    trace.mode = if reranked {
-        "hybrid+rerank".into()
+    let mut mode = if reranked {
+        "hybrid+rerank".to_string()
     } else if !vector_hits.is_empty() {
-        "hybrid".into()
+        "hybrid".to_string()
     } else {
-        "fts".into()
+        "fts".to_string()
     };
+    if trace.graph_added > 0 {
+        mode.push_str("+graph");
+    }
+    trace.mode = mode;
     trace.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok((chunks, trace))
 }
@@ -432,6 +547,8 @@ mod tests {
         assert_eq!(trace.mode, "fts");
         assert!(trace.vector_hits == 0 && !trace.reranked);
         assert!(chunks[0].sources.contains(&"fts".to_string()));
+        // 没有图谱数据时扩展静默失效
+        assert_eq!((trace.graph_hits, trace.graph_added, trace.graph_entities), (0, 0, 0));
     }
 
     #[tokio::test]
@@ -455,5 +572,108 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(trace.mode, "fts");
         assert_eq!(trace.degraded.len(), 1);
+    }
+
+    fn add_entity(conn: &Connection, name: &str, kind: &str) -> i64 {
+        conn.execute("INSERT INTO entities (name, kind) VALUES (?1, ?2)", params![name, kind])
+            .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn link_entity(conn: &Connection, chunk_id: i64, note_id: &str, entity_id: i64) {
+        conn.execute(
+            "INSERT OR IGNORE INTO chunk_entities (chunk_id, note_id, entity_id) VALUES (?1, ?2, ?3)",
+            params![chunk_id, note_id, entity_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn graph_expand_prefers_rare_entities() {
+        let conn = db::open_memory().unwrap();
+        // c1 同时含「张三」「北京大学」「会议」；c2 共享北京大学；c4 共享张三；c3 无关
+        conn.execute(
+            "INSERT INTO notes (id, title) VALUES ('n.md', '笔记')",
+            [],
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for (seq, text) in [
+            "张三在北京大学参加周会。",
+            "北京大学的实验室在装修。",
+            "读了 Rust 所有权相关章节。",
+            "张三和李四合作发表论文。",
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO chunks (note_id, seq, start_line, end_line, text) VALUES ('n.md', ?1, 1, 2, ?2)",
+                params![seq as i64, text],
+            )
+            .unwrap();
+            ids.push(conn.last_insert_rowid());
+        }
+        let (c1, c2, c3, c4) = (ids[0], ids[1], ids[2], ids[3]);
+        // 高频实体「会议」：挂到 c1 + 10 个填充块
+        let e_meeting = add_entity(&conn, "会议", "event");
+        let mut filler = Vec::new();
+        for i in 0..10 {
+            conn.execute(
+                "INSERT INTO chunks (note_id, seq, start_line, end_line, text) VALUES ('n.md', ?1, 1, 2, '填充')",
+                params![100 + i],
+            )
+            .unwrap();
+            filler.push(conn.last_insert_rowid());
+        }
+        let e_zhang = add_entity(&conn, "张三", "person");
+        let e_pku = add_entity(&conn, "北京大学", "org");
+        link_entity(&conn, c1, "n.md", e_zhang);
+        link_entity(&conn, c1, "n.md", e_pku);
+        link_entity(&conn, c1, "n.md", e_meeting);
+        link_entity(&conn, c2, "n.md", e_pku);
+        link_entity(&conn, c4, "n.md", e_zhang);
+        for f in &filler {
+            link_entity(&conn, *f, "n.md", e_meeting);
+        }
+
+        let expanded = graph_expand(&conn, &[c1], 2).unwrap();
+        assert_eq!(expanded, vec![c2, c4], "应优先共享低频实体（北京大学/张三），而不是高频的「会议」");
+        assert!(!expanded.contains(&c3));
+        // 种子为空 → 不扩展
+        assert!(graph_expand(&conn, &[], 5).unwrap().is_empty());
+        // 实体 id 去重
+        assert_eq!(entities_for_chunks(&conn, &[c1, c2]).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn retrieve_expands_via_graph_and_can_be_disabled() {
+        let conn = db::open_memory().unwrap();
+        seed(&conn);
+        let c1: i64 = conn
+            .query_row("SELECT id FROM chunks WHERE note_id = '工作/周会.md'", [], |r| r.get(0))
+            .unwrap();
+        let c2: i64 = conn
+            .query_row("SELECT id FROM chunks WHERE note_id = '读书.md'", [], |r| r.get(0))
+            .unwrap();
+        let e = add_entity(&conn, "镜像站", "concept");
+        link_entity(&conn, c1, "工作/周会.md", e);
+        link_entity(&conn, c2, "读书.md", e);
+        let m = Mutex::new(conn);
+        let cfg = ModelConfig::default();
+
+        let (chunks, trace) = retrieve(&m, &cfg, "镜像拉取", &RetrieveOptions::default()).await.unwrap();
+        assert_eq!(chunks.len(), 2, "图谱把读书笔记也带出来了");
+        assert_eq!(trace.graph_entities, 1);
+        assert_eq!(trace.graph_hits, 1);
+        assert_eq!(trace.graph_added, 1);
+        assert_eq!(trace.mode, "fts+graph");
+        let extra = chunks.iter().find(|c| c.chunk_id == c2).unwrap();
+        assert_eq!(extra.sources, vec!["graph".to_string()]);
+
+        let opts = RetrieveOptions { expand_entities: false, ..Default::default() };
+        let (chunks, trace) = retrieve(&m, &cfg, "镜像拉取", &opts).await.unwrap();
+        assert_eq!(chunks.len(), 1, "关掉扩展后只返回全文命中");
+        assert_eq!((trace.graph_hits, trace.graph_added), (0, 0));
     }
 }
