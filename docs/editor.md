@@ -57,6 +57,16 @@ npx vitest run src/core/blocks.spec.ts        # 块模型：逐字节还原、�
 npx vitest run src/components/BlockEditor.spec.ts  # 组件交互：点选编辑、blur 写回、菜单、回车拆分、定位
 ```
 
+jsdom 测不出的那部分（焦点/blur 时序、浏览器补发的 blur、canvas 尺寸、G6/three 生命周期）用**真浏览器冒烟**兜：
+
+```bash
+npm run dev                  # 另开终端
+node scripts/smoke-ui.mjs    # 真 Chrome 点一遍：块编辑 + 图谱 2D/3D 切换（含用户报过的切换回归）
+```
+
+> v0.3.1 就是这么抓到一个 jsdom 测不出的 bug：Chrome 在旧输入框被移除 / 新输入框刚挂载时会补发 blur，
+> 之前会把「回车拆段」刚打开的新编辑会话立刻关掉（写回逻辑因此改成只认当前这一轮编辑的输入框元素）。
+
 ## 已知限制
 
 - 行内格式（加粗、链接）没有悬浮工具栏：在段里直接写 `**加粗**`、`[文字](url)`，写回后即渲染；

@@ -410,6 +410,10 @@ defineExpose({ insertLines, locate })
   cursor: text;
 }
 
+.blocks.readonly .blk {
+  cursor: default;
+}
+
 .blk:hover {
   background: var(--hover);
 }

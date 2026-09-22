@@ -20,6 +20,7 @@ npm run dev            # 浏览器预览（Mock 适配器，不发真实请求�
 npm run tauri dev      # 桌面客户端（真实命令层）
 npm test               # 前端单测
 npm run build          # 类型检查 + 前端构建
+node scripts/smoke-ui.mjs   # 真 Chrome UI 冒烟（需先 npm run dev；见文件头注释）
 
 cargo test -p bnu-core                 # Rust 核心库单测
 cargo test -p bnu-core -- --ignored    # 真实网关联调（需要 BNU_TEST_API_KEY，见 docs/models.md）
@@ -42,7 +43,7 @@ docs/models.md       四类模型端点、实测记录与注意事项
 ## 文档
 
 - [docs/graph.md](docs/graph.md)：知识图谱（实体/关系抽取、防幻觉约束、2D 力导 + 3D 星球视图、邻居扩展检索）。
-- [docs/editor.md](docs/editor.md)：笔记编辑器——块模型与「只替换被编辑的块」、交互与快捷键、引用插入落点。
+- [docs/editor.md](docs/editor.md)：笔记编辑器——块模型与「只替换被编辑的块」、交互与快捷键、引用插入落点、真浏览器冒烟。
 - [docs/qa.md](docs/qa.md)：问答——流式生成与停止、行内引用定位、会话历史（`chat-history.json`）、追问建议与限流。
 - [docs/models.md](docs/models.md)：模型端点配置、推荐模型、实测数据、上游限制。
 - [docs/meetings.md](docs/meetings.md)：会议笔记——文件夹树、**会议 = 一篇 md**（`/v` 引用录音、一键处理转写 + 纪要）、录音归类、旧会议迁移与排障。
