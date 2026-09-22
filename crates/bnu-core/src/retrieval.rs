@@ -91,6 +91,19 @@ fn lock<'a>(m: &'a Mutex<Connection>) -> Result<std::sync::MutexGuard<'a, Connec
     m.lock().map_err(|_| anyhow!("数据库锁定失败（锁已中毒）"))
 }
 
+/// 执行一次 FTS5 MATCH，按 BM25 排序返回 chunk_id。
+fn fts_ids(conn: &Connection, expr: &str, limit: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.chunk_id FROM notes_fts f WHERE notes_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![expr, limit], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// 全文召回：返回按相关度排序的 chunk_id。
 pub fn fts_candidates(conn: &Connection, query: &str, limit: usize) -> Result<Vec<i64>> {
     let q = query.trim();
@@ -100,15 +113,15 @@ pub fn fts_candidates(conn: &Connection, query: &str, limit: usize) -> Result<Ve
     let limit = limit.clamp(1, 200) as i64;
     match notes::fts_match_expr(q) {
         Some(expr) => {
-            let mut stmt = conn.prepare(
-                "SELECT f.chunk_id FROM notes_fts f WHERE notes_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![expr, limit], |r| r.get::<_, i64>(0))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
+            let ids = fts_ids(conn, &expr, limit)?;
+            if !ids.is_empty() {
+                return Ok(ids);
             }
-            Ok(out)
+            // 严格匹配空手（典型：整句中文问题）→ 3-gram 宽松兜底
+            match notes::fts_relaxed_expr(q) {
+                Some(relaxed) if relaxed != expr => fts_ids(conn, &relaxed, limit),
+                _ => Ok(ids),
+            }
         }
         None => {
             let mut stmt = conn.prepare(
@@ -519,6 +532,11 @@ mod tests {
         // 短查询走 LIKE 兜底
         let hits = fts_candidates(&conn, "读书", 10).unwrap();
         assert_eq!(hits.len(), 1);
+        // 整句中文问题：严格 phrase 空手 → 3-gram 宽松兜底
+        let hits = fts_candidates(&conn, "镜像拉取超时的问题是谁跟进、怎么解决的？", 10).unwrap();
+        assert_eq!(hits.len(), 1, "长中文问题应有兜底命中");
+        // 库里没有的词不硬凑
+        assert!(fts_candidates(&conn, "量子纠缠退相干实验", 10).unwrap().is_empty());
     }
 
     #[test]

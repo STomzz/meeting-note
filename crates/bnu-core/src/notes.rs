@@ -321,6 +321,51 @@ pub fn fts_match_expr(query: &str) -> Option<String> {
     }
 }
 
+/// 宽松匹配表达式：把长串（整句中文问题）拆成 3-gram，用 OR 连接。
+///
+/// trigram 分词器下，整句中文问题会被当成**一个 phrase** 去 AND 匹配 → 必然空手；
+/// 严格匹配无结果时用这个表达式兜底（BM25 仍会按命中词数与稀有度排序）。
+pub fn fts_relaxed_expr(query: &str) -> Option<String> {
+    /// 单个查询词超过这个长度就拆 3-gram。
+    const LONG_TERM: usize = 8;
+    /// 3-gram 数量上限（避免超长问题生成巨型表达式）。
+    const MAX_GRAMS: usize = 24;
+
+    let mut grams: Vec<String> = Vec::new();
+    for term in query.split_whitespace() {
+        let chars: Vec<char> = term.chars().collect();
+        if chars.len() < 3 {
+            continue; // trigram 索引匹配不了 <3 字符，交给 LIKE 兜底
+        }
+        let pieces: Vec<String> = if chars.len() <= LONG_TERM {
+            vec![chars.iter().collect()]
+        } else {
+            chars.windows(3).map(|w| w.iter().collect()).collect()
+        };
+        for p in pieces {
+            if !grams.contains(&p) {
+                grams.push(p);
+            }
+            if grams.len() >= MAX_GRAMS {
+                break;
+            }
+        }
+        if grams.len() >= MAX_GRAMS {
+            break;
+        }
+    }
+    if grams.is_empty() {
+        return None;
+    }
+    Some(
+        grams
+            .iter()
+            .map(|g| format!("\"{}\"", g.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
 /// 全文检索。
 ///
 /// - 查询 >= 3 字符：FTS5 trigram 子串匹配（中文友好）；
@@ -362,7 +407,30 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Search
            WHERE notes_fts MATCH ?1
            ORDER BY rank LIMIT ?2"#,
     )?;
-    let rows = stmt.query_map(params![match_expr, limit], |r| {
+    let hits: Vec<SearchHit> = stmt
+        .query_map(params![match_expr, limit], |r| {
+            Ok(SearchHit {
+                note_id: r.get(0)?,
+                title: r.get(1)?,
+                start_line: r.get(2)?,
+                end_line: r.get(3)?,
+                snippet: r.get(4)?,
+            })
+        })?
+        .flatten()
+        .collect();
+    if !hits.is_empty() {
+        return Ok(hits);
+    }
+
+    // 严格匹配空手（典型：整句中文问题被当成一个 phrase）→ 3-gram 宽松兜底
+    let Some(relaxed) = fts_relaxed_expr(q) else {
+        return Ok(Vec::new());
+    };
+    if relaxed == match_expr {
+        return Ok(hits);
+    }
+    let rows = stmt.query_map(params![relaxed, limit], |r| {
         Ok(SearchHit {
             note_id: r.get(0)?,
             title: r.get(1)?,
@@ -491,5 +559,31 @@ mod tests {
         scan_vault(&conn, root).unwrap();
         let hits = search(&conn, "图", 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn long_chinese_question_falls_back_to_grams() {
+        let (dir, conn) = setup();
+        let root = dir.path();
+        write(root, "a.md", "# 周会\n\n镜像拉取超时的问题由张伟跟进，下周给结论。\n");
+        write(root, "b.md", "# 读书\n\n今天读了 Rust 所有权相关章节。\n");
+        scan_vault(&conn, root).unwrap();
+
+        // 整句问题：严格 phrase 匹配必然空手 → 3-gram 兜底应命中 a.md
+        let hits = search(&conn, "镜像拉取超时的问题是谁跟进、怎么解决的？", 10).unwrap();
+        assert_eq!(hits.len(), 1, "长中文问题应有兜底命中：{hits:?}");
+        assert_eq!(hits[0].note_id, "a.md");
+
+        // 纯关键词仍走严格匹配（不因兜底改变排序）
+        let hits = search(&conn, "Rust 所有权", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].note_id, "b.md");
+
+        // 库里没有的词 → 依旧空手，不硬凑
+        assert!(search(&conn, "量子纠缠退相干实验", 10).unwrap().is_empty());
+
+        let expr = fts_relaxed_expr("镜像拉取超时的问题是谁跟进").unwrap();
+        assert!(expr.contains("\"镜像拉\"") && expr.contains("OR"), "{expr}");
+        assert!(fts_relaxed_expr("图").is_none(), "太短的词交给 LIKE 兜底");
     }
 }
