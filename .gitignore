@@ -25,3 +25,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Android 签名（本地私密信息，不入库）
+src-tauri/gen/android/keystore.properties
+*.keystore
+*.jks
+

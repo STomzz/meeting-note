@@ -1,0 +1,87 @@
+# Android（Tauri 移动端）
+
+目标：先用一个可安装的 APK 验证**前台录音链路**（权限 → WebView 采集 PCM → 落盘 → 回放 → 转写），
+风险早暴露；不追求 Play 上架、不做后台录音。
+
+## 环境（本机已具备）
+
+| 组件 | 位置 |
+| --- | --- |
+| JDK 17 | `~/tools/jdk-17.0.20.1+1`（`~/tools/env.sh` 里设置 `JAVA_HOME`） |
+| Android SDK | `~/tools/android-sdk`（`ANDROID_HOME`） |
+| NDK | `~/tools/android-sdk/ndk/28.2.13676358`（`NDK_HOME`） |
+| Rust 目标 | `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`（国内可用 `RUSTUP_DIST_SERVER=https://rsproxy.cn`） |
+
+一次性初始化（已执行，工程在 `src-tauri/gen/android/`，已入库）：
+
+```bash
+source ~/.cargo/env && source ~/tools/env.sh
+export NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+npm run tauri android init          # 生成 gen/android 工程
+```
+
+## 权限
+
+`src-tauri/gen/android/app/src/main/AndroidManifest.xml`：
+
+```xml
+<uses-permission android:name="android.permission.RECORD_AUDIO" />
+<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+<uses-feature android:name="android.hardware.microphone" android:required="false" />
+```
+
+运行时授权由 wry 的 `RustWebChromeClient.onPermissionRequest` 处理：WebView 里第一次调用
+`getUserMedia({audio:true})` 时会弹出系统授权框（`AUDIO_CAPTURE` → `RECORD_AUDIO`）。
+拒绝后需要在系统设置里手动开启，App 内会显示「没有麦克风权限」。
+
+## 构建 APK
+
+debug 包（190 MB 左右，含调试符号，只用于快速验证）：
+
+```bash
+npm run tauri android build -- --debug --apk --target aarch64
+# 产物：src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+```
+
+release 包（~11 MB，已开启混淆；**推荐装这个**）：
+
+```bash
+npm run tauri android build -- --apk --target aarch64
+# 产物：src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+```
+
+签名（release）：
+
+- 密钥库在 `~/.android/bnu-notes.keystore`（密码存 `~/.android/bnu-notes-keystore.txt`，权限 600，
+  **不要入库**；正式发布请换成你自己的密钥库并妥善备份——丢了就再也无法覆盖安装升级）；
+- `src-tauri/gen/android/keystore.properties`（已 gitignore）指向密钥库，Gradle 会自动签名；
+- 文件不存在时 release 构建产出未签名 APK，可用 `apksigner` 手动签：
+
+```bash
+$ANDROID_HOME/build-tools/35.0.0/apksigner sign --ks ~/.android/bnu-notes.keystore \
+  --out bnu-notes.apk app-universal-release.apk
+```
+
+产物已确认：ABI 仅 `arm64-v8a`，签名证书 `CN=BNU Notes`，`libbnu_notes_lib.so` 为**生产模式**
+（内嵌前端资源，不依赖 `localhost:1420` 开发服务器）。
+
+## 安装与验证清单
+
+1. 把 APK 传到手机（`/mnt/c/Users/<你>/Desktop/` 里的副本直接拖进手机，或 `adb install -r bnu-notes.apk`）；
+2. 允许「安装未知来源应用」；
+3. 打开 App → **会议** 页 → 右上角「录音自检」：
+   - 「运行环境自检」：应显示支持 `getUserMedia`、支持 Wake Lock；
+   - 「录 5 秒并回放」：第一次会弹麦克风授权 → 录完显示采样率/峰值，能播放说明采集链路可用；
+4. 回到会议页「开始录音」→ 对着手机说话（看电平条）→ 停止 → 分段出现在列表里 → 点「播放」能听到；
+5. 转写前先在**设置**里「填 API 地址 + Key」（与桌面端一致；手机需要能访问模型网关），
+   然后点「开始转写」；
+6. 想看持久化结果：会议页「音频目录」按钮会显示路径（应用私有目录）。
+
+## 已知限制与注意
+
+- **只做前台录音**：息屏、切后台、被电话/其它 App 抢占麦克风都可能中断录音（v1 不做音频焦点与前台服务）；
+- 录音期间会申请 `screen` Wake Lock 保持屏幕常亮（失败不阻断录音）；
+- Android 上不能用 `localhost` 访问模型网关，必须填手机网络能到达的地址；
+- `tauri android dev`（开发服务器 + 热重载）在 Tauri 里走 `tauri://localhost` 代理，
+  需要 `adb reverse`；本仓库的验证流程用打包 APK，不走这条路径；
+- 手机与电脑不在同一网络时，转写/纪要会失败（录音、播放、保存都是本地的，不受影响）。
