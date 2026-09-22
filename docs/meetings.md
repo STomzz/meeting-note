@@ -1,34 +1,81 @@
-# 会议模块（P5）
+# 会议模块（P7：会议 = 一篇 Markdown）
 
-录音、转写、纪要全部在客户端完成，云端只提供模型能力（ASR + 对话模型）。
-音频与文本都存在本机，不上传任何自建服务。
+一场会议就是**笔记库里的一篇 md**：开会时随手写、用 `/v` 引用录音，会后点「一键处理」
+自动转写引用的音频并把「手写记录 + 转写」交给对话模型，在文件末尾生成纪要。
+音频、文本、纪要全部在本地，云端只提供模型能力（ASR + 对话模型）。
+
+## 长什么样
+
+````md
+# 2026-09-22 周会
+
+> 2026-09-22 会议记录：随手写下要点；用 `/v 音频文件名` 引用录音（录音面板会自动插入）。
+
+## 我的记录
+
+张三说镜像拉取超时，先换镜像站解决。
+/v 会议音频/2026-09-22-周会/seg_0001.wav      ← 你写的引用（预览里是播放器）
+> 🎙 转写 00:00:00–00:03:41 · seg_0001.wav     ← 处理时自动生成/覆盖
+>
+> [00:00:00] 张三：镜像拉取超时的问题……
+
+我又补了一句：下周把部署文档也补上。
+/v 会议音频/2026-09-22-周会/seg_0002.wav
+
+## 会议纪要（AI 整理）                        ← 这一行到文件末尾：处理时整段重写
+### 结论
+- 镜像拉取改用镜像站（张三）
+- 下周补部署文档（我）
+````
+
+## 约定（人可读、幂等，不藏隐形标记）
+
+| 约定 | 说明 |
+| --- | --- |
+| `/v <路径>` 或 `/video <路径>` **独占一行**（允许前导空白） | 音频引用；路径相对 vault，也可以只写文件名（会去 `会议音频/` 下按名字找） |
+| 引用行**紧跟其后**的连续 `>` 块 | **程序生成**的转写，重新处理时整块替换（你自己的备注写在引用行上方） |
+| `## 会议纪要（AI 整理）`（**取最后一次出现**） | 分界线，从这里到文件末尾由 LLM 生成并整段重写 |
+| 手写内容 | 除了插入转写块与纪要段，程序永远不改你的文字 |
+
+一键处理做的事：
+
+1. 扫出所有 `/v` 引用并解析成 vault 内文件（拒绝绝对路径与 `..` 逃逸；找不到的记一条错误继续）；
+2. 逐个音频转写（静音切段 + 串行限流重试），**先写回转写块**（即使后面纪要失败，转写也已落盘）；
+3. 用「手写正文（去掉引用行、转写块、旧纪要）+ 所有转写」生成纪要，替换纪要段；
+4. 手写记录与转写冲突时**以手写记录为准**（提示词里明确写了）。
 
 ## 数据在哪里
 
 | 内容 | 位置 |
 | --- | --- |
-| 录音分段（WAV） | `<应用数据目录>/meetings/<会议ID>/seg_0001.wav` |
-| 会议、分段、转写、纪要（结构化） | `<应用数据目录>/index.sqlite`（表 `meetings` / `meeting_segments`） |
-| 纪要 Markdown | 笔记库里的 `会议纪要/<标题>-<日期>.md`（自动写入并建索引，可在笔记页打开） |
+| 会议笔记 | 笔记库里 `会议/<日期>-<标题>.md`（自己手动放别处也行，只是会议页默认列 `会议/`） |
+| 录音分段（WAV） | **vault 内** `会议音频/<笔记文件名>/seg_0001.wav`，跟着笔记一起备份/导出 |
+| 转写缓存 | `<应用数据目录>/index.sqlite` 表 `audio_transcripts`（键：路径 + mtime + size + ASR 模型） |
+| 旧版会议（迁移用） | 旧录音仍在 `<应用数据目录>/meetings/<会议ID>/`，导出时**复制**进 vault |
 
 应用数据目录（桌面端）：
 
 - Windows：`%APPDATA%\com.bnu.notes\`
 - Linux/macOS：`~/.local/share/com.bnu.notes/`（macOS 为 `~/Library/Application Support/com.bnu.notes/`）
-- Android：应用私有目录（UI 上「音频目录」按钮可看到具体路径）
+- Android：应用私有目录
+
+**体积**：16 kHz 单声道 WAV ≈ 1.9 MB/分钟，4 分钟一段 ≈ 7.7 MB。录音直接在 vault 里，
+以后 zip 导出笔记时注意体积（可以只导出 md、不导出 `会议音频/`）。
 
 ## 录音
 
+- 入口：右下角浮动 🎙 面板（任意页面可用）。选目标笔记 → 开始录音 → 4 分钟自动切段 →
+  停止时把 `/v 会议音频/…` 引用写进笔记：
+  - 该笔记正打开且编辑器可见 → **插到光标处**（不覆盖你未保存的编辑，记得 Ctrl+S）；
+  - 否则 → 追加到正文末尾（纪要段之前）。
 - 采集：Web Audio `getUserMedia` → `ScriptProcessorNode` 取 Float32 → 转 PCM16 单声道。
-  不使用 `MediaRecorder`：上游 ASR 只吃 WAV，而 WebView 的 `MediaRecorder` 在 WebKitGTK
-  上编码 webm/opus 不稳定。
-- 采样率：优先请求 16 kHz；设备不支持时按设备采样率（常见 48 kHz）采集，
-  **按原采样率保存**（保真回放），送 ASR 前再重采样到 16 kHz。
-- 落盘：每 1 秒把 PCM 追加写入当前分段文件，Rust 侧在开始分段时就写好 WAV 头，
-  关闭分段时回写长度 → 意外退出最多丢最后一段的头部信息。
-- 分段：默认 4 分钟一段（`src/stores/meetings.ts` 里的 `SEGMENT_MAX_MS`），
-  切段时不中断录音（关闭上一段 → 立即开新段）。
-- Android v1：只做前台录音；录音期间申请 `screen` Wake Lock 保持屏幕常亮（失败不阻断录音）。
+  不用 `MediaRecorder`：上游 ASR 只吃 WAV，而 WebView 的 `MediaRecorder` 在 WebKitGTK 上不稳定。
+- 采样率：优先请求 16 kHz，设备不支持时按设备采样率采集（常见 48 kHz），
+  **按原采样率保存**（保真回放），送 ASR 前由 Rust 侧重采样到 16 kHz。
+- 落盘：每 1 秒把 PCM 追加写入当前分段，Rust 侧先写好 WAV 头、关闭分段时回写长度。
+- 分段上限：`SEGMENT_MAX_MS = 4 * 60 * 1000`（`src/stores/meetingNote.ts`）。
+- Android v1：只做前台录音；录音期间申请 `screen` Wake Lock 保持屏幕常亮（失败不阻断）。
+- 录坏了：面板里「丢弃」（二次确认）删掉该分段文件——已写进笔记的引用要自己删。
 
 ### 平台麦克风权限
 
@@ -36,14 +83,14 @@
 |---|---|
 | Windows | ① 应用内已注册 WebView2 `PermissionRequested`，只放行本应用页面（`http(s)://tauri.localhost` / 开发服务器）的麦克风/摄像头，见 `src-tauri/src/webview_permissions.rs`；② 系统「设置 → 隐私和安全性 → 麦克风」需允许桌面应用访问麦克风，否则 `getUserMedia` 直接 `NotAllowedError` |
 | Android | 系统运行时权限弹窗（Manifest 已声明 `RECORD_AUDIO`），拒绝后需到系统设置里重开 |
-| Linux (WebKitGTK) | 未处理 WebKitGTK 媒体权限（WSL 无麦克风，无法实测）；如需 Linux 原生录音需再补 `enable-media-stream` + `permission-request` 放行 |
+| Linux (WebKitGTK) | 未处理 WebKitGTK 媒体权限（WSL 无麦克风，无法实测） |
 
-> 前端「录音自检」面板会打印每一步的错误名（`NotAllowedError` / `NotFoundError` / `NotReadableError`），
-> 权限问题一眼可辨。
+## 一键处理（转写 + 纪要）
 
-## 转写（送 ASR 前会再切一次段）
+入口：会议页「一键处理」、笔记编辑器工具栏「一键处理（N 段录音）」。
+选项「强制重新转写（忽略缓存）」= 忽略 `audio_transcripts` 缓存重新烧 ASR。
 
-分段文件不会整段丢给 ASR，而是先在 Rust 侧做**静音切段**，减少长音频带来的超时/显存压力：
+送 ASR 前会在 Rust 侧做**静音切段**（减少长音频的超时/显存压力）：
 
 | 参数 | 值 |
 | --- | --- |
@@ -54,56 +101,82 @@
 | 收尾 | 残余 < 1 s 丢弃，≥ 1 s 保留 |
 | 静音判定 | 自适应噪声地板 `max(220, floor×2.5)` |
 
-请求编排（移植自既有会议 App）：
+请求编排：
 
-- 串行发送 + 令牌桶限流 **9 请求/分钟**（上游 10/分钟，留 1 个余量给纪要生成）；
-- 失败重试 3 次：`429` → 15 s×次数，其它网络错误 → 2 s×次数；
-  确定性 4xx（非 429，例如音频格式不对）直接标记该段失败，不重试；
-- 每段完成即写入数据库，UI 通过 `meeting-progress` 事件看到进度；
-- 单段失败不影响其它段，重新点「重新转写未完成段」即可续跑；
-- 时间戳：每段内按切点偏移，跨段按已有时长累加，格式 `[HH:MM:SS]`。
+- 串行发送 + 令牌桶限流 **9 请求/分钟**（图谱抽取与转写共用同一套限流器，见 `rate_limit.rs`）；
+- 失败重试 3 次：`429` → 15 s×次数，其它网络错误 → 2 s×次数；确定性 4xx 直接判失败；
+- 进度走 `meeting-note-progress` 事件（`phase`：parse / transcribe / write / minutes / done），
+  可以随时「取消」（当前请求结束后停下，已完成的转写会落盘）；
+- **转写缓存**：同一音频（路径 + mtime + size + ASR 模型 都一样）第二次处理直接复用，
+  不重复烧配额；重跑时笔记里的转写块不会堆叠（幂等替换）；
+- 单段失败不影响其它段：失败的那条错误写进结果里，其余照常写回与生成纪要。
 
-## 纪要
+纪要：
 
-- 提示词在 `crates/bnu-core/src/minutes.rs`（`MINUTES_SYSTEM_PROMPT` 等常量），
-  移植自既有会议的提示词，铁律是「只依据原文、不编造、owner/due 不确定就 null」。
-- 优先带 `response_format: {"type":"json_object"}` 请求；上游返回 400 时自动降级重试一次
-  （能力状态在同一次生成内记忆）。
-- JSON 解析失败会自动「修复重试」一次（带上解析错误与上次输出）。
-- 长会议（≥ 60 000 字）先按 20 000 字分片抽取（map），再合并成完整纪要（reduce）。
-- 结构化字段与既有会议后端一致：
-  `title / meeting_date / participants / overview / topics[] / decisions[] / action_items[] / risks[] / next_steps[]`。
-- 渲染成 Markdown 时：待办事项渲染为表格，无内容是写「（无）」而不是编内容。
+- 提示词在 `crates/bnu-core/src/minutes.rs`：旧流程用 `MINUTES_SYSTEM_PROMPT`，
+  会议笔记流程用 `notes_system_prompt()`（在铁律之外补充「手写记录优先于转写」）；
+- 优先带 `response_format: {"type":"json_object"}`；上游 400 时自动降级重试一次；
+- JSON 解析失败会自动「修复重试」一次；
+- 内容 ≥ 60 000 字先 map（20 000 字分片）再 reduce；
+- 结构化字段：`title / meeting_date / participants / overview / topics[] / decisions[] /
+  action_items[] / risks[] / next_steps[]`，渲染成 Markdown 时待办是表格。
 
-## 预览模式
+## 旧会议迁移
 
-浏览器里 `npm run dev` 打开（非 Tauri 壳）时，会议模块走内存实现：
-不录真实麦克风、不调模型，转写/纪要是示例文本并明确标注「预览模式」。
-真实录音与转写请在桌面客户端里验证。
+会议页详情里「旧版会议（录音在前的那种）」→「导出为笔记」（一次性，可重复点但已存在的会跳过）：
 
-## 录音自检（Android spike 用）
+- 旧录音从 `<应用数据>/meetings/<ID>/seg_*.wav` **复制**（不移动、不删除）到
+  `会议音频/旧会议-<标题>/`，并在笔记里生成 `/v` 引用；
+- 旧转写按 `[hh:mm:ss]` 时间戳分摊到各分段，放在对应引用下面（识别不出时间戳就整体放第一段；
+  没有录音文件就退化成 `## 旧版转写` 小节）；
+- 旧纪要写进 `## 会议纪要（AI 整理）` 段；目标笔记已存在则跳过，不覆盖。
 
-会议页右上角「录音自检」：
-
-1. 「运行环境自检」：报告 WebView 是否支持 `getUserMedia`、Wake Lock、Android UA；
-2. 「录 5 秒并回放」：只在内存里录，显示采样率/峰值，并生成可回放的 WAV —— 
-   能录能放就说明前台录音链路（权限 → 采集 → PCM → WAV）在目标设备上可用。
+导出后旧会议记录（`meetings` / `meeting_segments` 表）保留不动——**没有删除**，
+旧录音目录也还在，确认迁移没问题之后要不要清理由你决定。
 
 ## 接线（客户端命令）
 
 | 命令 | 作用 |
 | --- | --- |
-| `meeting_create` / `meeting_list` / `meeting_detail` / `meeting_rename` | 会议 CRUD |
-| `meeting_delete`（`deleteFiles`） | 删除记录；勾选时同时删除音频目录（UI 二次确认） |
-| `meeting_start_segment` / `meeting_append_pcm` / `meeting_close_segment` | 分段写入（PCM 走 base64，避免大数组 JSON） |
-| `meeting_transcribe` / `meeting_cancel_transcribe` | 转写（异步，事件 `meeting-progress` / `meeting-transcribed`） |
-| `meeting_generate_minutes` | 生成纪要并写入笔记库 |
-| `meeting_dir` | 返回音频目录（播放走 `asset://` 协议，配置见 `tauri.conf.json`） |
+| `meeting_notes_list`（`scanAll`） | 会议笔记列表（`会议/` 下 + 可选其它目录含 `/v` 的笔记） |
+| `meeting_note_new` | 新建 `会议/<日期>-<标题>.md`（带骨架 + 纪要段） |
+| `meeting_note_refs` | 解析一篇笔记里的引用（时长、是否已有转写） |
+| `meeting_note_process` / `meeting_note_cancel` | 一键处理（事件 `meeting-note-progress` / `meeting-note-processed`） |
+| `meeting_note_migrate_legacy` | 旧会议导出为笔记 |
+| `audio_clip_start` / `audio_clip_append` / `audio_clip_close` | 录音落盘（PCM 走 base64，避免大数组 JSON）；`close` 返回可插入的引用行 |
+| `audio_clip_discard` | 丢弃一个分段（UI 二次确认） |
+| `audio_clip_list` | 列出 vault 内录音（`/v` 选择器用） |
+| `read_note` / `write_note` | 笔记读写（会议笔记也是普通笔记） |
+
+播放：音频在 vault 里，走 Tauri 的 `asset://` 协议；**vault 目录在启动与切换 vault 时
+动态加入 asset scope**（`app.asset_protocol_scope().allow_directory`），
+静态 scope（`tauri.conf.json`）里只有应用数据目录。
+
+## 预览模式
+
+浏览器里 `npm run dev`（非 Tauri 壳）时走内存实现：一篇示例会议笔记 + 假转写/假纪要，
+播放器不可用（明确标注「预览模式」）。真实录音、转写、播放请在桌面客户端验证。
+
+## 排障
+
+| 现象 | 排查 |
+| --- | --- |
+| 「未配置语音转写模型」 | 设置页填 ASR 端点（`qwen3-asr-1.7b` 这类） |
+| 「未配置对话模型，已跳过纪要生成」 | 转写已保存；到设置页填对话端点后重跑 |
+| 找不到音频「xxx」 | 笔记里的路径写错或文件被移走；`/v` 只写文件名时会去 `会议音频/` 下找 |
+| 处理很慢 | 每段音频要过静音切段 + 限流 9 请求/分钟；面板会显示「限流等待 Ns」 |
+| 转写是空的 | 音频几乎全是静音（切段后无内容）；换掉这段或删掉引用 |
+| 纪要里出现转写没有的内容 | 检查是否把旧纪要/其它文本写进了正文；提示词已要求「只依据原文」 |
+| 播放器不出声 | vault 目录没进 asset scope（换 vault 后应自动放行）或文件缺失 |
+| Android 录音没声音 | 会议页「录音自检」→「检查环境」看 `getUserMedia` / Wake Lock 支持情况 |
+| 处理完引用被删了 | 引用行紧跟的 `>` 块被视为程序生成（会整块替换）；自己的备注写到引用行上方 |
 
 ## 已知限制
 
 - 无实时流式转写、无说话人分离（产品范围外）；
-- 录音期间不允许切换会议（UI 会拦截）；
-- 纪要生成的 completion token 上限 8192；转写文本上限 150 万字（超出直接报错，不静默截断）；
+- 录音面板同时只能录一路（切换目标笔记前先停止）；
+- 转写缓存按「文件戳 + 模型」命中，改内容不换文件会复用旧文本（可勾「强制重新转写」）；
+- 纪要生成 completion token 上限 8192；「手写 + 转写」合计上限 150 万字（超出直接报错，不静默截断）；
 - Android 音频焦点/中断（来电、其它 App 抢占麦克风）v1 不做处理，息屏或切后台可能中断录音；
-- Linux 桌面端未处理 WebKitGTK 媒体权限，录音仅在 Windows / Android 验证。
+- Linux 桌面端未处理 WebKitGTK 媒体权限，录音仅在 Windows / Android 验证；
+- 实体同义归并、说话人分离、zip 同步导出都还没做（见各自文档/计划）。
