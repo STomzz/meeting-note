@@ -144,23 +144,32 @@ fn stat_of(vault: &Path, dir: &str, seq: i64) -> Result<ClipStat> {
 
 /// 读 WAV 头拿采样率与时长（文件缺失/损坏 → (0, 0)）。
 ///
-/// 录音中途（`close` 回写长度之前）头里的 data 长度还是 0，此时按实际文件大小估算。
+/// **只读文件头**（4 KB），不把整个 WAV 读进内存——会议页列表/引用解析会对每个分段调用它，
+/// 一场 1 小时会议的音频上百 MB，整读代价太大。
+/// 头里的 data 长度是 0（录音尚未收尾）或与实际文件大小不符时，按文件大小估算。
 pub fn wav_meta(path: &Path) -> (u32, u64) {
-    let Ok(bytes) = std::fs::read(path) else { return (0, 0) };
-    match audio::parse_wav(&bytes) {
-        Some(info) => {
-            let data_len = if info.data_length > 0 {
-                info.data_length
-            } else {
-                bytes.len().saturating_sub(info.data_offset)
-            };
-            (
-                info.sample_rate,
-                data_len as u64 * 1000 / (info.byte_rate.max(1) as u64),
-            )
-        }
-        None => (0, 0),
-    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (0, 0);
+    };
+    let mut head = [0u8; 4096];
+    let n = match std::io::Read::read(&mut file, &mut head) {
+        Ok(n) => n,
+        Err(_) => return (0, 0),
+    };
+    let Some(info) = crate::audio::parse_wav_head(&head[..n]) else {
+        return (0, 0);
+    };
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let actual = file_size.saturating_sub(info.data_offset as u64);
+    let data_len = if info.data_length > 0 {
+        (info.data_length as u64).min(actual)
+    } else {
+        actual
+    };
+    (
+        info.sample_rate,
+        data_len * 1000 / (info.byte_rate.max(1) as u64),
+    )
 }
 
 /// 开始一个分段：写占位 WAV 头（长度在 close 时回写）。
@@ -345,5 +354,28 @@ mod tests {
         let clips = list(vault).unwrap();
         assert_eq!(clips.len(), 2);
         assert_eq!(clips[1].duration_ms, 100);
+    }
+
+    #[test]
+    fn wav_meta_only_needs_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        let name = "头解析";
+        start(vault, name, 1, 16_000).unwrap();
+        // 2 秒数据：文件 64 KB 远大于 4 KB 头缓冲
+        append(vault, name, 1, &vec![0x33u8; 16_000 * 2 * 2]).unwrap();
+        let path = seg_path(vault, name, 1).unwrap();
+        // 收尾前（头里长度还是 0）：按文件大小估算
+        assert_eq!(wav_meta(&path).1, 2000);
+        close(vault, name, 1).unwrap();
+        assert_eq!(wav_meta(&path).1, 2000);
+
+        // 截断数据区（头声明 2s、实际只剩 1s）→ 报可播放长度 1s，不虚报
+        let bytes = std::fs::read(&path).unwrap();
+        let keep = 44 + 16_000 * 2;
+        std::fs::write(&path, &bytes[..keep]).unwrap();
+        let (rate, dur) = wav_meta(&path);
+        assert_eq!(rate, 16_000);
+        assert_eq!(dur, 1000);
     }
 }

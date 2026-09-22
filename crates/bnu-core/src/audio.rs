@@ -36,8 +36,11 @@ pub struct WavInfo {
     pub data_length: usize,
 }
 
-/// 解析 WAV 头（支持 fmt/data 分块，容忍附加块）。
-pub fn parse_wav(bytes: &[u8]) -> Option<WavInfo> {
+/// 解析 WAV 头（支持 fmt/data 分块，容忍附加块），`data_length` 取头部**声明**的长度。
+///
+/// 只需要文件开头的若干字节（不必读整个文件）；调用方想拿真实可播放长度时用
+/// `parse_wav`，或自己与文件大小取 min。
+pub fn parse_wav_head(bytes: &[u8]) -> Option<WavInfo> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return None;
     }
@@ -76,7 +79,7 @@ pub fn parse_wav(bytes: &[u8]) -> Option<WavInfo> {
             bits = Some(u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]));
         } else if chunk_id == b"data" {
             data_offset = Some(body);
-            data_length = Some(chunk_size.min(bytes.len().saturating_sub(body)));
+            data_length = Some(chunk_size);
             break;
         }
 
@@ -91,6 +94,13 @@ pub fn parse_wav(bytes: &[u8]) -> Option<WavInfo> {
         data_offset: data_offset?,
         data_length: data_length?,
     })
+}
+
+/// 解析 WAV 头，并把 `data_length` 收敛到实际存在的字节数（文件被截断时等于可播放长度）。
+pub fn parse_wav(bytes: &[u8]) -> Option<WavInfo> {
+    let mut info = parse_wav_head(bytes)?;
+    info.data_length = info.data_length.min(bytes.len().saturating_sub(info.data_offset));
+    Some(info)
 }
 
 /// 生成标准 WAV 头 + PCM 数据。
