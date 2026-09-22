@@ -270,7 +270,7 @@ pub fn write_note(conn: &Connection, root: &Path, id: &str, content: &str) -> Re
 
 /// 新建笔记：标题生成安全文件名，重名自动加序号。
 pub fn create_note(conn: &Connection, root: &Path, folder: &str, title: &str) -> Result<NoteMeta> {
-    let base = sanitize_filename(title);
+    let base = safe_filename(title);
     let folder = folder.trim_matches('/');
     let mut candidate = if folder.is_empty() {
         format!("{base}.md")
@@ -371,7 +371,8 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Search
     Ok(rows.flatten().collect())
 }
 
-fn sanitize_filename(title: &str) -> String {
+/// 把标题转成安全的文件名（去掉路径分隔符等非法字符，限长 60）。
+pub fn safe_filename(title: &str) -> String {
     let mut s: String = title
         .trim()
         .chars()

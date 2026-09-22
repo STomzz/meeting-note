@@ -3,7 +3,7 @@
 use rusqlite::{Connection, Result};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 打开（或创建）数据库文件，启用 WAL 并执行迁移。
 pub fn open(path: &Path) -> Result<Connection> {
@@ -76,6 +76,38 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             updated_at INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_chunk_vectors_model ON chunk_vectors(model);
+
+        -- 会议与录音分段
+        CREATE TABLE IF NOT EXISTS meetings (
+            id          TEXT PRIMARY KEY,
+            title       TEXT NOT NULL,
+            created_at  INTEGER NOT NULL DEFAULT 0,
+            updated_at  INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            status      TEXT NOT NULL DEFAULT 'recording',
+            asr_model   TEXT NOT NULL DEFAULT '',
+            chat_model  TEXT NOT NULL DEFAULT '',
+            transcript  TEXT NOT NULL DEFAULT '',
+            minutes_json TEXT NOT NULL DEFAULT '',
+            minutes_md  TEXT NOT NULL DEFAULT '',
+            note_id     TEXT NOT NULL DEFAULT '',
+            error       TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS meeting_segments (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            meeting_id  TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+            seq         INTEGER NOT NULL,
+            file        TEXT NOT NULL,
+            src_rate    INTEGER NOT NULL DEFAULT 16000,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            bytes       INTEGER NOT NULL DEFAULT 0,
+            status      TEXT NOT NULL DEFAULT 'recording',
+            transcript  TEXT NOT NULL DEFAULT '',
+            error       TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_meeting_segments_unique
+            ON meeting_segments(meeting_id, seq);
         "#,
     )?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

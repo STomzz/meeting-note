@@ -1,21 +1,28 @@
 //! Tauri 命令层：薄封装，真正的逻辑都在 `bnu-core`。
 
 use bnu_core::db;
+use bnu_core::meetings::{self, Meeting, MeetingDetail, Segment, SegmentStat};
+use bnu_core::minutes::{self, MinutesOutcome};
 use bnu_core::models::{self, ModelConfig, PublicModelConfig};
 use bnu_core::notes::{self, NoteMeta, ScanStats, SearchHit};
 use bnu_core::qa::{self, Answer};
 use bnu_core::retrieval::{self, RetrievalStatus};
 use bnu_core::rusqlite::{Connection, Result as SqlResult};
 use bnu_core::secret::SecretBox;
+use bnu_core::transcribe::{self, TranscribeOutcome, TranscribeProgress};
 use bnu_core::vectors::{self, EmbedProgress};
 use std::path::PathBuf;
-use std::sync::Mutex;
-use tauri::{Manager, State};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager, State};
 
 struct AppState {
     conn: Mutex<Connection>,
     vault: Mutex<PathBuf>,
     secret: SecretBox,
+    /// 会议音频目录：`<应用数据>/meetings`
+    meetings_root: PathBuf,
+    cancel_transcribe: Arc<AtomicBool>,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -218,6 +225,157 @@ async fn ask_question(
         .map_err(err)
 }
 
+// ---------------------------------------------------------------------------
+// 会议（录音 / 转写 / 纪要）
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn meeting_create(title: String, state: State<'_, AppState>) -> Result<Meeting, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    meetings::create(&conn, &title).map_err(err)
+}
+
+#[tauri::command]
+fn meeting_list(state: State<'_, AppState>) -> Result<Vec<Meeting>, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    meetings::list(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn meeting_detail(id: String, state: State<'_, AppState>) -> Result<MeetingDetail, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    meetings::detail(&conn, &state.meetings_root, &id).map_err(err)
+}
+
+#[tauri::command]
+fn meeting_rename(id: String, title: String, state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(err)?;
+    meetings::rename(&conn, &id, &title).map_err(err)
+}
+
+/// 删除会议；`deleteFiles` 为 true 时同时删除音频目录（界面上需二次确认）。
+#[tauri::command]
+fn meeting_delete(id: String, delete_files: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let dir = {
+        let conn = state.conn.lock().map_err(err)?;
+        meetings::delete(&conn, &id).map_err(err)?;
+        meetings::meeting_dir(&state.meetings_root, &id)
+    };
+    if delete_files && dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("删除录音目录失败: {e}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn meeting_dir(id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let dir = meetings::ensure_dir(&state.meetings_root, &id).map_err(err)?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn meeting_start_segment(
+    id: String,
+    seq: i64,
+    sample_rate: u32,
+    state: State<'_, AppState>,
+) -> Result<Segment, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    meetings::start_segment(&conn, &state.meetings_root, &id, seq, sample_rate).map_err(err)
+}
+
+#[tauri::command]
+fn meeting_append_pcm(
+    id: String,
+    seq: i64,
+    sample_rate: u32,
+    pcm_base64: String,
+    state: State<'_, AppState>,
+) -> Result<SegmentStat, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    meetings::append_pcm_base64(
+        &conn,
+        &state.meetings_root,
+        &id,
+        seq,
+        sample_rate,
+        &pcm_base64,
+    )
+    .map_err(err)
+}
+
+#[tauri::command]
+fn meeting_close_segment(id: String, seq: i64, state: State<'_, AppState>) -> Result<Segment, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    meetings::close_segment(&conn, &state.meetings_root, &id, seq).map_err(err)
+}
+
+#[tauri::command]
+async fn meeting_transcribe(
+    id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TranscribeOutcome, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    state.cancel_transcribe.store(false, Ordering::Relaxed);
+    let cancel = state.cancel_transcribe.clone();
+    let emitter = app.clone();
+    let out = transcribe::transcribe_meeting(
+        &state.conn,
+        &state.meetings_root,
+        &cfg,
+        &id,
+        &move |p: TranscribeProgress| {
+            let _ = emitter.emit("meeting-progress", &p);
+        },
+        &cancel,
+    )
+    .await
+    .map_err(err)?;
+    let _ = app.emit("meeting-transcribed", &out);
+    Ok(out)
+}
+
+#[tauri::command]
+fn meeting_cancel_transcribe(state: State<'_, AppState>) -> Result<(), String> {
+    state.cancel_transcribe.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 生成纪要并把 Markdown 存进 vault（`会议纪要/<标题>-<日期>.md`），同时回写会议记录。
+#[tauri::command]
+async fn meeting_generate_minutes(
+    id: String,
+    date: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<MinutesOutcome, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    let outcome = minutes::generate(&state.conn, &cfg, &id).await.map_err(err)?;
+
+    let (vault, title, created_at) = {
+        let conn = state.conn.lock().map_err(err)?;
+        let m = meetings::get(&conn, &id).map_err(err)?;
+        (state.vault.lock().map_err(err)?.clone(), m.title, m.created_at)
+    };
+    let date_str = date
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| meetings::ymd_from_secs(created_at));
+    let note_id = format!("会议纪要/{}-{}.md", notes::safe_filename(&title), date_str);
+    let json = serde_json::to_string(&outcome.minutes).unwrap_or_default();
+    {
+        let conn = state.conn.lock().map_err(err)?;
+        notes::write_note(&conn, &vault, &note_id, &outcome.markdown).map_err(err)?;
+        meetings::set_minutes(&conn, &id, &outcome.markdown, &json, &note_id).map_err(err)?;
+    }
+    Ok(outcome)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -233,6 +391,8 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let conn = db::open(&data_dir.join("index.sqlite"))?;
             let secret = SecretBox::load_or_create(&data_dir.join("secret.key"))?;
+            let meetings_root = data_dir.join("meetings");
+            std::fs::create_dir_all(&meetings_root)?;
 
             let default_vault = app
                 .path()
@@ -250,6 +410,8 @@ pub fn run() {
                 conn: Mutex::new(conn),
                 vault: Mutex::new(vault),
                 secret,
+                meetings_root,
+                cancel_transcribe: Arc::new(AtomicBool::new(false)),
             });
             Ok(())
         })
@@ -269,7 +431,19 @@ pub fn run() {
             list_available_models,
             retrieval_status,
             build_vector_index,
-            ask_question
+            ask_question,
+            meeting_create,
+            meeting_list,
+            meeting_detail,
+            meeting_rename,
+            meeting_delete,
+            meeting_dir,
+            meeting_start_segment,
+            meeting_append_pcm,
+            meeting_close_segment,
+            meeting_transcribe,
+            meeting_cancel_transcribe,
+            meeting_generate_minutes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

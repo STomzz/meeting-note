@@ -131,6 +131,77 @@ async fn live_test_capability_all() {
     }
 }
 
+/// 端到端：录音分段（合成会议音频）→ 静音切段 → 转写 → 纪要生成。
+#[tokio::test]
+#[ignore]
+async fn live_meeting_transcribe_and_minutes() {
+    use bnu_core::{audio, db, meetings, minutes, transcribe};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    let cfg = live_config();
+    assert_key(&cfg);
+    let audio_path = std::env::var("BNU_TEST_AUDIO")
+        .unwrap_or_else(|_| "/tmp/opencode/tts16k.wav".to_string());
+    let src = std::fs::read(&audio_path)
+        .unwrap_or_else(|e| panic!("需要一段中文语音 WAV（可用 BNU_TEST_AUDIO 指定）：{audio_path}: {e}"));
+
+    // 拼一场"会议"：语音 + 2s 静音 ×3
+    let pcm = audio::normalize_to_16k_mono(&src).unwrap();
+    let silence = vec![0u8; 16_000 * 2 * 2];
+    let mut all: Vec<u8> = Vec::new();
+    for i in 0..3 {
+        all.extend_from_slice(&pcm);
+        if i < 2 {
+            all.extend_from_slice(&silence);
+        }
+    }
+    let wav = audio::build_wav(&all, 16_000, 1, 16);
+    let chunks = audio::split_speech(&wav).unwrap();
+    let durations: Vec<u64> = chunks.iter().map(|c| c.duration_ms).collect();
+    println!("静音切段：{} 段，时长 {:?}", chunks.len(), durations);
+    assert!(chunks.len() >= 2, "应在静音处切开");
+
+    // 写入会议分段（模拟前端录音）
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db::open_memory().unwrap();
+    let m = meetings::create(&conn, "联调会议").unwrap();
+    meetings::start_segment(&conn, dir.path(), &m.id, 1, 16_000).unwrap();
+    meetings::append_pcm(&conn, dir.path(), &m.id, 1, 16_000, &all).unwrap();
+    meetings::close_segment(&conn, dir.path(), &m.id, 1).unwrap();
+    let mm = Mutex::new(conn);
+
+    let cancel = AtomicBool::new(false);
+    let out = transcribe::transcribe_meeting(
+        &mm,
+        dir.path(),
+        &cfg,
+        &m.id,
+        &|p| {
+            if !p.message.is_empty() {
+                println!("  progress: {}", p.message);
+            }
+        },
+        &cancel,
+    )
+    .await
+    .unwrap();
+    println!(
+        "转写：{} 块，失败 {} 段，{} ms\n{}",
+        out.chunks, out.failed_segments, out.elapsed_ms, out.transcript
+    );
+    assert_eq!(out.failed_segments, 0, "转写失败: {:?}", out.errors);
+    assert!(!out.transcript.trim().is_empty());
+
+    let res = minutes::generate(&mm, &cfg, &m.id).await.unwrap();
+    println!(
+        "纪要（{}，{} ms，修复={}，map-reduce={}）：\n{}",
+        res.model, res.elapsed_ms, res.repaired, res.used_map_reduce, res.markdown
+    );
+    assert!(!res.minutes.overview.trim().is_empty(), "摘要不应为空");
+    assert!(res.markdown.starts_with('#'));
+}
+
 /// 端到端：索引 → 构建向量 → 混合检索 + 重排 → 问答（带引用）。
 #[tokio::test]
 #[ignore]

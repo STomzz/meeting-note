@@ -111,7 +111,7 @@ pub async fn answer(
     let reply = models::chat(
         chat_cfg,
         &messages,
-        &ChatOptions { max_tokens: Some(1024), temperature: Some(0.2) },
+        &ChatOptions { max_tokens: Some(1024), temperature: Some(0.2), ..Default::default() },
     )
     .await?;
 

@@ -249,6 +249,8 @@ impl ChatMessage {
 pub struct ChatOptions {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// 额外请求体字段（例如 `response_format`），直接并入请求 JSON。
+    pub extra: Option<Map<String, Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,6 +279,11 @@ pub async fn chat(cfg: &EndpointConfig, messages: &[ChatMessage], opts: &ChatOpt
     }
     if let Some(t) = opts.temperature {
         body.insert("temperature".into(), json!(t));
+    }
+    if let Some(extra) = &opts.extra {
+        for (k, v) in extra {
+            body.insert(k.clone(), v.clone());
+        }
     }
 
     let url = format!("{}/chat/completions", api_root(&cfg.base_url));
