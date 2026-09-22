@@ -4,6 +4,18 @@ import type { FolderInfo, NoteMeta, SearchHit } from '../core/types'
 
 const a = () => notesAdapter()
 
+export type SaveState = 'idle' | 'dirty' | 'saving' | 'saved'
+
+/** 自动保存防抖计时器放模块级：不进响应式，切笔记/卸载时可取消。 */
+let autoSaveTimer = 0
+
+/** 问答引用点击「打开并定位」时投递的目标行（编辑视图消费后高亮）。 */
+export interface LocateTarget {
+  noteId: string
+  startLine: number
+  endLine: number
+}
+
 export const useNotesStore = defineStore('notes', {
   state: () => ({
     vault: '',
@@ -13,11 +25,16 @@ export const useNotesStore = defineStore('notes', {
     currentId: '',
     content: '',
     dirty: false,
+    /** 保存状态：编辑区角标显示「未保存 / 保存中 / 已保存」 */
+    saveState: 'idle' as SaveState,
+    lastSavedAt: 0,
     loading: false,
     scanning: false,
     query: '',
     hits: [] as SearchHit[],
     scanMessage: '',
+    /** 待定位的引用位置（打开笔记后编辑视图滚动并高亮） */
+    pendingLocate: null as LocateTarget | null,
   }),
 
   getters: {
@@ -78,23 +95,61 @@ export const useNotesStore = defineStore('notes', {
     },
 
     async openNote(id: string) {
+      cancelAutoSave()
       this.currentId = id
       this.dirty = false
+      this.saveState = 'idle'
       this.content = await a().read(id)
     },
 
     setContent(value: string) {
       this.content = value
       this.dirty = true
+      this.saveState = 'dirty'
+      this.scheduleAutoSave()
+    },
+
+    /** 编辑后 0.8s 静默保存；手动保存/切笔记会取消本次排队。 */
+    scheduleAutoSave(delay = 800) {
+      cancelAutoSave()
+      if (!this.currentId) return
+      autoSaveTimer = window.setTimeout(() => {
+        autoSaveTimer = 0
+        void this.autoSave()
+      }, delay)
+    },
+
+    async autoSave() {
+      if (!this.dirty || !this.currentId) return
+      if (this.saveState === 'saving') return
+      this.saveState = 'saving'
+      try {
+        await this.save()
+      } catch (e) {
+        this.saveState = 'dirty'
+        this.scanMessage = `自动保存失败：${String(e)}`
+      }
     },
 
     async save() {
       if (!this.currentId) return
+      cancelAutoSave()
       const meta = await a().write(this.currentId, this.content)
       this.dirty = false
+      this.saveState = 'saved'
+      this.lastSavedAt = Date.now()
       const idx = this.notes.findIndex((n) => n.id === meta.id)
       if (idx >= 0) this.notes[idx] = meta
       else await this.refresh()
+    },
+
+    /** 问答/图谱里点引用：打开目标笔记并高亮对应行。 */
+    locateNote(noteId: string, startLine: number, endLine = startLine) {
+      this.pendingLocate = { noteId, startLine, endLine }
+    },
+
+    clearLocate() {
+      this.pendingLocate = null
     },
 
     async createNote(folder: string, title: string) {
@@ -135,10 +190,13 @@ export const useNotesStore = defineStore('notes', {
     },
 
     async removeNote(id: string) {
+      cancelAutoSave()
       await a().remove(id)
       if (this.currentId === id) {
         this.currentId = ''
         this.content = ''
+        this.dirty = false
+        this.saveState = 'idle'
       }
       await this.refresh()
       await this.refreshFolders()
@@ -154,3 +212,10 @@ export const useNotesStore = defineStore('notes', {
     },
   },
 })
+
+function cancelAutoSave() {
+  if (autoSaveTimer) {
+    window.clearTimeout(autoSaveTimer)
+    autoSaveTimer = 0
+  }
+}

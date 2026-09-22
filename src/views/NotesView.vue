@@ -27,6 +27,7 @@ import {
 } from '../core/meetingNote'
 import type { ClipInfo } from '../core/meetingNote'
 import { ancestorsOf, buildTreeRows } from '../core/notesTree'
+import { lineRangeOffset } from '../core/lines'
 import type { NoteMeta } from '../core/types'
 
 const store = useNotesStore()
@@ -36,6 +37,20 @@ const md = new MarkdownIt({ html: false, linkify: true })
 const query = ref('')
 const preview = ref(false)
 const editorEl = ref<HTMLTextAreaElement | null>(null)
+
+/** 保存状态角标文案（自动保存 + 手动保存共用）。 */
+const saveLabel = computed(() => {
+  switch (store.saveState) {
+    case 'dirty':
+      return '未保存'
+    case 'saving':
+      return '保存中…'
+    case 'saved':
+      return '已保存'
+    default:
+      return ''
+  }
+})
 
 // ---------------------------------------------------------------- 目录树
 const expanded = ref<Set<string>>(new Set())
@@ -58,6 +73,96 @@ const menu = ref<{ x: number; y: number; kind: 'folder' | 'note'; path: string; 
 
 function openMenu(e: MouseEvent, kind: 'folder' | 'note', path: string, name: string) {
   menu.value = { x: e.clientX, y: e.clientY, kind, path, name }
+}
+
+/** 行内「…」按钮：贴着按钮右下角弹菜单。 */
+function openMenuAt(el: MouseEvent | HTMLElement, kind: 'folder' | 'note', path: string, name: string) {
+  const target = el instanceof MouseEvent ? (el.currentTarget as HTMLElement) : el
+  const rect = target.getBoundingClientRect()
+  menu.value = { x: rect.left, y: rect.bottom + 4, kind, path, name }
+}
+
+// ---------------------------------------------------------------- 行内重命名
+const editingPath = ref('')
+const editingValue = ref('')
+
+async function startInlineRename(row: { kind: 'folder' | 'note'; path: string; name: string }) {
+  menu.value = null
+  editingPath.value = row.path
+  editingValue.value = row.name
+  await nextTick()
+  const el = document.querySelector<HTMLInputElement>('.tree-rename')
+  el?.focus()
+  el?.select()
+}
+
+async function commitInlineRename() {
+  const path = editingPath.value
+  const value = editingValue.value.trim()
+  editingPath.value = ''
+  if (!path || !value) return
+  try {
+    if (store.folders.some((f) => f.path === path)) await store.renameFolder(path, value)
+    else await store.renameNote(path, value)
+    await meeting.loadAllClips()
+    MessagePlugin.success('已重命名')
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  }
+}
+
+function cancelInlineRename() {
+  editingPath.value = ''
+}
+
+// ---------------------------------------------------------------- 拖拽移动
+const dragNote = ref('')
+const dragOverFolder = ref('')
+
+function onNoteDragStart(e: DragEvent, row: { kind: string; path: string }) {
+  if (row.kind !== 'note') return
+  dragNote.value = row.path
+  e.dataTransfer?.setData('text/plain', row.path)
+  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+}
+
+function onFolderDragOver(e: DragEvent, folderPath: string) {
+  if (!dragNote.value) return
+  e.preventDefault()
+  dragOverFolder.value = folderPath
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+}
+
+async function onDropToFolder(folderPath: string) {
+  const noteId = dragNote.value
+  dragNote.value = ''
+  dragOverFolder.value = ''
+  if (!noteId) return
+  const note = store.notes.find((n) => n.id === noteId)
+  if (!note || (note.folder ?? '') === folderPath) return
+  try {
+    const next = await store.moveNote(noteId, folderPath)
+    await meeting.loadAllClips()
+    MessagePlugin.success(`已移动到 ${folderPath || '根目录'}：${next}`)
+  } catch (e) {
+    MessagePlugin.error(String(e))
+  }
+}
+
+async function onDropToRoot(e: DragEvent) {
+  if (!dragNote.value) return
+  e.preventDefault()
+  await onDropToFolder('')
+}
+
+function onRootDragOver(e: DragEvent) {
+  if (!dragNote.value) return
+  e.preventDefault()
+}
+
+function onDragEnd() {
+  dragNote.value = ''
+  dragOverFolder.value = ''
 }
 
 // ---------------------------------------------------------------- 新建
@@ -338,7 +443,7 @@ function renderMarkdown(body: string): string {
   const html = md.render(prepareAudioRefs(body))
   return replaceAudioPlaceholders(html, (raw) => {
     const src = resolveSrc(raw)
-    if (!src) return `<p class="audio-ref">🎧 <code>${escapeHtml(raw)}</code>（暂不可播放）</p>`
+    if (!src) return `<p class="audio-ref"><code>${escapeHtml(raw)}</code>（暂不可播放）</p>`
     return `<p class="audio-ref"><audio controls preload="metadata" src="${escapeHtml(src)}"></audio><span class="audio-name">${escapeHtml(raw)}</span></p>`
   })
 }
@@ -395,6 +500,30 @@ watch(
   async () => {
     await meeting.loadAllClips()
     if (store.currentId) await meeting.openNote(store.currentId)
+  },
+)
+
+/** 问答/图谱里点引用：打开笔记 → 切编辑视图 → 滚动并高亮对应行。 */
+watch(
+  () => store.pendingLocate,
+  async (loc) => {
+    if (!loc) return
+    if (store.currentId !== loc.noteId) await open(loc.noteId)
+    preview.value = false
+    showClips.value = false
+    await nextTick()
+    const el = editorEl.value
+    if (!el) {
+      store.clearLocate()
+      return
+    }
+    const { start, end } = lineRangeOffset(store.content, loc.startLine, loc.endLine)
+    const lineHeight = Number.parseFloat(getComputedStyle(el).lineHeight || '') || 24
+    el.focus()
+    el.setSelectionRange(start, Math.max(start, end - 1))
+    el.scrollTop = Math.max(0, (loc.startLine - 3) * lineHeight)
+    store.clearLocate()
+    MessagePlugin.info(`已定位到第 ${loc.startLine}-${loc.endLine} 行`)
   },
 )
 
@@ -483,7 +612,10 @@ async function removeCurrent() {
       <span class="page-sub" :title="store.vault">{{ store.vault }}</span>
       <span v-if="store.scanMessage" class="scan-msg">{{ store.scanMessage }}</span>
       <span class="spacer" />
-      <t-button size="small" variant="outline" @click="meeting.toggleRecorder(true)">🎙 录音</t-button>
+      <t-button size="small" variant="outline" @click="meeting.toggleRecorder(true)">
+        <t-icon name="microphone-1" size="14px" />
+        录音
+      </t-button>
       <t-button size="small" :loading="store.scanning" @click="store.scan()">扫描 vault</t-button>
     </header>
 
@@ -527,30 +659,96 @@ async function removeCurrent() {
 
           <!-- 文件夹树 -->
           <template v-else>
-            <div class="list-label">{{ store.notes.length }} 篇笔记</div>
+            <div
+              class="list-label"
+              :class="{ 'drop-on': dragNote && !dragOverFolder }"
+              @dragover="onRootDragOver"
+              @drop.prevent="onDropToRoot"
+            >
+              {{ store.notes.length }} 篇笔记
+              <span v-if="dragNote" class="drop-hint">放到这里 = 移动到根目录</span>
+            </div>
             <div
               v-for="row in treeRows"
               :key="`${row.kind}:${row.path}`"
               class="tree-row"
-              :class="{ active: row.kind === 'note' && row.path === store.currentId }"
+              :class="{
+                active: row.kind === 'note' && row.path === store.currentId,
+                'drop-on': row.kind === 'folder' && dragOverFolder === row.path,
+                dragging: dragNote === row.path,
+              }"
               :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
+              :draggable="row.kind === 'note'"
               @click="row.kind === 'folder' ? toggleFolder(row.path) : open(row.path)"
               @contextmenu.prevent="openMenu($event, row.kind, row.path, row.name)"
+              @dblclick.stop="startInlineRename(row)"
+              @dragstart="onNoteDragStart($event, row)"
+              @dragend="onDragEnd"
+              @dragover="row.kind === 'folder' ? onFolderDragOver($event, row.path) : undefined"
+              @drop.prevent="row.kind === 'folder' ? onDropToFolder(row.path) : undefined"
             >
-              <template v-if="row.kind === 'folder'">
-                <span class="tree-caret">{{ row.expanded ? '▾' : '▸' }}</span>
-                <span class="tree-icon">📁</span>
+              <input
+                v-if="editingPath === row.path"
+                v-model="editingValue"
+                class="tree-rename"
+                @click.stop
+                @dblclick.stop
+                @keydown.enter.stop="commitInlineRename"
+                @keydown.esc.stop="cancelInlineRename"
+                @blur="commitInlineRename"
+              />
+              <template v-else-if="row.kind === 'folder'">
+                <span class="tree-caret">
+                  <t-icon :name="row.expanded ? 'chevron-down' : 'chevron-right'" size="13px" />
+                </span>
+                <t-icon
+                  :name="row.expanded ? 'folder-open' : 'folder'"
+                  size="15px"
+                  class="tree-icon folder-icon"
+                />
                 <span class="tree-name">{{ row.name }}</span>
                 <span class="tree-count">{{ row.count }}</span>
+                <span class="tree-actions">
+                  <button
+                    class="icon-btn"
+                    title="在此新建笔记"
+                    @click.stop="startNewNote(row.path)"
+                  >
+                    <t-icon name="file-add" size="13px" />
+                  </button>
+                  <button
+                    class="icon-btn"
+                    title="更多"
+                    @click.stop="openMenuAt($event, 'folder', row.path, row.name)"
+                  >
+                    <t-icon name="ellipsis" size="14px" />
+                  </button>
+                </span>
               </template>
               <template v-else>
                 <span class="tree-caret" />
-                <span class="tree-icon">📄</span>
+                <t-icon name="file" size="14px" class="tree-icon" />
                 <span class="tree-name">{{ row.name }}</span>
-                <span v-if="row.count" class="tree-badge">🎙 {{ row.count }}</span>
+                <span v-if="row.count" class="tree-badge">
+                  <t-icon name="microphone-1" size="12px" />
+                  {{ row.count }}
+                </span>
+                <span class="tree-actions">
+                  <button
+                    class="icon-btn"
+                    title="更多"
+                    @click.stop="openMenuAt($event, 'note', row.path, row.name)"
+                  >
+                    <t-icon name="ellipsis" size="14px" />
+                  </button>
+                </span>
               </template>
             </div>
-            <div v-if="!treeRows.length" class="empty">还没有笔记，点「新建笔记」开始</div>
+            <div v-if="!treeRows.length" class="empty-state">
+              <t-icon name="edit-1" size="30px" class="empty-icon" />
+              <div class="empty-title">还没有笔记</div>
+              <div class="empty-desc">点上方「新建笔记」开始，或把 md 文件放进 vault 后「扫描 vault」。</div>
+            </div>
           </template>
         </div>
       </aside>
@@ -560,7 +758,10 @@ async function removeCurrent() {
           <div class="editor-bar">
             <span class="doc-title">{{ store.current?.title ?? store.currentId }}</span>
             <span class="doc-path">{{ store.currentId }}</span>
-            <span v-if="store.dirty" class="dirty">未保存</span>
+            <span v-if="saveLabel" class="save-state" :class="store.saveState">
+              <t-icon :name="store.saveState === 'saved' ? 'check-circle' : 'time'" size="13px" />
+              {{ saveLabel }}
+            </span>
             <span class="spacer" />
             <t-button
               v-if="currentClips.length"
@@ -568,7 +769,8 @@ async function removeCurrent() {
               variant="outline"
               @click="showClips = !showClips"
             >
-              🎙 {{ currentClips.length }} 段<template v-if="unrefClips.length">
+              <t-icon name="microphone-1" size="14px" />
+              {{ currentClips.length }} 段<template v-if="unrefClips.length">
                 · {{ unrefClips.length }} 未引用</template
               >
             </t-button>
@@ -651,13 +853,13 @@ async function removeCurrent() {
               @click="slashOpen = false"
               @blur="slashOpen = false"
             />
-            <div v-else class="preview markdown-body" v-html="rendered" />
+            <div v-else class="preview md-body" v-html="rendered" />
             <div v-if="slashOpen" class="slash">
               <div class="slash-head">
                 插入录音引用（↑↓ 选择，Enter 插入，Esc 取消）
               </div>
               <div v-if="!slashMatches.length" class="slash-empty">
-                还没有录音。用右下角 🎙 录一段，或先录到 <code>会议音频/</code> 下。
+                还没有录音。用右下角「录音」录一段，或先录到 <code>会议音频/</code> 下。
               </div>
               <div
                 v-for="(c, i) in slashMatches"
@@ -855,34 +1057,72 @@ async function removeCurrent() {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 6px 8px;
-  border-radius: 8px;
+  padding: 6px 6px 6px 8px;
+  border-radius: var(--radius-m);
   cursor: pointer;
   font-size: 13px;
   user-select: none;
+  transition: background 0.12s ease;
 }
 
 .tree-row:hover {
-  background: #f5f6f8;
+  background: var(--hover);
 }
 
 .tree-row.active {
-  background: #eef3ff;
+  background: var(--brand-weak);
+}
+
+.tree-row.active .tree-name {
+  color: var(--primary);
+  font-weight: 500;
+}
+
+.tree-row.dragging {
+  opacity: 0.45;
+}
+
+.tree-row.drop-on,
+.list-label.drop-on {
+  background: var(--brand-weak);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.list-label.drop-on {
+  border-radius: var(--radius-m);
+  padding: 6px;
+}
+
+.drop-hint {
+  margin-left: 8px;
+  color: var(--primary);
 }
 
 .tree-caret {
-  width: 12px;
+  width: 14px;
+  flex: 0 0 14px;
   color: var(--text-3);
-  font-size: 10px;
-  flex: 0 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .tree-icon {
-  font-size: 13px;
+  flex: none;
+  color: var(--text-3);
+}
+
+.tree-icon.folder-icon {
+  color: #f5a623;
+}
+
+:root[theme-mode='dark'] .tree-icon.folder-icon {
+  color: #d9a13b;
 }
 
 .tree-name {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -893,10 +1133,49 @@ async function removeCurrent() {
   font-size: 11px;
   color: var(--text-3);
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .tree-badge {
   color: var(--primary);
+}
+
+.tree-actions {
+  flex: none;
+  display: none;
+  align-items: center;
+  gap: 2px;
+}
+
+.tree-row:hover .tree-actions {
+  display: inline-flex;
+}
+
+.tree-rename {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-family: var(--font-sans);
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-s);
+  padding: 3px 6px;
+  outline: none;
+}
+
+/* 触屏没有 hover：行内操作常驻，并把行高放大一点 */
+@media (pointer: coarse) {
+  .tree-actions {
+    display: inline-flex;
+  }
+
+  .tree-row {
+    padding-top: 9px;
+    padding-bottom: 9px;
+  }
 }
 
 .note-item {
@@ -906,11 +1185,11 @@ async function removeCurrent() {
 }
 
 .note-item:hover {
-  background: #f5f6f8;
+  background: var(--hover);
 }
 
 .note-item.active {
-  background: #eef3ff;
+  background: var(--brand-weak);
 }
 
 .note-title {
@@ -962,7 +1241,7 @@ async function removeCurrent() {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  background: #fafbfc;
+  background: var(--panel-2);
 }
 
 .clips-head {
@@ -1017,7 +1296,7 @@ async function removeCurrent() {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  box-shadow: var(--shadow-3);
   z-index: 5;
 }
 
@@ -1046,7 +1325,7 @@ async function removeCurrent() {
 
 .slash-item.on,
 .slash-item:hover {
-  background: rgba(0, 82, 217, 0.08);
+  background: var(--brand-weak);
 }
 
 .slash-tag {
@@ -1075,24 +1354,6 @@ async function removeCurrent() {
   color: var(--text-3);
 }
 
-.preview :deep(.audio-ref) {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin: 8px 0;
-}
-
-.preview :deep(.audio-ref audio) {
-  width: 100%;
-  max-width: 520px;
-}
-
-.preview :deep(.audio-ref .audio-name) {
-  font-size: 11px;
-  color: var(--text-3);
-  font-family: ui-monospace, monospace;
-}
-
 .doc-title {
   font-weight: 600;
   font-size: 14px;
@@ -1103,9 +1364,29 @@ async function removeCurrent() {
   color: var(--text-3);
 }
 
-.dirty {
+.save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   font-size: 12px;
-  color: #e37318;
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--text-3);
+  background: var(--panel-2);
+}
+
+.save-state.dirty {
+  color: var(--warning);
+  background: transparent;
+}
+
+.save-state.saving {
+  color: var(--text-3);
+}
+
+.save-state.saved {
+  color: var(--success);
+  background: transparent;
 }
 
 .editor-body {
@@ -1123,7 +1404,7 @@ async function removeCurrent() {
   padding: 16px 20px;
   font-size: 14px;
   line-height: 1.7;
-  font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+  font-family: var(--font-mono);
   background: var(--panel);
   color: var(--text);
 }
@@ -1132,35 +1413,6 @@ async function removeCurrent() {
   flex: 1;
   overflow: auto;
   padding: 16px 24px;
-  line-height: 1.75;
-  font-size: 14px;
-}
-
-.preview :deep(h1) {
-  font-size: 22px;
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 6px;
-}
-.preview :deep(h2) {
-  font-size: 18px;
-}
-.preview :deep(code) {
-  background: #f2f3f5;
-  padding: 1px 5px;
-  border-radius: 4px;
-  font-size: 13px;
-}
-.preview :deep(pre) {
-  background: #f7f8fa;
-  padding: 12px;
-  border-radius: 8px;
-  overflow: auto;
-}
-.preview :deep(blockquote) {
-  margin: 0;
-  padding: 4px 12px;
-  border-left: 3px solid var(--border);
-  color: var(--text-2);
 }
 
 .scan-msg {
@@ -1182,7 +1434,7 @@ async function removeCurrent() {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+  box-shadow: var(--shadow-3);
   padding: 4px;
 }
 
@@ -1194,7 +1446,7 @@ async function removeCurrent() {
 }
 
 .ctx-item:hover {
-  background: #f2f3f5;
+  background: var(--hover);
 }
 
 .dialog-row {

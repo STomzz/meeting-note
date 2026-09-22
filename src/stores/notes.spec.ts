@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { useNotesStore } from './notes'
 
 describe('notes store（浏览器预览适配器）', () => {
   beforeEach(() => setActivePinia(createPinia()))
+  afterEach(() => vi.useRealTimers())
 
   it('初始化后能加载示例笔记与文件夹', async () => {
     const s = useNotesStore()
@@ -64,5 +65,46 @@ describe('notes store（浏览器预览适配器）', () => {
     await s.init()
     expect(s.folderOptions[0]).toEqual({ label: '根目录', value: '' })
     expect(s.folderOptions.some((o) => o.value === '工作')).toBe(true)
+  })
+
+  it('自动保存：编辑后防抖写盘，保存状态走 dirty → saved', async () => {
+    const s = useNotesStore()
+    await s.init()
+    await s.openNote('学习/Rust 所有权.md')
+
+    vi.useFakeTimers()
+    s.setContent('# Rust 所有权\n\n自动保存测试。\n')
+    expect(s.saveState).toBe('dirty')
+    expect(s.dirty).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(900)
+    expect(s.dirty).toBe(false)
+    expect(s.saveState).toBe('saved')
+    expect(s.lastSavedAt).toBeGreaterThan(0)
+  })
+
+  it('切走笔记会取消排队中的自动保存', async () => {
+    const s = useNotesStore()
+    await s.init()
+    await s.openNote('学习/Rust 所有权.md')
+
+    vi.useFakeTimers()
+    s.setContent('# 改动\n')
+    await s.openNote('工作/周会示例.md')
+    expect(s.dirty).toBe(false)
+    expect(s.saveState).toBe('idle')
+
+    await vi.advanceTimersByTimeAsync(1200)
+    // 排队已被取消：不会把上一篇的改动写进刚打开的笔记
+    expect(s.content).not.toContain('改动')
+  })
+
+  it('引用定位：投递与消费目标行', async () => {
+    const s = useNotesStore()
+    await s.init()
+    s.locateNote('学习/Rust 所有权.md', 3, 5)
+    expect(s.pendingLocate).toEqual({ noteId: '学习/Rust 所有权.md', startLine: 3, endLine: 5 })
+    s.clearLocate()
+    expect(s.pendingLocate).toBeNull()
   })
 })
