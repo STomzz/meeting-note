@@ -47,6 +47,9 @@ const menuIndex = ref(0)
 const flashId = ref<number | null>(null)
 /** 下方空间不够时把块类型菜单翻到输入框上方 */
 const menuAbove = ref(false)
+/** 当前这一轮编辑的输入框元素：只有它的 blur 才算「用户点到别处」。 */
+let sessionEl: HTMLTextAreaElement | null = null
+
 /** 正在编辑的输入框。注意它在 v-for 里，模板 ref 会变成数组，所以用函数 ref。 */
 const taEl = ref<HTMLTextAreaElement | null>(null)
 const rootEl = ref<HTMLDivElement | null>(null)
@@ -101,6 +104,7 @@ function startEdit(block: Block, caret: 'start' | 'end' = 'end') {
   draft.value = block.text
   menuOpen.value = false
   menuIndex.value = 0
+  sessionEl = null
   void nextTick(() => {
     const el = currentTa()
     if (!el) return
@@ -108,11 +112,13 @@ function startEdit(block: Block, caret: 'start' | 'end' = 'end') {
     const pos = caret === 'start' ? markerOffset(el.value) : el.value.length
     el.setSelectionRange(pos, pos)
     el.scrollIntoView({ block: 'nearest' })
+    sessionEl = el
   })
 }
 
 /** 写回当前编辑的块（没改动就什么都不做）。 */
 function commit() {
+  sessionEl = null
   if (editingId.value === null) return
   const id = editingId.value
   const block = blocks.value.find((b) => b.id === id)
@@ -125,9 +131,23 @@ function commit() {
 }
 
 function cancel() {
+  sessionEl = null
   editingId.value = null
   menuOpen.value = false
   draft.value = ''
+}
+
+/**
+ * 失焦 = 写回。
+ *
+ * 注意：Chrome 在「旧的编辑框被移除」时也会补发 blur，而那时候新的编辑会话已经开了
+ * （回车拆段、点另一段都会这样），所以只处理当前输入框的 blur，别把新会话关掉。
+ */
+function onBlur(e: FocusEvent) {
+  // 只认当前这一轮编辑的输入框：换段、回车拆段时旧输入框被移除 / 新输入框刚挂载，
+  // 浏览器补发的 blur 不能当成「用户点到别处」（否则会把刚开的新会话关掉）。
+  if ((e.target as HTMLTextAreaElement | null) !== sessionEl) return
+  commit()
 }
 
 /**
@@ -331,7 +351,7 @@ defineExpose({ insertLines, locate })
             spellcheck="false"
             @input="onInput"
             @keydown="onKeydown"
-            @blur="commit"
+            @blur="onBlur"
           />
           <div v-if="menuOpen" class="blk-menu" :class="{ above: menuAbove }">
             <div class="menu-head">块类型（↑↓ 选择 · Enter 应用 · Esc 关掉）</div>

@@ -148,6 +148,20 @@ describe('BlockEditor 回车拆分与引用插入', () => {
     expect(lastEmitted(wrapper)).toBe('- 第一项\n\n')
   })
 
+  it('回车拆段后仍在新段落里编辑（旧输入框的 blur 不关新会话）', async () => {
+    const wrapper = mountEditor('标题行')
+    await wrapper.findAll('.blk')[0].trigger('click')
+    const old = wrapper.find('textarea')
+    ;(old.element as HTMLTextAreaElement).setSelectionRange(3, 3)
+    await old.trigger('keydown', { key: 'Enter' })
+    // 浏览器在旧输入框被移除时会补一个 blur（jsdom 不会，手动补上）
+    old.element.dispatchEvent(new FocusEvent('blur'))
+    await wrapper.vm.$nextTick()
+    const ta = wrapper.find('textarea')
+    expect(ta.exists()).toBe(true)
+    expect((ta.element as HTMLTextAreaElement).value).toBe('')
+  })
+
   it('插入引用时落到纪要标题之前', async () => {
     const wrapper = mountEditor(MEETING)
     wrapper.vm.insertLines(['/v 会议音频/周会/seg_0002.wav'])
