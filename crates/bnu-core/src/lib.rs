@@ -7,10 +7,12 @@
 //! 用于问答引用回跳。
 
 pub mod audio;
+pub mod audio_clip;
 pub mod chunk;
 pub mod db;
 pub mod graph;
 pub mod markdown;
+pub mod meeting_note;
 pub mod meetings;
 pub mod minutes;
 pub mod models;

@@ -465,3 +465,114 @@ async fn live_graph_enhanced_retrieval() {
     assert!(!answer.answer.is_empty());
 }
 
+
+/// 会议笔记端到端（P7）：新建 md → `/v` 引用两段录音 → 一键处理（转写 + 纪要）→ 幂等重跑。
+#[tokio::test]
+#[ignore]
+async fn live_meeting_note_process() {
+    use bnu_core::{audio, audio_clip, db, meeting_note, notes};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    let cfg = live_config();
+    assert_key(&cfg);
+    let audio_path = std::env::var("BNU_TEST_AUDIO")
+        .unwrap_or_else(|_| "/tmp/opencode/tts16k.wav".to_string());
+    let src = std::fs::read(&audio_path).unwrap_or_else(|e| {
+        panic!("需要一段中文语音 WAV（可用 BNU_TEST_AUDIO 指定）：{audio_path}: {e}")
+    });
+    let pcm = audio::normalize_to_16k_mono(&src).unwrap();
+    let silence = vec![0u8; 16_000 * 2 * 2]; // 2s 静音
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vault = tmp.path();
+    let conn = db::open_memory().unwrap();
+
+    let (note_id, body) = meeting_note::create_note(&conn, vault, "联调周会", "2026-09-22").unwrap();
+    println!("新建会议笔记：{note_id}");
+
+    // 录两段（模拟录音面板落盘）
+    let clip_dir = audio_clip::dir_for_note(&note_id);
+    let mut refs: Vec<String> = Vec::new();
+    for seq in 1..=2i64 {
+        audio_clip::start(vault, &clip_dir, seq, 16_000).unwrap();
+        let mut all = pcm.clone();
+        all.extend_from_slice(&silence);
+        all.extend_from_slice(&pcm);
+        audio_clip::append(vault, &clip_dir, seq, &all).unwrap();
+        let stat = audio_clip::close(vault, &clip_dir, seq).unwrap();
+        println!("录音 seg_{seq:04}.wav：{:.1}s，{} 字节", stat.duration_ms as f64 / 1000.0, stat.bytes);
+        refs.push(format!("/v {}", audio_clip::rel_path(&clip_dir, seq)));
+    }
+
+    // 手写正文 + 插在纪要段之前的两条引用
+    let handwritten = "我在会上记的：镜像拉取超时的问题要换镜像站；下周一补部署文档。";
+    let insertion = format!(
+        "## 我的记录\n\n{handwritten}\n{}\n\n第二段录音记的是结论部分。\n{}\n\n",
+        refs[0], refs[1]
+    );
+    let with_notes =
+        body.replace(meeting_note::MINUTES_HEADING, &format!("{insertion}{}", meeting_note::MINUTES_HEADING));
+    notes::write_note(&conn, vault, &note_id, &with_notes).unwrap();
+
+    let mm = Mutex::new(conn);
+    let cancel = AtomicBool::new(false);
+    let run = |force: bool| {
+        let mm = &mm;
+        let cancel = &cancel;
+        let vault = vault;
+        let cfg = &cfg;
+        let note_id = note_id.clone();
+        async move {
+            meeting_note::process(
+                mm,
+                vault,
+                cfg,
+                &note_id,
+                force,
+                &|p: meeting_note::ProcessProgress| {
+                    if !p.message.is_empty() {
+                        println!("  progress[{}]: {}", p.phase, p.message);
+                    }
+                },
+                cancel,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let out = run(false).await;
+    println!(
+        "处理：转写 {}（复用 {}、失败 {}），转写 {} 字，纪要 {} 字，{} ms，模型 {}",
+        out.audio_done,
+        out.audio_skipped,
+        out.audio_failed,
+        out.transcript_chars,
+        out.minutes_chars,
+        out.elapsed_ms,
+        out.model
+    );
+    assert_eq!(out.audio_failed, 0, "有音频处理失败: {:?}", out.errors);
+    assert_eq!(out.audio_done, 2, "两段都应转写: {:?}", out.errors);
+    assert!(out.minutes_chars > 0, "应生成纪要: {:?}", out.errors);
+
+    let final_body = notes::read_note(vault, &note_id).unwrap();
+    println!("--- 处理后的笔记 ---\n{final_body}\n--- 结束 ---");
+    assert!(final_body.contains("🎙 转写"), "应有转写块");
+    assert_eq!(final_body.matches("🎙 转写").count(), 2, "每个引用一个转写块");
+    assert!(final_body.contains(handwritten), "手写内容必须原样保留");
+    assert!(!final_body.contains(meeting_note::MINUTES_HINT), "占位提示应被纪要替换");
+    assert!(final_body.contains("会议纪要（AI 整理）"));
+
+    // 幂等重跑：音频全部命中缓存，笔记不重复堆叠
+    let out2 = run(false).await;
+    println!(
+        "重跑：转写 {}（复用 {}、失败 {}），{} ms",
+        out2.audio_done, out2.audio_skipped, out2.audio_failed, out2.elapsed_ms
+    );
+    assert_eq!(out2.audio_done, 0, "重跑不应再调 ASR: {:?}", out2.errors);
+    assert_eq!(out2.audio_skipped, 2);
+    let again = notes::read_note(vault, &note_id).unwrap();
+    assert_eq!(again.matches("🎙 转写").count(), 2, "转写块不应堆叠");
+}

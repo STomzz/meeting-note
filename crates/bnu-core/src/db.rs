@@ -3,7 +3,7 @@
 use rusqlite::{Connection, Result};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// 打开（或创建）数据库文件，启用 WAL 并执行迁移。
 pub fn open(path: &Path) -> Result<Connection> {
@@ -153,6 +153,18 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             entities     INTEGER NOT NULL DEFAULT 0,
             relations    INTEGER NOT NULL DEFAULT 0,
             error        TEXT NOT NULL DEFAULT ''
+        );
+
+        -- 会议笔记（P7）的音频转写缓存：按 vault 相对路径 + mtime + size + ASR 模型命中，
+        -- 重新「一键处理」时不再重复烧 ASR 配额（音频文件被替换后 mtime/size 变化自动失效）。
+        CREATE TABLE IF NOT EXISTS audio_transcripts (
+            path       TEXT PRIMARY KEY,
+            mtime      INTEGER NOT NULL DEFAULT 0,
+            size       INTEGER NOT NULL DEFAULT 0,
+            asr_model  TEXT NOT NULL DEFAULT '',
+            text       TEXT NOT NULL DEFAULT '',
+            error      TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0
         );
         "#,
     )?;

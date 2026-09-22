@@ -1,7 +1,11 @@
 //! Tauri 命令层：薄封装，真正的逻辑都在 `bnu-core`。
 
+use bnu_core::audio_clip::{self, ClipInfo, ClipStat};
 use bnu_core::db;
 use bnu_core::graph::{self, ExtractOutcome, GraphProgress, GraphSnapshot, GraphStats, NodeDetail};
+use bnu_core::meeting_note::{
+    self, AudioRefView, MeetingNoteBrief, ProcessOutcome, ProcessProgress,
+};
 use bnu_core::meetings::{self, Meeting, MeetingDetail, Segment, SegmentStat};
 use bnu_core::minutes::{self, MinutesOutcome};
 use bnu_core::models::{self, ModelConfig, PublicModelConfig};
@@ -29,6 +33,8 @@ struct AppState {
     cancel_transcribe: Arc<AtomicBool>,
     /// 图谱抽取的取消标志
     cancel_graph: Arc<AtomicBool>,
+    /// 会议笔记「一键处理」的取消标志
+    cancel_meeting_note: Arc<AtomicBool>,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -59,7 +65,11 @@ fn get_vault(state: State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
-fn set_vault(path: String, state: State<'_, AppState>) -> Result<String, String> {
+fn set_vault(
+    path: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     let p = PathBuf::from(path.trim());
     if p.as_os_str().is_empty() {
         return Err("路径不能为空".into());
@@ -71,6 +81,8 @@ fn set_vault(path: String, state: State<'_, AppState>) -> Result<String, String>
     let conn = state.conn.lock().unwrap();
     write_setting(&conn, "vault", &p.to_string_lossy()).map_err(err)?;
     *state.vault.lock().unwrap() = p.clone();
+    // vault 里的音频（会议录音）要用 asset 协议播放：换 vault 后重新放行目录
+    let _ = app.asset_protocol_scope().allow_directory(&p, true);
     Ok(p.to_string_lossy().to_string())
 }
 
@@ -383,6 +395,156 @@ async fn meeting_generate_minutes(
 }
 
 // ---------------------------------------------------------------------------
+// 会议笔记（P7）：会议 = vault 里的一篇 md；`/v` 引用录音；一键处理
+// ---------------------------------------------------------------------------
+
+/// 会议页列表（`scanAll = true` 时额外列出其它目录里含 `/v` 的笔记）。
+#[tauri::command]
+fn meeting_notes_list(
+    scan_all: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<Vec<MeetingNoteBrief>, String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let conn = state.conn.lock().map_err(err)?;
+    meeting_note::list_notes(&conn, &vault, scan_all.unwrap_or(false)).map_err(err)
+}
+
+/// 新建会议笔记：`会议/<日期>-<标题>.md`，返回笔记 id。
+#[tauri::command]
+fn meeting_note_new(
+    title: String,
+    date: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let conn = state.conn.lock().map_err(err)?;
+    let (id, _) = meeting_note::create_note(&conn, &vault, &title, &date).map_err(err)?;
+    Ok(id)
+}
+
+/// 解析一篇会议笔记里的音频引用（含时长与已有转写）。
+#[tauri::command]
+fn meeting_note_refs(
+    note_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<AudioRefView>, String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let body = notes::read_note(&vault, &note_id).map_err(err)?;
+    Ok(meeting_note::refs_of(&vault, &body))
+}
+
+/// 一键处理：转写引用的音频 → 写回转写块 → 生成纪要。进度走 `meeting-note-progress`。
+#[tauri::command]
+async fn meeting_note_process(
+    note_id: String,
+    force: Option<bool>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ProcessOutcome, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    let vault = state.vault.lock().map_err(err)?.clone();
+    state.cancel_meeting_note.store(false, Ordering::Relaxed);
+    let cancel = state.cancel_meeting_note.clone();
+    let emitter = app.clone();
+    let out = meeting_note::process(
+        &state.conn,
+        &vault,
+        &cfg,
+        &note_id,
+        force.unwrap_or(false),
+        &move |p: ProcessProgress| {
+            let _ = emitter.emit("meeting-note-progress", &p);
+        },
+        &cancel,
+    )
+    .await
+    .map_err(err)?;
+    let _ = app.emit("meeting-note-processed", &out);
+    Ok(out)
+}
+
+#[tauri::command]
+fn meeting_note_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    state.cancel_meeting_note.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 一次性迁移：把旧会议（录音 + 转写 + 纪要）导出成 `会议/旧会议/` 下的会议笔记。
+#[tauri::command]
+fn meeting_note_migrate_legacy(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let conn = state.conn.lock().map_err(err)?;
+    meeting_note::export_legacy(&conn, &vault, &state.meetings_root).map_err(err)
+}
+
+/// 开始一段会议录音（落在 vault 的 `会议音频/<笔记名>/` 下，序号自动递增）。
+#[tauri::command]
+fn audio_clip_start(
+    note_id: String,
+    sample_rate: u32,
+    state: State<'_, AppState>,
+) -> Result<ClipStat, String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let dir = audio_clip::dir_for_note(&note_id);
+    let seq = audio_clip::next_seq(&vault, &dir);
+    audio_clip::start(&vault, &dir, seq, sample_rate).map_err(err)
+}
+
+#[tauri::command]
+fn audio_clip_append(
+    note_id: String,
+    seq: i64,
+    pcm_base64: String,
+    state: State<'_, AppState>,
+) -> Result<ClipStat, String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let dir = audio_clip::dir_for_note(&note_id);
+    audio_clip::append_base64(&vault, &dir, seq, &pcm_base64).map_err(err)
+}
+
+/// 结束当前分段，返回可插入笔记的 `/v` 引用行。
+#[tauri::command]
+fn audio_clip_close(
+    note_id: String,
+    seq: i64,
+    state: State<'_, AppState>,
+) -> Result<ClipStat, String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let dir = audio_clip::dir_for_note(&note_id);
+    audio_clip::close(&vault, &dir, seq).map_err(err)
+}
+
+/// 丢弃一个分段（界面上的「重录」）。
+#[tauri::command]
+fn audio_clip_discard(
+    note_id: String,
+    seq: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let dir = audio_clip::dir_for_note(&note_id);
+    audio_clip::remove(&vault, &dir, seq).map_err(err)
+}
+
+/// 列出 vault 里的录音分段（`noteId` 为空则列出全部，供 `/v` 选择器用）。
+#[tauri::command]
+fn audio_clip_list(
+    note_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ClipInfo>, String> {
+    let vault = state.vault.lock().map_err(err)?.clone();
+    let mut all = audio_clip::list(&vault).map_err(err)?;
+    if let Some(note_id) = note_id.filter(|s| !s.trim().is_empty()) {
+        let dir = audio_clip::dir_for_note(&note_id);
+        all.retain(|c| c.dir == dir);
+    }
+    Ok(all)
+}
+
+// ---------------------------------------------------------------------------
 // 知识图谱（P4）：抽取入口 + 图数据查询
 // ---------------------------------------------------------------------------
 
@@ -509,6 +671,11 @@ pub fn run() {
                 .unwrap_or(default_vault);
             std::fs::create_dir_all(&vault).ok();
 
+            // vault 里的录音要用 asset 协议播放，而静态 scope 只放行了应用数据目录
+            if let Err(e) = app.asset_protocol_scope().allow_directory(&vault, true) {
+                eprintln!("[bnu-notes] 放行 vault 资源目录失败: {e}");
+            }
+
             app.manage(AppState {
                 conn: Mutex::new(conn),
                 vault: Mutex::new(vault),
@@ -516,6 +683,7 @@ pub fn run() {
                 meetings_root,
                 cancel_transcribe: Arc::new(AtomicBool::new(false)),
                 cancel_graph: Arc::new(AtomicBool::new(false)),
+                cancel_meeting_note: Arc::new(AtomicBool::new(false)),
             });
 
             // Windows(WebView2)：显式放行本应用页面的麦克风/摄像头，否则窗口里的
@@ -557,6 +725,17 @@ pub fn run() {
             meeting_transcribe,
             meeting_cancel_transcribe,
             meeting_generate_minutes,
+            meeting_notes_list,
+            meeting_note_new,
+            meeting_note_refs,
+            meeting_note_process,
+            meeting_note_cancel,
+            meeting_note_migrate_legacy,
+            audio_clip_start,
+            audio_clip_append,
+            audio_clip_close,
+            audio_clip_discard,
+            audio_clip_list,
             graph_stats,
             graph_snapshot,
             graph_node_detail,

@@ -363,13 +363,156 @@ fn parse_minutes(content: &str) -> (Option<Minutes>, Option<String>) {
     }
 }
 
-/// 生成会议纪要。
+/// 输入来源：决定用哪套提示词（纯转写 / 手写记录 + 转写）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinutesSource {
+    /// 旧会议流程：整场会议的转写文本
+    Transcript,
+    /// 会议笔记：手写正文 + 录音转写
+    Notes,
+}
+
+/// 会议笔记流程的系统提示词（在纪要助手基础上补充「手写记录优先」）。
+pub fn notes_system_prompt() -> String {
+    format!(
+        "{MINUTES_SYSTEM_PROMPT}\n\
+\n\
+【本次输入的特殊说明】\n\
+输入包含两部分：【我手写的会议记录】（会议主人边开会边写的笔记，通常是结论与要点）与【录音转写】（语音识别文本，细节多但有噪声）。\n\
+- 两部分冲突时以手写记录为准；\n\
+- 手写记录里的结论、待办、人名优先保留；\n\
+- 转写用于补充细节与背景，不要把口语碎片写进纪要。\n"
+    )
+}
+
+impl MinutesSource {
+    fn system(&self) -> String {
+        match self {
+            MinutesSource::Transcript => MINUTES_SYSTEM_PROMPT.to_string(),
+            MinutesSource::Notes => notes_system_prompt(),
+        }
+    }
+
+    /// 文本不长时的单次调用提示词。
+    fn single_prompt(&self, title: &str, text: &str) -> String {
+        let title = if title.trim().is_empty() { "未提供" } else { title.trim() };
+        match self {
+            MinutesSource::Transcript => minutes_user_prompt(title, None, &[], text),
+            MinutesSource::Notes => format!(
+                "【会议信息】\n标题：{title}\n\n【我手写的会议记录 + 录音转写】\n{text}\n\n请据此整理结构化会议纪要。"
+            ),
+        }
+    }
+
+    /// map 阶段（长文本切片）的提示词。
+    fn chunk_prompt(&self, index: usize, total: usize, chunk: &str) -> String {
+        format!("【片段序号】第 {} / {} 段\n【片段原文】\n{}", index + 1, total, chunk)
+    }
+
+    /// reduce 阶段的提示词。
+    fn merge_prompt(&self, title: &str, merge_input: &str) -> String {
+        let title = if title.trim().is_empty() { "未提供" } else { title.trim() };
+        match self {
+            MinutesSource::Transcript => minutes_user_prompt(
+                title,
+                None,
+                &[],
+                &format!("以下是按时间顺序的分段抽取结果：\n{merge_input}"),
+            ),
+            MinutesSource::Notes => format!(
+                "【会议信息】\n标题：{title}\n\n以下是按时间顺序的分段抽取结果（来源含手写记录与录音转写）：\n{merge_input}\n\n请合并成一份完整的结构化会议纪要。"
+            ),
+        }
+    }
+}
+
+/// 纪要生成核心：系统提示词 + 文本 → 结构化纪要（含 JSON 修复重试与 map-reduce）。
+async fn summarize(
+    chat_cfg: &EndpointConfig,
+    title: &str,
+    source: MinutesSource,
+    text: &str,
+) -> Result<MinutesOutcome> {
+    let started = Instant::now();
+    let mut json_mode = true;
+    let mut repaired = false;
+    let use_map_reduce = text.chars().count() >= MAP_REDUCE_THRESHOLD_CHARS;
+
+    let (content, tokens) = if use_map_reduce {
+        let chunks = split_transcript(text, CHUNK_CHARS);
+        let mut partials: Vec<Value> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let messages = vec![
+                ChatMessage::system(CHUNK_SYSTEM_PROMPT),
+                ChatMessage::user(source.chunk_prompt(i, chunks.len(), chunk)),
+            ];
+            let reply = chat_json(chat_cfg, &messages, &mut json_mode).await?;
+            if let Some(v) = extract_json_object(&reply.content) {
+                partials.push(v);
+            }
+        }
+        if partials.is_empty() {
+            return Err(anyhow!("长会议分段抽取全部失败，无法生成纪要"));
+        }
+        let merge_input: String = serde_json::to_string_pretty(&partials)?
+            .chars()
+            .take(MAX_TRANSCRIPT_CHARS)
+            .collect();
+        let messages = vec![
+            ChatMessage::system(MERGE_SYSTEM_PROMPT),
+            ChatMessage::user(source.merge_prompt(title, &merge_input)),
+        ];
+        let reply = chat_json(chat_cfg, &messages, &mut json_mode).await?;
+        (reply.content, reply.completion_tokens)
+    } else {
+        let messages = vec![
+            ChatMessage::system(source.system()),
+            ChatMessage::user(source.single_prompt(title, text)),
+        ];
+        let reply = chat_json(chat_cfg, &messages, &mut json_mode).await?;
+        (reply.content, reply.completion_tokens)
+    };
+
+    let (mut minutes, mut err) = parse_minutes(&content);
+    let mut tokens = tokens;
+    if minutes.is_none() {
+        // 修复重试一次
+        repaired = true;
+        let repair_prompt = format!(
+            "你上一步的输出不是合法的目标 JSON，解析失败。\n\n【解析错误】\n{}\n\n【你上一步的输出】\n{}\n\n请严格按之前约定的 JSON 结构重新输出，只输出 JSON 对象本身，不要任何解释或 Markdown 代码块。",
+            err.clone().unwrap_or_default(),
+            content.chars().take(REPAIR_PREVIEW_CHARS).collect::<String>()
+        );
+        let messages =
+            vec![ChatMessage::system(source.system()), ChatMessage::user(repair_prompt)];
+        let reply = chat_json(chat_cfg, &messages, &mut json_mode).await?;
+        tokens = reply.completion_tokens.or(tokens);
+        let (m, e2) = parse_minutes(&reply.content);
+        minutes = m;
+        err = e2;
+    }
+    let minutes = minutes.ok_or_else(|| {
+        anyhow!("纪要 JSON 两次解析失败：{}", err.unwrap_or_else(|| "未知错误".into()))
+    })?;
+
+    let markdown = render_markdown(&minutes);
+    Ok(MinutesOutcome {
+        minutes,
+        markdown,
+        model: chat_cfg.model.clone(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        completion_tokens: tokens,
+        repaired,
+        used_map_reduce: use_map_reduce,
+    })
+}
+
+/// 生成会议纪要（旧流程：按会议 id 取转写文本）。
 pub async fn generate(
     conn: &Mutex<Connection>,
     cfg: &ModelConfig,
     meeting_id: &str,
 ) -> Result<MinutesOutcome> {
-    let started = Instant::now();
     let chat_cfg = cfg
         .chat
         .as_ref()
@@ -396,84 +539,38 @@ pub async fn generate(
             MAX_TRANSCRIPT_CHARS
         ));
     }
+    summarize(&chat_cfg, &meeting.title, MinutesSource::Transcript, &transcript).await
+}
 
-    let mut json_mode = true;
-    let mut repaired = false;
-    let use_map_reduce = transcript.chars().count() >= MAP_REDUCE_THRESHOLD_CHARS;
-
-    let (content, tokens) = if use_map_reduce {
-        let chunks = split_transcript(&transcript, CHUNK_CHARS);
-        let mut partials: Vec<Value> = Vec::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let messages = vec![
-                ChatMessage::system(CHUNK_SYSTEM_PROMPT),
-                ChatMessage::user(format!(
-                    "【片段序号】第 {} / {} 段\n【片段原文】\n{}",
-                    i + 1,
-                    chunks.len(),
-                    chunk
-                )),
-            ];
-            let reply = chat_json(&chat_cfg, &messages, &mut json_mode).await?;
-            if let Some(v) = extract_json_object(&reply.content) {
-                partials.push(v);
-            }
-        }
-        if partials.is_empty() {
-            return Err(anyhow!("长会议分段抽取全部失败，无法生成纪要"));
-        }
-        let merge_input: String = serde_json::to_string_pretty(&partials)?
-            .chars()
-            .take(MAX_TRANSCRIPT_CHARS)
-            .collect();
-        let prompt = minutes_user_prompt(
-            &meeting.title,
-            None,
-            &[],
-            &format!("以下是按时间顺序的分段抽取结果：\n{merge_input}"),
-        );
-        let messages = vec![ChatMessage::system(MERGE_SYSTEM_PROMPT), ChatMessage::user(prompt)];
-        let reply = chat_json(&chat_cfg, &messages, &mut json_mode).await?;
-        (reply.content, reply.completion_tokens)
-    } else {
-        let prompt = minutes_user_prompt(&meeting.title, None, &[], &transcript);
-        let messages = vec![ChatMessage::system(MINUTES_SYSTEM_PROMPT), ChatMessage::user(prompt)];
-        let reply = chat_json(&chat_cfg, &messages, &mut json_mode).await?;
-        (reply.content, reply.completion_tokens)
-    };
-
-    let (mut minutes, mut err) = parse_minutes(&content);
-    let mut tokens = tokens;
-    if minutes.is_none() {
-        // 修复重试一次
-        repaired = true;
-        let repair_prompt = format!(
-            "你上一步的输出不是合法的目标 JSON，解析失败。\n\n【解析错误】\n{}\n\n【你上一步的输出】\n{}\n\n请严格按之前约定的 JSON 结构重新输出，只输出 JSON 对象本身，不要任何解释或 Markdown 代码块。",
-            err.clone().unwrap_or_default(),
-            content.chars().take(REPAIR_PREVIEW_CHARS).collect::<String>()
-        );
-        let messages =
-            vec![ChatMessage::system(MINUTES_SYSTEM_PROMPT), ChatMessage::user(repair_prompt)];
-        let reply = chat_json(&chat_cfg, &messages, &mut json_mode).await?;
-        tokens = reply.completion_tokens.or(tokens);
-        let (m, e2) = parse_minutes(&reply.content);
-        minutes = m;
-        err = e2;
+/// 生成会议纪要（会议笔记流程：手写正文 + 录音转写，都可为空但不能同时为空）。
+pub async fn generate_from_text(
+    chat_cfg: &EndpointConfig,
+    title: &str,
+    handwritten: &str,
+    transcript: &str,
+) -> Result<MinutesOutcome> {
+    let mut text = String::new();
+    if !handwritten.trim().is_empty() {
+        text.push_str("【我手写的会议记录】\n");
+        text.push_str(handwritten.trim());
+        text.push_str("\n\n");
     }
-    let minutes = minutes.ok_or_else(|| {
-        anyhow!("纪要 JSON 两次解析失败：{}", err.unwrap_or_else(|| "未知错误".into()))
-    })?;
-
-    let markdown = render_markdown(&minutes);
-    Ok(MinutesOutcome {
-        minutes,
-        markdown,
-        model: chat_cfg.model.clone(),
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        completion_tokens: tokens,
-        repaired,
-        used_map_reduce: use_map_reduce,
-    })
+    if !transcript.trim().is_empty() {
+        text.push_str("【录音转写】\n");
+        text.push_str(transcript.trim());
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(anyhow!("笔记里没有可整理的内容：既没有手写记录，也没有可用的转写"));
+    }
+    if text.chars().count() > MAX_TRANSCRIPT_CHARS {
+        return Err(anyhow!(
+            "内容过长（{} 字），上限 {} 字：建议拆分会议或减少引用的音频",
+            text.chars().count(),
+            MAX_TRANSCRIPT_CHARS
+        ));
+    }
+    summarize(chat_cfg, title, MinutesSource::Notes, &text).await
 }
 
 #[cfg(test)]
