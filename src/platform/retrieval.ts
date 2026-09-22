@@ -38,6 +38,8 @@ class MockRetrievalAdapter implements RetrievalAdapter {
       hasEmbedding: false,
       hasRerank: false,
       vectorReady: false,
+      graphEntities: 0,
+      graphRelations: 0,
     }
   }
 
@@ -79,6 +81,9 @@ class MockRetrievalAdapter implements RetrievalAdapter {
         ftsHits: top.length,
         vectorHits: 0,
         reranked: false,
+        graphHits: 0,
+        graphAdded: 0,
+        graphEntities: 0,
         degraded: ['浏览器预览模式：未调用真实模型，未使用向量索引'],
         elapsedMs: 0,
       },

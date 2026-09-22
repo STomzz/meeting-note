@@ -23,17 +23,19 @@ cargo test -p bnu-core -- --ignored    # 真实网关联调（需要 BNU_TEST_AP
 ## 目录
 
 ```
-crates/bnu-core/     核心库：db / markdown / chunk / notes / models / secret
+crates/bnu-core/     核心库：db / graph / markdown / chunk / notes / models / secret
 src-tauri/           Tauri 命令层（薄封装）
 src/core/            前端类型与契约
 src/platform/        适配器（Tauri 实现 / 浏览器 Mock）
 src/stores/          Pinia
 src/views/           笔记 / 问答 / 图谱 / 会议 / 设置
+docs/graph.md        知识图谱：抽取、存储、可视化与检索增强
 docs/models.md       四类模型端点、实测记录与注意事项
 ```
 
 ## 文档
 
+- [docs/graph.md](docs/graph.md)：知识图谱（实体/关系抽取、防幻觉约束、G6 力导图、邻居扩展检索）。
 - [docs/models.md](docs/models.md)：模型端点配置、推荐模型、实测数据、上游限制。
 - [docs/meetings.md](docs/meetings.md)：会议模块（录音 / 分段 / 转写 / 纪要）与平台麦克风权限。
 - [docs/windows.md](docs/windows.md)：Windows 安装包怎么出、安装、数据位置与验收清单。

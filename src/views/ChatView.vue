@@ -6,7 +6,7 @@ import { MessagePlugin } from 'tdesign-vue-next'
 import { useRouter } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useNotesStore } from '../stores/notes'
-import { MODE_LABEL, type RetrievedChunk } from '../core/retrieval'
+import { modeLabel, type RetrievedChunk } from '../core/retrieval'
 
 const chat = useChatStore()
 const notes = useNotesStore()
@@ -64,10 +64,6 @@ async function openSource(s: RetrievedChunk) {
 
 function render(text: string) {
   return md.render(text || '')
-}
-
-function modeLabel(mode: string) {
-  return MODE_LABEL[mode] ?? mode
 }
 
 function shorten(text: string, n = 160) {
@@ -148,6 +144,9 @@ function shorten(text: string, n = 160) {
               <span class="meta-item">全文命中 {{ e.answer.trace.ftsHits }}</span>
               <span v-if="e.answer.trace.vectorHits" class="meta-item">
                 向量命中 {{ e.answer.trace.vectorHits }}
+              </span>
+              <span v-if="e.answer.trace.graphAdded" class="meta-item">
+                图谱补 {{ e.answer.trace.graphAdded }} 段
               </span>
               <span class="meta-item">{{ e.answer.elapsedMs }} ms</span>
               <span v-if="e.answer.completionTokens" class="meta-item">

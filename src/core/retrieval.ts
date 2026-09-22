@@ -13,11 +13,17 @@ export interface RetrievedChunk {
 }
 
 export interface RetrievalTrace {
-  /** fts | hybrid | hybrid+rerank */
+  /** fts | hybrid | hybrid+rerank（后缀 +graph 表示图谱邻居扩展生效） */
   mode: string
   ftsHits: number
   vectorHits: number
   reranked: boolean
+  /** 图谱扩展召回的候选片段数 */
+  graphHits: number
+  /** 最终结果里来自图谱扩展的片段数 */
+  graphAdded: number
+  /** 用到的种子实体数 */
+  graphEntities: number
   /** 降级原因（用户可见） */
   degraded: string[]
   elapsedMs: number
@@ -44,6 +50,9 @@ export interface RetrievalStatus {
   hasEmbedding: boolean
   hasRerank: boolean
   vectorReady: boolean
+  /** 图谱实体/关系数（0 表示还没抽取过） */
+  graphEntities: number
+  graphRelations: number
 }
 
 export interface EmbedProgress {
@@ -58,4 +67,12 @@ export const MODE_LABEL: Record<string, string> = {
   hybrid: '混合检索',
   'hybrid+rerank': '混合检索 + 重排',
   mock: '预览模式',
+}
+
+/** 检索模式标签：`+graph` 后缀表示图谱邻居扩展补到了片段。 */
+export function modeLabel(mode: string): string {
+  const graph = mode.includes('+graph')
+  const base = mode.replace('+graph', '')
+  const label = MODE_LABEL[base] ?? base
+  return graph ? `${label} + 图谱扩展` : label
 }
