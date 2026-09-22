@@ -82,6 +82,80 @@ async fn live_chat_returns_content_without_thinking() {
     assert!(!reply.content.trim().is_empty());
 }
 
+/// 流式对话：验证 SSE 逐块到达、增量可拼接、usage/finish_reason 能解析。
+#[tokio::test]
+#[ignore]
+async fn live_chat_stream_delivers_deltas() {
+    use std::sync::{Arc, Mutex};
+    let cfg = live_config();
+    assert_key(&cfg);
+
+    let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = deltas.clone();
+    let started = std::time::Instant::now();
+    let mut first_at: Option<u128> = None;
+    let reply = models::chat_stream(
+        cfg.chat.as_ref().unwrap(),
+        &[ChatMessage::user("用三句话介绍北京的秋天")],
+        &ChatOptions { max_tokens: Some(256), temperature: Some(0.3), ..Default::default() },
+        |ev| {
+            if let models::ChatStreamEvent::Delta(t) = ev {
+                if first_at.is_none() {
+                    first_at = Some(started.elapsed().as_millis());
+                }
+                sink.lock().unwrap().push(t);
+            }
+            true
+        },
+    )
+    .await
+    .unwrap();
+
+    let chunks = deltas.lock().unwrap().clone();
+    let elapsed = started.elapsed().as_millis();
+    println!(
+        "stream {} ms（首字 {:?} ms）| finish={} | tokens={:?} | 增量 {} 个 | 正文 {} 字\n{}",
+        elapsed,
+        first_at,
+        reply.finish_reason,
+        reply.completion_tokens,
+        chunks.len(),
+        reply.content.chars().count(),
+        reply.content
+    );
+    assert!(!reply.content.trim().is_empty());
+    assert_eq!(reply.content, chunks.concat(), "拼接增量应等于最终正文");
+    assert!(chunks.len() >= 2, "应至少收到 2 个增量（实际 {}）", chunks.len());
+}
+
+/// 流式取消：收到首个增量后停止，应返回半截回答且 finish_reason=cancelled。
+#[tokio::test]
+#[ignore]
+async fn live_chat_stream_can_be_cancelled() {
+    let cfg = live_config();
+    assert_key(&cfg);
+
+    let mut seen = 0usize;
+    let reply = models::chat_stream(
+        cfg.chat.as_ref().unwrap(),
+        &[ChatMessage::user("写一段 200 字左右的随笔，主题是秋天")],
+        &ChatOptions { max_tokens: Some(512), ..Default::default() },
+        |_ev| {
+            seen += 1;
+            seen < 3 // 收到第 3 个增量就喊停
+        },
+    )
+    .await
+    .unwrap();
+    println!(
+        "取消：finish={} | 收到增量 {} | 半截正文 {} 字",
+        reply.finish_reason,
+        seen,
+        reply.content.chars().count()
+    );
+    assert_eq!(reply.finish_reason, "cancelled");
+}
+
 #[tokio::test]
 #[ignore]
 async fn live_embed_rerank_and_asr() {
