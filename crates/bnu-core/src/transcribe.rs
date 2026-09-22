@@ -7,60 +7,14 @@
 use crate::audio;
 use crate::meetings;
 use crate::models::{self, ModelConfig};
+use crate::rate_limit::{backoff_for, is_fatal_http, RateLimiter, MAX_RETRIES, RATE_LIMIT_PER_MINUTE};
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-/// 每分钟最大请求数（上游 10，留 1 个余量给纪要）。
-pub const RATE_LIMIT_PER_MINUTE: usize = 9;
-/// 最大重试次数。
-pub const MAX_RETRIES: usize = 3;
-/// 429 退避基数（秒）。
-pub const BACKOFF_RATE_LIMIT_SECS: u64 = 15;
-/// 其它错误退避基数（秒）。
-pub const BACKOFF_OTHER_SECS: u64 = 2;
-
-/// 令牌桶（滑动窗口）限流。
-pub struct RateLimiter {
-    max_requests: usize,
-    window: Duration,
-    stamps: VecDeque<Instant>,
-}
-
-impl RateLimiter {
-    pub fn new(max_requests: usize, window: Duration) -> Self {
-        Self { max_requests: max_requests.max(1), window, stamps: VecDeque::new() }
-    }
-
-    /// 取得一个令牌；必要时等到最早的请求滑出窗口。返回累计等待时长。
-    pub async fn acquire(&mut self) -> Duration {
-        let mut waited = Duration::ZERO;
-        loop {
-            let now = Instant::now();
-            while let Some(front) = self.stamps.front() {
-                if now.duration_since(*front) >= self.window {
-                    self.stamps.pop_front();
-                } else {
-                    break;
-                }
-            }
-            if self.stamps.len() < self.max_requests {
-                self.stamps.push_back(now);
-                return waited;
-            }
-            let first = *self.stamps.front().expect("非空");
-            let wait = self.window.saturating_sub(now.duration_since(first));
-            let wait = if wait > Duration::ZERO { wait } else { Duration::from_millis(200) };
-            tokio::time::sleep(wait).await;
-            waited += wait;
-        }
-    }
-}
 
 /// 转写进度（推送给前端）。
 #[derive(Debug, Clone, Default, Serialize)]
@@ -92,18 +46,6 @@ pub struct TranscribeOutcome {
 fn mmss(ms: u64) -> String {
     let total = ms / 1000;
     format!("{:02}:{:02}:{:02}", total / 3600, (total % 3600) / 60, total % 60)
-}
-
-/// 判断错误是否为"确定性失败"（非 429 的 4xx，不该重试）。
-fn is_fatal(err: &str) -> bool {
-    if let Some(idx) = err.find("返回 ") {
-        let rest = &err[idx + "返回 ".len()..];
-        let code: String = rest.chars().take(3).collect();
-        if let Ok(code) = code.parse::<u16>() {
-            return code != 429 && (400..500).contains(&code);
-        }
-    }
-    false
 }
 
 /// 转写一场会议（串行 + 限流 + 重试）。
@@ -217,7 +159,7 @@ pub async fn transcribe_meeting(
                         chunks_total: chunk_total,
                         chunks_done: i,
                         current_text: String::new(),
-                        message: format!("限流等待 {}s（上游 9 请求/分钟）", waited.as_secs()),
+                        message: format!("限流等待 {}s（上游 {} 请求/分钟）", waited.as_secs(), RATE_LIMIT_PER_MINUTE),
                     });
                 }
                 match models::transcribe(&asr_cfg, chunk.wav.clone(), "chunk.wav").await {
@@ -227,12 +169,10 @@ pub async fn transcribe_meeting(
                     }
                     Err(e) => {
                         last_err = e.to_string();
-                        if is_fatal(&last_err) || attempt == MAX_RETRIES {
+                        if is_fatal_http(&last_err) || attempt == MAX_RETRIES {
                             break;
                         }
-                        let rate_limited = last_err.contains("429");
-                        let base = if rate_limited { BACKOFF_RATE_LIMIT_SECS } else { BACKOFF_OTHER_SECS };
-                        let backoff = Duration::from_secs(base * attempt as u64);
+                        let backoff = backoff_for(&last_err, attempt);
                         progress(TranscribeProgress {
                             meeting_id: meeting_id.to_string(),
                             segment_seq: seg.seq,
@@ -335,27 +275,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fatal_classification() {
-        assert!(is_fatal("语音转写返回 400: bad audio"));
-        assert!(!is_fatal("语音转写返回 429: too many requests"));
-        assert!(!is_fatal("语音转写返回 500: boom"));
-        assert!(!is_fatal("请求失败: connection reset"));
-    }
-
-    #[test]
     fn mmss_formats_hours() {
         assert_eq!(mmss(0), "00:00:00");
         assert_eq!(mmss(65_000), "00:01:05");
         assert_eq!(mmss(3_725_000), "01:02:05");
-    }
-
-    #[tokio::test]
-    async fn rate_limiter_allows_within_window_then_waits() {
-        // 2 次 / 300ms：前两次立即通过，第三次需要等待
-        let mut limiter = RateLimiter::new(2, Duration::from_millis(300));
-        assert!(limiter.acquire().await < Duration::from_millis(50));
-        assert!(limiter.acquire().await < Duration::from_millis(50));
-        let waited = limiter.acquire().await;
-        assert!(waited >= Duration::from_millis(250), "第三次应等待窗口滑出，实际 {waited:?}");
     }
 }

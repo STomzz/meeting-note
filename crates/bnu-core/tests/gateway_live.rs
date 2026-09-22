@@ -264,3 +264,112 @@ async fn live_qa_end_to_end() {
     assert!(answer.sources.iter().any(|s| s.note_id == "周会.md"));
     assert_eq!(answer.trace.mode, "hybrid+rerank");
 }
+
+/// 端到端：两篇中文笔记 → LLM 抽取实体/关系 → 图查询（并校验实体名都在原文里）。
+#[tokio::test]
+#[ignore]
+async fn live_graph_extract_and_query() {
+    use bnu_core::{db, graph, notes};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    let cfg = live_config();
+    assert_key(&cfg);
+
+    let note_a = "# 项目周会纪要\n\n\
+2026年9月18日，北京师范大学人工智能学院召开了知识库项目周会，会议由张伟主持，李娜、王强参加。\n\n\
+会上确定了三件事：\n\
+1. 李娜负责在十月底前完成 Milvus 向量库的部署，部署节点为 gpu-node2。\n\
+2. 王强负责对接 new-api 网关，把 Qwen-Inno-35B-v1 接入知识库项目。\n\
+3. 张伟提出用 AntV G6 实现知识图谱可视化，并在下一次评审上演示。\n\n\
+会议决定：知识库项目采用本地优先的架构，笔记数据保存在用户本地，云端只提供模型能力。\n";
+    let note_b = "# 部署记录\n\n\
+李娜在 gpu-node2 上完成了 Milvus 部署，用 Docker 启动，端口是 19530。\n\
+王强在 new-api 网关里新建了渠道，模型别名为 Qwen-Inno-35B-v1。\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("周会.md"), note_a).unwrap();
+    std::fs::write(dir.path().join("部署记录.md"), note_b).unwrap();
+    let conn = db::open_memory().unwrap();
+    let stats = notes::scan_vault(&conn, dir.path()).unwrap();
+    println!("索引：{} 篇", stats.indexed);
+    let m = Mutex::new(conn);
+
+    let cancel = AtomicBool::new(false);
+    let out = graph::extract_all(
+        &m,
+        &cfg,
+        false,
+        &|p| {
+            if !p.message.is_empty() {
+                println!("  progress: {}", p.message);
+            }
+        },
+        &cancel,
+    )
+    .await
+    .unwrap();
+    println!(
+        "抽取：完成 {} 跳过 {} 失败 {}｜批次 {} 实体 {} 关系 {}｜{} ms\n错误：{:?}",
+        out.notes_done,
+        out.notes_skipped,
+        out.notes_failed,
+        out.batches,
+        out.entities,
+        out.relations,
+        out.elapsed_ms,
+        out.errors
+    );
+    assert_eq!(out.notes_failed, 0, "抽取失败: {:?}", out.errors);
+    assert!(out.entities >= 4, "实体太少：{}", out.entities);
+    assert!(out.relations >= 3, "关系太少：{}", out.relations);
+
+    // 增量：第二次应全部跳过、零调用
+    let out2 = graph::extract_all(&m, &cfg, false, &|_| {}, &cancel).await.unwrap();
+    println!("二次抽取：done={} skipped={} batches={}", out2.notes_done, out2.notes_skipped, out2.batches);
+    assert_eq!((out2.notes_done, out2.notes_skipped, out2.batches), (0, 2, 0));
+
+    let (snap, top, detail) = {
+        let c = m.lock().unwrap();
+        let snap = graph::snapshot(&c, 500, 0).unwrap();
+        let top = snap
+            .nodes
+            .iter()
+            .max_by_key(|n| (n.note_count, n.degree))
+            .cloned()
+            .unwrap();
+        let detail = graph::node_detail(&c, top.id).unwrap();
+        (snap, top, detail)
+    };
+    println!("图：节点 {} 边 {}（截断 {}）", snap.nodes.len(), snap.edges.len(), snap.truncated);
+    for n in &snap.nodes {
+        println!("  节点 [{}] {}（{} 篇笔记，度 {})", n.kind, n.name, n.note_count, n.degree);
+    }
+    for e in snap.edges.iter().take(15) {
+        println!("  边 {} -> {} · {} × {}", e.src, e.dst, e.kinds, e.weight);
+    }
+    assert!(snap.nodes.len() >= 4, "节点太少：{}", snap.nodes.len());
+    assert!(!snap.edges.is_empty(), "没有边");
+
+    // 防幻觉：所有实体名都必须是原文子串
+    let hay = graph::normalize_name(&format!("{note_a}\n{note_b}"));
+    for n in &snap.nodes {
+        assert!(hay.contains(&graph::normalize_name(&n.name)), "实体「{}」不在原文里", n.name);
+    }
+
+    // 跨笔记实体：李娜/王强在两篇里都出现
+    let cross = snap.nodes.iter().filter(|n| n.note_count >= 2).count();
+    println!("跨笔记实体：{cross} 个（最多的是「{}」）", top.name);
+    assert!(cross >= 1, "应抽到跨笔记的公共实体");
+
+    println!("「{}」的邻居：", top.name);
+    for nb in detail.neighbors.iter().take(8) {
+        println!("  {} {} · {} × {}", nb.direction, nb.name, nb.rel_kind, nb.weight);
+    }
+    println!("「{}」的出处：", top.name);
+    for men in detail.mentions.iter().take(5) {
+        println!("  {} 第 {}-{} 行｜{}", men.note_id, men.start_line, men.end_line, men.snippet);
+    }
+    assert!(!detail.neighbors.is_empty() && !detail.mentions.is_empty());
+}
+

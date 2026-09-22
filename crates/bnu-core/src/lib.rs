@@ -9,12 +9,14 @@
 pub mod audio;
 pub mod chunk;
 pub mod db;
+pub mod graph;
 pub mod markdown;
 pub mod meetings;
 pub mod minutes;
 pub mod models;
 pub mod notes;
 pub mod qa;
+pub mod rate_limit;
 pub mod retrieval;
 pub mod secret;
 pub mod transcribe;

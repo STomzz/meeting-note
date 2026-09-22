@@ -1,11 +1,13 @@
 //! Tauri 命令层：薄封装，真正的逻辑都在 `bnu-core`。
 
 use bnu_core::db;
+use bnu_core::graph::{self, ExtractOutcome, GraphProgress, GraphSnapshot, GraphStats, NodeDetail};
 use bnu_core::meetings::{self, Meeting, MeetingDetail, Segment, SegmentStat};
 use bnu_core::minutes::{self, MinutesOutcome};
 use bnu_core::models::{self, ModelConfig, PublicModelConfig};
 use bnu_core::notes::{self, NoteMeta, ScanStats, SearchHit};
 use bnu_core::qa::{self, Answer};
+use bnu_core::rate_limit::{RateLimiter, RATE_LIMIT_PER_MINUTE};
 use bnu_core::retrieval::{self, RetrievalStatus};
 use bnu_core::rusqlite::{Connection, Result as SqlResult};
 use bnu_core::secret::SecretBox;
@@ -25,6 +27,8 @@ struct AppState {
     /// 会议音频目录：`<应用数据>/meetings`
     meetings_root: PathBuf,
     cancel_transcribe: Arc<AtomicBool>,
+    /// 图谱抽取的取消标志
+    cancel_graph: Arc<AtomicBool>,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -378,6 +382,103 @@ async fn meeting_generate_minutes(
     Ok(outcome)
 }
 
+// ---------------------------------------------------------------------------
+// 知识图谱（P4）：抽取入口 + 图数据查询
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn graph_stats(state: State<'_, AppState>) -> Result<GraphStats, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    graph::stats(&conn).map_err(err)
+}
+
+#[tauri::command]
+fn graph_snapshot(
+    limit: Option<usize>,
+    min_degree: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<GraphSnapshot, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    graph::snapshot(&conn, limit.unwrap_or(1500), min_degree.unwrap_or(0)).map_err(err)
+}
+
+#[tauri::command]
+fn graph_node_detail(entity_id: i64, state: State<'_, AppState>) -> Result<NodeDetail, String> {
+    let conn = state.conn.lock().map_err(err)?;
+    graph::node_detail(&conn, entity_id).map_err(err)
+}
+
+/// 抽取全部笔记（增量；`force = true` 时忽略哈希全量重抽）。
+/// 进度走 `graph-progress` 事件，完成后另发 `graph-extracted`。
+#[tauri::command]
+async fn graph_extract_all(
+    force: Option<bool>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ExtractOutcome, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    state.cancel_graph.store(false, Ordering::Relaxed);
+    let cancel = state.cancel_graph.clone();
+    let emitter = app.clone();
+    let out = graph::extract_all(
+        &state.conn,
+        &cfg,
+        force.unwrap_or(false),
+        &move |p: GraphProgress| {
+            let _ = emitter.emit("graph-progress", &p);
+        },
+        &cancel,
+    )
+    .await
+    .map_err(err)?;
+    let _ = app.emit("graph-extracted", &out);
+    Ok(out)
+}
+
+/// 抽取单篇笔记（`force = false` 时未改动直接跳过）。
+#[tauri::command]
+async fn graph_extract_note(
+    note_id: String,
+    force: Option<bool>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ExtractOutcome, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    state.cancel_graph.store(false, Ordering::Relaxed);
+    let cancel = state.cancel_graph.clone();
+    let emitter = app.clone();
+    let mut limiter = RateLimiter::new(RATE_LIMIT_PER_MINUTE, std::time::Duration::from_secs(60));
+    let mut json_mode = true;
+    let out = graph::extract_note(
+        &state.conn,
+        &cfg,
+        &note_id,
+        force.unwrap_or(false),
+        &mut limiter,
+        &mut json_mode,
+        &move |p: GraphProgress| {
+            let _ = emitter.emit("graph-progress", &p);
+        },
+        &cancel,
+    )
+    .await
+    .map_err(err)?;
+    let _ = app.emit("graph-extracted", &out);
+    Ok(out)
+}
+
+#[tauri::command]
+fn graph_cancel_extract(state: State<'_, AppState>) -> Result<(), String> {
+    state.cancel_graph.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -414,6 +515,7 @@ pub fn run() {
                 secret,
                 meetings_root,
                 cancel_transcribe: Arc::new(AtomicBool::new(false)),
+                cancel_graph: Arc::new(AtomicBool::new(false)),
             });
 
             // Windows(WebView2)：显式放行本应用页面的麦克风/摄像头，否则窗口里的
@@ -454,7 +556,13 @@ pub fn run() {
             meeting_close_segment,
             meeting_transcribe,
             meeting_cancel_transcribe,
-            meeting_generate_minutes
+            meeting_generate_minutes,
+            graph_stats,
+            graph_snapshot,
+            graph_node_detail,
+            graph_extract_all,
+            graph_extract_note,
+            graph_cancel_extract
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -189,6 +189,8 @@ pub fn index_file(conn: &Connection, root: &Path, path: &Path) -> Result<NoteMet
     )?;
     tx.execute("DELETE FROM chunks WHERE note_id = ?1", params![rel])?;
     tx.execute("DELETE FROM notes_fts WHERE note_id = ?1", params![rel])?;
+    // 图谱数据随索引失效：块 id 会变，旧关系/溯源必须一起清掉（下次抽取重建）
+    crate::graph::invalidate_note(&tx, &rel)?;
 
     let chunks = chunk::chunk_markdown(&doc.body);
     for c in &chunks {
@@ -221,6 +223,7 @@ pub fn remove_from_index(conn: &Connection, id: &str) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM chunks WHERE note_id = ?1", params![id])?;
     tx.execute("DELETE FROM notes_fts WHERE note_id = ?1", params![id])?;
+    crate::graph::invalidate_note(&tx, id)?;
     tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     tx.commit()?;
     Ok(())

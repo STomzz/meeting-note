@@ -3,7 +3,7 @@
 use rusqlite::{Connection, Result};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 打开（或创建）数据库文件，启用 WAL 并执行迁移。
 pub fn open(path: &Path) -> Result<Connection> {
@@ -108,6 +108,52 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_meeting_segments_unique
             ON meeting_segments(meeting_id, seq);
+
+        -- 知识图谱（P4）：实体 / 关系明细 / 块-实体 / 抽取账本
+        -- 说明：`relations` 按「一次出现一行」存明细，聚合（强度=出现次数）在查询时做，
+        -- 这样重建某篇笔记 = 先按 note_id 删除再插入，天然幂等，且保留出处用于回跳。
+        CREATE TABLE IF NOT EXISTS entities (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,                  -- 规范名（trim / 全半角归一 / 英文小写）
+            kind        TEXT NOT NULL DEFAULT 'other',  -- person/org/place/concept/event/other
+            created_at  INTEGER NOT NULL DEFAULT 0,
+            updated_at  INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(name, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+
+        CREATE TABLE IF NOT EXISTS relations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id     TEXT NOT NULL,
+            chunk_id    INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+            src_id      INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            dst_id      INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            kind        TEXT NOT NULL,                  -- 关系短语（归一化小写）
+            evidence    TEXT NOT NULL DEFAULT '',       -- 出处原句（截断）
+            created_at  INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_relations_note ON relations(note_id);
+        CREATE INDEX IF NOT EXISTS idx_relations_src ON relations(src_id);
+        CREATE INDEX IF NOT EXISTS idx_relations_dst ON relations(dst_id);
+
+        CREATE TABLE IF NOT EXISTS chunk_entities (
+            chunk_id    INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+            note_id     TEXT NOT NULL,
+            entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            PRIMARY KEY (chunk_id, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_entities_entity ON chunk_entities(entity_id);
+        CREATE INDEX IF NOT EXISTS idx_chunk_entities_note ON chunk_entities(note_id);
+
+        CREATE TABLE IF NOT EXISTS graph_state (
+            note_id      TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,                 -- 抽取时的笔记正文哈希
+            model        TEXT NOT NULL DEFAULT '',      -- 抽取用的对话模型
+            extracted_at INTEGER NOT NULL DEFAULT 0,
+            entities     INTEGER NOT NULL DEFAULT 0,
+            relations    INTEGER NOT NULL DEFAULT 0,
+            error        TEXT NOT NULL DEFAULT ''
+        );
         "#,
     )?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
