@@ -5,9 +5,9 @@
  * 排版参考 WeKnora：提问是右侧气泡，回答是正文直排（.md-body），
  * 上面一行「检索完成 · 引用 N 篇」可展开看检索步骤；来源点击可打开笔记并定位到行。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import MarkdownIt from 'markdown-it'
-import { MessagePlugin } from 'tdesign-vue-next'
+import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
 import { useRouter } from 'vue-router'
 import { useChatStore, type ChatEntry } from '../stores/chat'
 import { useNotesStore } from '../stores/notes'
@@ -25,6 +25,10 @@ const asked: string[] = []
 let askedIndex = -1
 const expandedTrace = ref<Set<number>>(new Set())
 const copiedId = ref(0)
+/** 会话历史栏：窄屏默认收起（点标题栏「历史」展开） */
+const historyOpen = ref(typeof window !== 'undefined' && window.innerWidth > 900)
+const renamingId = ref('')
+const renameValue = ref('')
 
 const samples = [
   '镜像拉取超时最后是怎么解决的？',
@@ -47,7 +51,44 @@ const indexDetail = computed(() => {
 
 onMounted(() => {
   void chat.loadStatus()
+  void chat.loadHistory()
 })
+
+function startNewConversation() {
+  chat.newConversation()
+  historyOpen.value = window.innerWidth > 900
+}
+
+function openConversation(id: string) {
+  chat.selectConversation(id)
+  if (window.innerWidth <= 900) historyOpen.value = false
+}
+
+function startRename(c: { id: string; title: string }) {
+  renamingId.value = c.id
+  renameValue.value = c.title
+  void nextTick(() => document.querySelector<HTMLInputElement>('.history-rename')?.select())
+}
+
+function commitRename(id: string) {
+  if (renamingId.value !== id) return
+  const value = renameValue.value
+  renamingId.value = ''
+  chat.renameConversation(id, value)
+}
+
+function confirmRemove(c: { id: string; title: string }) {
+  const dialog = DialogPlugin.confirm({
+    header: '删除会话',
+    body: `确定删除「${c.title}」吗？该会话的问答记录会一起删除（笔记与录音不受影响）。`,
+    confirmBtn: '删除',
+    theme: 'danger',
+    onConfirm: () => {
+      chat.removeConversation(c.id)
+      dialog.hide()
+    },
+  })
+}
 
 async function submit() {
   const q = question.value.trim()
@@ -230,6 +271,9 @@ function stepList(e: ChatEntry): string[] {
 <template>
   <div class="page">
     <header class="page-header">
+      <button class="icon-btn history-toggle" title="会话历史" @click="historyOpen = !historyOpen">
+        <t-icon name="history" size="16px" />
+      </button>
       <span class="page-title">问答</span>
       <span class="page-sub">基于本地笔记的检索增强问答</span>
       <span class="spacer" />
@@ -256,7 +300,62 @@ function stepList(e: ChatEntry): string[] {
       </t-button>
     </header>
 
-    <div class="chat-body" @click="onStreamClick">
+    <div class="chat-shell">
+      <aside class="history" :class="{ open: historyOpen }">
+        <div class="history-head">
+          <span class="history-title">会话</span>
+          <button class="icon-btn" title="新会话" @click="startNewConversation">
+            <t-icon name="add" size="15px" />
+          </button>
+        </div>
+        <div class="history-list">
+          <template v-for="g in chat.historyGroups" :key="g.label">
+            <div class="history-group">{{ g.label }}</div>
+            <div
+              v-for="c in g.items"
+              :key="c.id"
+              class="history-item"
+              :class="{ active: c.id === chat.currentConversationId }"
+              @click="openConversation(c.id)"
+              @dblclick.stop="startRename(c)"
+            >
+              <input
+                v-if="renamingId === c.id"
+                v-model="renameValue"
+                class="history-rename"
+                @click.stop
+                @keydown.enter.stop="commitRename(c.id)"
+                @keydown.esc.stop="renamingId = ''"
+                @blur="commitRename(c.id)"
+              />
+              <template v-else>
+                <t-icon v-if="c.pinned" name="pin" size="12px" class="history-pin" />
+                <span class="history-name">{{ c.title }}</span>
+                <span class="history-actions">
+                  <button class="icon-btn" title="重命名" @click.stop="startRename(c)">
+                    <t-icon name="edit-2" size="13px" />
+                  </button>
+                  <button
+                    class="icon-btn"
+                    :title="c.pinned ? '取消置顶' : '置顶'"
+                    @click.stop="chat.togglePinConversation(c.id)"
+                  >
+                    <t-icon name="pin" size="13px" />
+                  </button>
+                  <button class="icon-btn" title="删除" @click.stop="confirmRemove(c)">
+                    <t-icon name="delete" size="13px" />
+                  </button>
+                </span>
+              </template>
+            </div>
+          </template>
+          <div v-if="!chat.conversations.length" class="history-empty">还没有会话</div>
+        </div>
+        <div v-if="chat.historyError" class="history-error">{{ chat.historyError }}</div>
+      </aside>
+
+      <section class="chat-main">
+        <div class="chat-body" @click="onStreamClick">
       <div class="stream">
         <div v-if="!chat.entries.length" class="empty-state">
           <t-icon name="chat-bubble" size="30px" class="empty-icon" />
@@ -372,7 +471,7 @@ function stepList(e: ChatEntry): string[] {
       </div>
     </div>
 
-    <footer class="composer">
+        <footer class="composer">
       <div class="composer-card">
         <textarea
           v-model="question"
@@ -407,12 +506,158 @@ function stepList(e: ChatEntry): string[] {
             提问
           </t-button>
         </div>
-      </div>
-    </footer>
+          </div>
+        </footer>
+      </section>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.chat-shell {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  position: relative;
+}
+
+.chat-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------------- 会话历史栏 ---------------- */
+.history {
+  display: none;
+  width: 216px;
+  flex: none;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.history.open {
+  display: flex;
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 8px 6px 12px;
+}
+
+.history-title {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.history-list {
+  flex: 1;
+  overflow: auto;
+  padding: 0 8px 10px;
+}
+
+.history-group {
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 10px 6px 4px;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 4px 6px 8px;
+  border-radius: var(--radius-m);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.history-item:hover {
+  background: var(--hover);
+}
+
+.history-item.active {
+  background: var(--brand-weak);
+}
+
+.history-item.active .history-name {
+  color: var(--primary);
+  font-weight: 500;
+}
+
+.history-pin {
+  flex: none;
+  color: var(--warning);
+}
+
+.history-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-actions {
+  flex: none;
+  display: none;
+  align-items: center;
+  gap: 1px;
+}
+
+.history-item:hover .history-actions {
+  display: inline-flex;
+}
+
+.history-rename {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-family: var(--font-sans);
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-s);
+  padding: 2px 6px;
+  outline: none;
+}
+
+.history-empty,
+.history-error {
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 10px 8px;
+}
+
+.history-error {
+  color: var(--danger);
+  word-break: break-all;
+}
+
+@media (pointer: coarse) {
+  .history-actions {
+    display: inline-flex;
+  }
+}
+
+/* 窄屏：历史栏变抽屉浮层 */
+@media (max-width: 900px) {
+  .history.open {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 30;
+    box-shadow: var(--shadow-3);
+    width: 240px;
+  }
+}
+
 .chat-body {
   flex: 1;
   overflow: auto;

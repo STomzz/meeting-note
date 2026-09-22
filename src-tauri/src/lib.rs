@@ -1,6 +1,7 @@
 //! Tauri 命令层：薄封装，真正的逻辑都在 `bnu-core`。
 
 use bnu_core::audio_clip::{self, ClipInfo, ClipStat};
+use bnu_core::chat_history;
 use bnu_core::db;
 use bnu_core::graph::{self, ExtractOutcome, GraphProgress, GraphSnapshot, GraphStats, NodeDetail};
 use bnu_core::meeting_note::{
@@ -17,6 +18,7 @@ use bnu_core::rusqlite::{Connection, Result as SqlResult};
 use bnu_core::secret::SecretBox;
 use bnu_core::transcribe::{self, TranscribeOutcome, TranscribeProgress};
 use bnu_core::vectors::{self, EmbedProgress};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -330,6 +332,18 @@ async fn ask_question_stream(
 #[tauri::command]
 fn qa_cancel(state: State<'_, AppState>) {
     state.cancel_qa.store(true, Ordering::SeqCst);
+}
+
+/// 读取问答会话历史（JSON 文件，结构由前端定义）。
+#[tauri::command]
+fn chat_history_load(state: State<'_, AppState>) -> Result<Value, String> {
+    chat_history::load(&state.data_dir).map_err(err)
+}
+
+/// 保存问答会话历史（原子写）。
+#[tauri::command]
+fn chat_history_save(payload: Value, state: State<'_, AppState>) -> Result<(), String> {
+    chat_history::save(&state.data_dir, &payload).map_err(err)
 }
 
 // ---------------------------------------------------------------------------
@@ -816,6 +830,8 @@ pub fn run() {
             ask_question,
             ask_question_stream,
             qa_cancel,
+            chat_history_load,
+            chat_history_save,
             meeting_create,
             meeting_list,
             meeting_detail,

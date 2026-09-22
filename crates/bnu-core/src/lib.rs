@@ -8,6 +8,7 @@
 
 pub mod audio;
 pub mod audio_clip;
+pub mod chat_history;
 pub mod chunk;
 pub mod db;
 pub mod graph;
