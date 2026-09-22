@@ -21,6 +21,11 @@ const router = useRouter()
 
 const container = ref<HTMLDivElement | null>(null)
 let graph: Graph | null = null
+/**
+ * 2D 布局坐标快照：切到 3D 会销毁 2D 实例（避免在隐藏容器里建出 0×0 画布，
+ * 那会让力导布局把节点全挤到原点），切回来时从这里恢复，画面不跳。
+ */
+const savedPositions = new Map<string, [number, number]>()
 
 /** 3D 星球视图按需加载：不切过去就不下载 three.js */
 const Graph3D = defineAsyncComponent(() => import('../components/Graph3D.vue'))
@@ -36,9 +41,11 @@ watch(viewMode, async (mode) => {
   }
   if (mode === '2d') {
     await nextTick()
-    await renderGraph()
-    await nextTick()
+    await mountGraph()
     await fit()
+  } else {
+    // 3D 模式下不保留 2D 实例：隐藏容器里没有尺寸，画布与布局都会坏
+    destroyGraph()
   }
 })
 
@@ -60,22 +67,43 @@ function toggleKind(kind: string) {
   store.filter.kinds = list.includes(kind) ? list.filter((k) => k !== kind) : [...list, kind]
 }
 
+/** 读当前实例里某个节点的坐标（新节点还没有，返回 null 交给力导布局）。 */
+function livePosition(id: string): [number, number] | null {
+  if (!graph) return null
+  try {
+    const pos = graph.getElementPosition(id)
+    if (pos && Number.isFinite(pos[0]) && Number.isFinite(pos[1])) return [pos[0], pos[1]]
+  } catch {
+    // 元素不存在等情况：当作没有坐标
+  }
+  return null
+}
+
+/** 销毁前把坐标记下来，切回 2D 时从原位恢复。 */
+function savePositions() {
+  for (const n of store.snapshot.nodes) {
+    const pos = livePosition(String(n.id))
+    if (pos) savedPositions.set(String(n.id), pos)
+  }
+}
+
+function destroyGraph() {
+  if (!graph) return
+  savePositions()
+  graph.destroy()
+  graph = null
+}
+
 /** 转成 G6 数据：保留已有坐标，筛选/重排时画面不整体跳动。 */
 function toG6Data(snapshot: GraphSnapshot) {
   const nodes = snapshot.nodes.map((n) => {
-    let x: number | undefined
-    let y: number | undefined
-    try {
-      const pos = graph?.getElementPosition(String(n.id))
-      if (pos) {
-        x = pos[0]
-        y = pos[1]
-      }
-    } catch {
-      // 新节点还没有坐标：交给力导布局
-    }
+    const id = String(n.id)
+    const live = livePosition(id)
+    const saved = live ? undefined : savedPositions.get(id)
+    const x = live ? live[0] : saved?.[0]
+    const y = live ? live[1] : saved?.[1]
     return {
-      id: String(n.id),
+      id,
       data: { label: n.name, kind: n.kind, degree: n.degree, noteCount: n.noteCount },
       style: {
         size: nodeSize(n.degree),
@@ -111,22 +139,34 @@ function cssVar(name: string, fallback: string): string {
 let themeObserver: MutationObserver | null = null
 
 async function remountGraph() {
-  const old = graph
-  graph = null
-  old?.destroy()
+  if (viewMode.value !== '2d') return
+  destroyGraph()
   await nextTick()
   await mountGraph()
+  await fit()
 }
 
-async function mountGraph() {
-  if (graph || !container.value) return
+/**
+ * 建 2D 实例。
+ *
+ * 只在 2D 模式、容器已有实际尺寸时才建：容器被隐藏或还没量出尺寸时建出来的
+ * 是 0×0 画布，力导布局会把所有节点挤到原点（切回来就只剩一个点）。
+ */
+async function mountGraph(attempt = 0) {
+  if (graph || viewMode.value !== '2d') return
+  const el = container.value
+  if (!el) return
+  if (!el.clientWidth || !el.clientHeight) {
+    if (attempt < 30) requestAnimationFrame(() => void mountGraph(attempt + 1))
+    return
+  }
   const labelFill = cssVar('--text-2', '#475569')
   const edgeLabelFill = cssVar('--text-3', '#94a3b8')
   const edgeStroke = cssVar('--border-strong', '#cbd5e1')
   const selectedStroke = cssVar('--text', '#0f172a')
   const labelBg = cssVar('--panel', '#ffffff')
   graph = new Graph({
-    container: container.value,
+    container: el,
     autoResize: true,
     data: toG6Data(store.visible),
     layout: {
@@ -183,6 +223,8 @@ async function mountGraph() {
 }
 
 async function renderGraph() {
+  // 3D 模式下 2D 实例不参与（Graph3D 有自己的 watch）；也不能在这里补建
+  if (viewMode.value !== '2d') return
   if (!graph) {
     await mountGraph()
     return
@@ -248,8 +290,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   themeObserver?.disconnect()
   themeObserver = null
-  graph?.destroy()
-  graph = null
+  destroyGraph()
   store.unbindProgress()
 })
 
