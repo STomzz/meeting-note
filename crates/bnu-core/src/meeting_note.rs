@@ -389,7 +389,22 @@ pub fn upsert_minutes(body: &str, minutes_md: &str) -> String {
     out
 }
 
-/// 处理时喂给对话模型的「手写正文」：去掉音频引用行、转写块与纪要段。
+/// 新建会议时写在正文里的提示行标记（处理时忽略，免得把骨架当成会议内容）。
+pub const SKELETON_NOTICE_MARK: &str = "会议记录：随手写下要点";
+
+/// 判断一段文本有没有「真正的内容」（忽略空行、纯标题行、分隔线与骨架提示）。
+pub fn has_meaningful_text(text: &str) -> bool {
+    text.lines().any(|line| {
+        let t = line.trim();
+        !t.is_empty()
+            && !t.starts_with('#')
+            && t != "---"
+            && t != "***"
+            && !t.contains(SKELETON_NOTICE_MARK)
+    })
+}
+
+/// 处理时喂给对话模型的「手写正文」：去掉音频引用行、转写块、纪要段与骨架提示。
 pub fn handwritten_text(body: &str) -> String {
     let (head, _) = split_minutes(body);
     let lines: Vec<&str> = head.lines().collect();
@@ -404,7 +419,9 @@ pub fn handwritten_text(body: &str) -> String {
             i = j;
             continue;
         }
-        out.push(lines[i]);
+        if !lines[i].contains(SKELETON_NOTICE_MARK) {
+            out.push(lines[i]);
+        }
         i += 1;
     }
     out.join("\n").trim().to_string()
@@ -792,9 +809,10 @@ pub async fn process(
             Some(chat_cfg) => {
                 let hand = handwritten_text(&with_transcripts);
                 let transcript = transcripts_text(&entries);
-                if hand.trim().is_empty() && transcript.trim().is_empty() {
+                if !has_meaningful_text(&hand) && !has_meaningful_text(&transcript) {
                     errors.push(
-                        "笔记里没有可整理的内容：既没有手写记录，也没有成功的转写".to_string(),
+                        "笔记里没有可整理的内容：既没有手写记录，也没有成功的转写（先写两句或录一段再处理）"
+                            .to_string(),
                     );
                 } else {
                     emit(
@@ -1253,6 +1271,19 @@ mod tests {
         let mut entries = BTreeMap::new();
         entries.insert(4usize, TranscriptEntry { meta: "m".into(), text: "T1".into() });
         assert!(transcripts_text(&entries).contains("T1"));
+    }
+
+    #[test]
+    fn skeleton_notice_is_not_content() {
+        let fresh = skeleton("周会", "2026-09-22");
+        assert!(fresh.contains(SKELETON_NOTICE_MARK));
+        let hand = handwritten_text(&fresh);
+        assert!(!hand.contains(SKELETON_NOTICE_MARK), "骨架提示不进模型输入：{hand}");
+        assert!(!has_meaningful_text(&hand), "全新空会议 = 没有内容");
+        assert!(!has_meaningful_text("# 标题\n\n\n---\n"), "只有标题与分隔线不算内容");
+        assert!(!has_meaningful_text("   \n"));
+        assert!(has_meaningful_text("# 标题\n\n张三说镜像要换源。\n"));
+        assert!(has_meaningful_text("# 标题\n\n> 引用块也是内容\n"));
     }
 
     #[test]
