@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "bnu-notes"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bnu-core",
  "serde",

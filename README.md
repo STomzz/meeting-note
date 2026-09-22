@@ -7,6 +7,7 @@ Windows / Android 桌面客户端：**笔记与会议合并成一个「会议笔
 - 技术栈：**Tauri 2 + Vue 3 + TypeScript**，Rust 侧承载索引、加密与模型调用（`crates/bnu-core`）。
 - 本地数据：vault（Markdown 文件）+ SQLite（FTS5 全文索引、图谱、设置）；API Key 用本机密钥 AES-256-GCM 加密存储。
 - 优雅降级：未配置 embedding / rerank 时检索自动退化为全文搜索；未配置对话模型时只有问答与纪要不可用。
+- 界面：TDesign 组件 + 语义 token，明暗两套主题（默认跟随系统，左下角可切）；答案/笔记共用一套 Markdown 排版。
 
 ## 开发
 
