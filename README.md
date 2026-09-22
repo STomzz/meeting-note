@@ -35,3 +35,6 @@ docs/models.md       四类模型端点、实测记录与注意事项
 ## 文档
 
 - [docs/models.md](docs/models.md)：模型端点配置、推荐模型、实测数据、上游限制。
+- [docs/meetings.md](docs/meetings.md)：会议模块（录音 / 分段 / 转写 / 纪要）与平台麦克风权限。
+- [docs/windows.md](docs/windows.md)：Windows 安装包怎么出、安装、数据位置与验收清单。
+- [docs/android.md](docs/android.md)：Android 工程、权限、release 签名与构建命令。
