@@ -30,6 +30,17 @@
   切段时不中断录音（关闭上一段 → 立即开新段）。
 - Android v1：只做前台录音；录音期间申请 `screen` Wake Lock 保持屏幕常亮（失败不阻断录音）。
 
+### 平台麦克风权限
+
+| 平台 | 需要什么 |
+|---|---|
+| Windows | ① 应用内已注册 WebView2 `PermissionRequested`，只放行本应用页面（`http(s)://tauri.localhost` / 开发服务器）的麦克风/摄像头，见 `src-tauri/src/webview_permissions.rs`；② 系统「设置 → 隐私和安全性 → 麦克风」需允许桌面应用访问麦克风，否则 `getUserMedia` 直接 `NotAllowedError` |
+| Android | 系统运行时权限弹窗（Manifest 已声明 `RECORD_AUDIO`），拒绝后需到系统设置里重开 |
+| Linux (WebKitGTK) | 未处理 WebKitGTK 媒体权限（WSL 无麦克风，无法实测）；如需 Linux 原生录音需再补 `enable-media-stream` + `permission-request` 放行 |
+
+> 前端「录音自检」面板会打印每一步的错误名（`NotAllowedError` / `NotFoundError` / `NotReadableError`），
+> 权限问题一眼可辨。
+
 ## 转写（送 ASR 前会再切一次段）
 
 分段文件不会整段丢给 ASR，而是先在 Rust 侧做**静音切段**，减少长音频带来的超时/显存压力：
@@ -94,4 +105,5 @@
 - 无实时流式转写、无说话人分离（产品范围外）；
 - 录音期间不允许切换会议（UI 会拦截）；
 - 纪要生成的 completion token 上限 8192；转写文本上限 150 万字（超出直接报错，不静默截断）；
-- Android 音频焦点/中断（来电、其它 App 抢占麦克风）v1 不做处理，息屏或切后台可能中断录音。
+- Android 音频焦点/中断（来电、其它 App 抢占麦克风）v1 不做处理，息屏或切后台可能中断录音；
+- Linux 桌面端未处理 WebKitGTK 媒体权限，录音仅在 Windows / Android 验证。

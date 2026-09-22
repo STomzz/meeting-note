@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
+mod webview_permissions;
+
 struct AppState {
     conn: Mutex<Connection>,
     vault: Mutex<PathBuf>,
@@ -413,6 +415,15 @@ pub fn run() {
                 meetings_root,
                 cancel_transcribe: Arc::new(AtomicBool::new(false)),
             });
+
+            // Windows(WebView2)：显式放行本应用页面的麦克风/摄像头，否则窗口里的
+            // getUserMedia 可能被引擎静默拒绝（Linux/Android 走各自平台默认路径）。
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(e) = webview_permissions::grant_media_capture(&window) {
+                    eprintln!("[bnu-notes] 媒体权限预置失败: {e}");
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

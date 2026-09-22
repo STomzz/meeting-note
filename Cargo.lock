@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "bnu-notes"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bnu-core",
  "serde",
@@ -366,6 +366,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "webview2-com",
+ "windows",
 ]
 
 [[package]]
