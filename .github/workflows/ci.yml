@@ -24,6 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
+      - run: npm test
       - run: npm run build
       - run: cargo test -p bnu-core
       - run: cargo check -p bnu-notes
