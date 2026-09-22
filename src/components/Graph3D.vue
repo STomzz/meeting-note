@@ -45,7 +45,7 @@ function refreshColors() {
 }
 
 function isSelected(id: string): boolean {
-  return store.selectedId !== null && String(store.selectedId) === id
+  return Boolean(store.selectedId) && String(store.selectedId) === id
 }
 
 function isDimmed(id: string): boolean {
