@@ -29,14 +29,39 @@ import type { ClipInfo } from '../core/meetingNote'
 import { ancestorsOf, buildTreeRows } from '../core/notesTree'
 import { lineRangeOffset } from '../core/lines'
 import type { NoteMeta } from '../core/types'
+import BlockEditor from '../components/BlockEditor.vue'
 
 const store = useNotesStore()
 const meeting = useMeetingNoteStore()
 const md = new MarkdownIt({ html: false, linkify: true })
 
 const query = ref('')
-const preview = ref(false)
 const editorEl = ref<HTMLTextAreaElement | null>(null)
+const blockEditorEl = ref<InstanceType<typeof BlockEditor> | null>(null)
+
+/**
+ * 编辑器形态：
+ * - edit：块编辑（所见即所得，默认）——点段落即改；
+ * - preview：只读渲染（怕误改的时候用）；
+ * - source：md 原文（textarea，行首 `/v` 有录音选择器）。
+ */
+const EDITOR_KEY = 'bnu-notes-editor-mode'
+type EditorMode = 'edit' | 'preview' | 'source'
+
+function readEditorMode(): EditorMode {
+  const saved = localStorage.getItem(EDITOR_KEY)
+  if (saved === 'source' || saved === 'preview') return saved
+  return 'edit' // 兼容早先存的 'wysiwyg'
+}
+
+const editorMode = ref<EditorMode>(readEditorMode())
+watch(editorMode, (mode) => {
+  try {
+    localStorage.setItem(EDITOR_KEY, mode)
+  } catch {
+    // 存不了不影响本次切换
+  }
+})
 
 /** 保存状态角标文案（自动保存 + 手动保存共用）。 */
 const saveLabel = computed(() => {
@@ -271,7 +296,6 @@ async function open(id: string) {
   await store.openNote(id)
   await meeting.openNote(id)
   unrefDialog.value = false
-  preview.value = false
   showClips.value = false
   const next = new Set(expanded.value)
   for (const p of ancestorsOf(id)) next.add(p)
@@ -319,9 +343,13 @@ async function playClip(c: ClipInfo) {
   playing.value = c.path
 }
 
-/** 直接在当前光标处插入若干引用行（编辑器打开时用）。 */
+/** 直接插入若干引用行（光标处 / 块编辑形态插到文末或当前段后面）。 */
 function insertLinesNow(lines: string[]) {
   if (!lines.length) return
+  if (useBlockEditor.value) {
+    blockEditorEl.value?.insertLines(lines)
+    return
+  }
   const el = editorEl.value
   let pos = el ? el.selectionStart : store.content.length
   let body = store.content
@@ -428,7 +456,13 @@ const slashMatches = computed(() => {
   return list.slice(0, 8)
 })
 
-const rendered = computed(() => renderMarkdown(store.content))
+/** 是否用块编辑（edit / preview），false = 源码 textarea。 */
+const useBlockEditor = computed(() => editorMode.value !== 'source')
+
+/** 块渲染：把一块 markdown 渲染成 HTML（`/v` 行换成播放器）。 */
+function renderBlock(body: string): string {
+  return renderMarkdown(body)
+}
 
 /** 预览：把 `/v 音频` 行渲染成播放器（src 异步取，取不到时先显示文件名）。 */
 function renderMarkdown(body: string): string {
@@ -473,6 +507,12 @@ watch(
   () => meeting.pendingRef,
   async (pending) => {
     if (!pending || pending.noteId !== store.currentId) return
+    if (useBlockEditor.value) {
+      // 块编辑形态：插到正在编辑的那段后面，否则插到纪要标题前 / 文末
+      blockEditorEl.value?.insertLines([pending.text])
+      meeting.clearPendingRef()
+      return
+    }
     const el = editorEl.value
     const cursor = el ? el.selectionStart : store.content.length
     const res = insertRefAtCursor(store.content, pending.text, cursor)
@@ -501,9 +541,14 @@ watch(
   async (loc) => {
     if (!loc) return
     if (store.currentId !== loc.noteId) await open(loc.noteId)
-    preview.value = false
     showClips.value = false
     await nextTick()
+    if (useBlockEditor.value) {
+      blockEditorEl.value?.locate(loc.startLine, loc.endLine)
+      store.clearLocate()
+      MessagePlugin.info(`已定位到第 ${loc.startLine}-${loc.endLine} 行`)
+      return
+    }
     const el = editorEl.value
     if (!el) {
       store.clearLocate()
@@ -793,9 +838,11 @@ async function removeCurrent() {
             <t-button size="small" :disabled="!store.dirty" theme="primary" @click="saveCurrent()"
               >保存</t-button
             >
-            <t-button size="small" variant="outline" @click="preview = !preview">
-              {{ preview ? '编辑' : '预览' }}
-            </t-button>
+            <t-radio-group v-model="editorMode" size="small" variant="default-filled">
+              <t-radio-button value="edit">编辑</t-radio-button>
+              <t-radio-button value="preview">预览</t-radio-button>
+              <t-radio-button value="source">源码</t-radio-button>
+            </t-radio-group>
             <t-button size="small" theme="danger" variant="text" @click="removeCurrent"
               >删除</t-button
             >
@@ -847,8 +894,16 @@ async function removeCurrent() {
             <span class="editor-progress-text">{{ meeting.message }}</span>
           </div>
           <div class="editor-body">
+            <BlockEditor
+              v-if="useBlockEditor"
+              ref="blockEditorEl"
+              :content="store.content"
+              :render="renderBlock"
+              :editable="editorMode === 'edit'"
+              @update:content="store.setContent"
+            />
             <textarea
-              v-if="!preview"
+              v-else
               ref="editorEl"
               class="editor"
               :value="store.content"
@@ -858,7 +913,6 @@ async function removeCurrent() {
               @click="slashOpen = false"
               @blur="slashOpen = false"
             />
-            <div v-else class="preview md-body" v-html="rendered" />
             <div v-if="slashOpen" class="slash">
               <div class="slash-head">
                 插入录音引用（↑↓ 选择，Enter 插入，Esc 取消）
@@ -1411,6 +1465,7 @@ async function removeCurrent() {
   min-height: 0;
   display: flex;
   position: relative;
+  overflow: auto;
 }
 
 .editor {
@@ -1424,12 +1479,6 @@ async function removeCurrent() {
   font-family: var(--font-mono);
   background: var(--panel);
   color: var(--text);
-}
-
-.preview {
-  flex: 1;
-  overflow: auto;
-  padding: 16px 24px;
 }
 
 .scan-msg {

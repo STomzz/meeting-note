@@ -9,6 +9,8 @@ Windows / Android 桌面客户端：**笔记与会议合并成一个「会议笔
 - 优雅降级：未配置 embedding / rerank 时检索自动退化为全文搜索；未配置对话模型时只有问答与纪要不可用。
 - 界面：TDesign 组件 + 语义 token，明暗两套主题（默认跟随系统，侧栏/设置页可切）；答案/笔记共用一套 Markdown 排版。
 - 问答：真流式逐字输出（可随时停止）、回答里的 `[n]` 可点回原文定位、会话历史分组管理、按需生成追问建议。
+- 笔记编辑器：默认**所见即所得**（点段落即改，输入 `#` / `/` 换块类型，回车拆段），只替换被编辑的那一块——
+  会议笔记的 `/v` 引用、转写块、纪要段不会被重排；需要抠 markdown 原文时切「源码」。
 
 ## 开发
 
@@ -32,6 +34,7 @@ src/core/            前端类型与契约
 src/platform/        适配器（Tauri 实现 / 浏览器 Mock）
 src/stores/          Pinia
 src/views/           会议笔记 / 问答 / 图谱 / 设置
+src/components/      块编辑器（所见即所得）、3D 图谱、录音面板等
 docs/graph.md        知识图谱：抽取、存储、可视化与检索增强
 docs/models.md       四类模型端点、实测记录与注意事项
 ```
@@ -39,6 +42,7 @@ docs/models.md       四类模型端点、实测记录与注意事项
 ## 文档
 
 - [docs/graph.md](docs/graph.md)：知识图谱（实体/关系抽取、防幻觉约束、2D 力导 + 3D 星球视图、邻居扩展检索）。
+- [docs/editor.md](docs/editor.md)：笔记编辑器——块模型与「只替换被编辑的块」、交互与快捷键、引用插入落点。
 - [docs/qa.md](docs/qa.md)：问答——流式生成与停止、行内引用定位、会话历史（`chat-history.json`）、追问建议与限流。
 - [docs/models.md](docs/models.md)：模型端点配置、推荐模型、实测数据、上游限制。
 - [docs/meetings.md](docs/meetings.md)：会议笔记——文件夹树、**会议 = 一篇 md**（`/v` 引用录音、一键处理转写 + 纪要）、录音归类、旧会议迁移与排障。
