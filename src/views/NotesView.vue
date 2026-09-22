@@ -263,9 +263,20 @@ async function discardClip() {
 const refCount = computed(() => parseRefs(store.content).length)
 const unrefDialog = ref(false)
 const unrefList = ref<ClipInfo[]>([])
+/** 本次处理是否忽略转写缓存（按钮下拉里的「强制重新转写」） */
+const processForce = ref(false)
+const processOptions = [
+  { content: '一键处理（缓存命中不重复转写）', value: 'normal' },
+  { content: '强制重新转写（忽略缓存，较慢）', value: 'force' },
+]
 
-async function processCurrent() {
+function onProcessPick(item: { value?: unknown }) {
+  void processCurrent(item?.value === 'force')
+}
+
+async function processCurrent(force = processForce.value) {
   if (!store.currentId || meeting.processing) return
+  processForce.value = force
   await store.save()
   await meeting.openNote(store.currentId)
   await meeting.loadAllClips()
@@ -281,7 +292,7 @@ async function processCurrent() {
 async function runProcess() {
   if (!store.currentId) return
   await meeting.openNote(store.currentId)
-  await meeting.process(false)
+  await meeting.process(processForce.value)
 }
 
 async function insertUnrefAndProcess() {
@@ -561,15 +572,17 @@ async function removeCurrent() {
                 · {{ unrefClips.length }} 未引用</template
               >
             </t-button>
-            <t-button
+            <t-dropdown
               v-if="refCount"
-              size="small"
-              variant="outline"
-              :loading="meeting.processing"
-              @click="processCurrent"
+              trigger="click"
+              :options="processOptions"
+              :disabled="meeting.processing"
+              @click="onProcessPick"
             >
-              一键处理（{{ refCount }} 段录音）
-            </t-button>
+              <t-button size="small" variant="outline" :loading="meeting.processing">
+                一键处理（{{ refCount }} 段录音）
+              </t-button>
+            </t-dropdown>
             <t-button size="small" :disabled="!store.dirty" theme="primary" @click="saveCurrent()"
               >保存</t-button
             >
