@@ -9,6 +9,15 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 walkdir = "2.5"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "rustls-tls-native-roots",
+] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

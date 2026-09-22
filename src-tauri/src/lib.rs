@@ -1,8 +1,10 @@
 //! Tauri 命令层：薄封装，真正的逻辑都在 `bnu-core`。
 
 use bnu_core::db;
+use bnu_core::models::{self, ModelConfig, PublicModelConfig};
 use bnu_core::notes::{self, NoteMeta, ScanStats, SearchHit};
-use rusqlite::Connection;
+use bnu_core::rusqlite::{Connection, Result as SqlResult};
+use bnu_core::secret::SecretBox;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -10,6 +12,7 @@ use tauri::{Manager, State};
 struct AppState {
     conn: Mutex<Connection>,
     vault: Mutex<PathBuf>,
+    secret: SecretBox,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -21,7 +24,7 @@ fn read_setting(conn: &Connection, key: &str) -> Option<String> {
         .ok()
 }
 
-fn write_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+fn write_setting(conn: &Connection, key: &str, value: &str) -> SqlResult<()> {
     conn.execute(
         "INSERT INTO settings(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -29,6 +32,10 @@ fn write_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<
     )?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// 笔记 / vault
+// ---------------------------------------------------------------------------
 
 #[tauri::command]
 fn get_vault(state: State<'_, AppState>) -> String {
@@ -101,17 +108,85 @@ fn search_notes(
     notes::search(&conn, &query, limit.unwrap_or(30)).map_err(err)
 }
 
+// ---------------------------------------------------------------------------
+// 模型配置
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn get_model_config(state: State<'_, AppState>) -> Result<PublicModelConfig, String> {
+    let conn = state.conn.lock().unwrap();
+    models::load_config(&conn, &state.secret)
+        .map(|c| c.public())
+        .map_err(err)
+}
+
+#[tauri::command]
+fn save_model_config(input: ModelConfig, state: State<'_, AppState>) -> Result<PublicModelConfig, String> {
+    let conn = state.conn.lock().unwrap();
+    let mut cfg = models::load_config(&conn, &state.secret).map_err(err)?;
+    cfg.merge(input);
+    models::save_config(&conn, &state.secret, &cfg).map_err(err)?;
+    Ok(cfg.public())
+}
+
+#[tauri::command]
+async fn test_model(capability: String, state: State<'_, AppState>) -> Result<String, String> {
+    let cfg = {
+        let conn = state.conn.lock().unwrap();
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    models::test_capability(&capability, &cfg).await.map_err(err)
+}
+
+#[tauri::command]
+async fn list_available_models(
+    base_url: String,
+    api_key: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let key = match api_key.filter(|k| !k.trim().is_empty()) {
+        Some(k) => Some(k),
+        None => {
+            let conn = state.conn.lock().unwrap();
+            let cfg = models::load_config(&conn, &state.secret).map_err(err)?;
+            [cfg.chat, cfg.embedding, cfg.rerank, cfg.asr]
+                .into_iter()
+                .flatten()
+                .find(|e| e.base_url.trim_end_matches('/') == base_url.trim_end_matches('/'))
+                .and_then(|e| e.api_key)
+        }
+    };
+    let endpoint = models::EndpointConfig {
+        base_url,
+        model: String::new(),
+        params: serde_json::Value::Null,
+        api_key: key,
+    };
+    models::list_models(&endpoint).await.map_err(err)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
+            // 路径解析在不同平台可能失败（如 WSL 里没有 XDG 文档目录），逐级兜底
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .or_else(|_| app.path().home_dir().map(|h| h.join(".bnu-notes")))
+                .map_err(|e| format!("无法确定应用数据目录: {e}"))?;
             std::fs::create_dir_all(&data_dir)?;
             let conn = db::open(&data_dir.join("index.sqlite"))?;
+            let secret = SecretBox::load_or_create(&data_dir.join("secret.key"))?;
 
-            let default_vault = app.path().document_dir()?.join("BNU-Notes");
+            let default_vault = app
+                .path()
+                .document_dir()
+                .or_else(|_| app.path().home_dir())
+                .map(|dir| dir.join("BNU-Notes"))
+                .unwrap_or_else(|_| data_dir.join("vault"));
             std::fs::create_dir_all(&default_vault)?;
             let vault = read_setting(&conn, "vault")
                 .map(PathBuf::from)
@@ -121,6 +196,7 @@ pub fn run() {
             app.manage(AppState {
                 conn: Mutex::new(conn),
                 vault: Mutex::new(vault),
+                secret,
             });
             Ok(())
         })
@@ -133,7 +209,11 @@ pub fn run() {
             write_note,
             create_note,
             delete_note,
-            search_notes
+            search_notes,
+            get_model_config,
+            save_model_config,
+            test_model,
+            list_available_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
