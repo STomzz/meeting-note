@@ -1,5 +1,11 @@
-import { invoke } from '@tauri-apps/api/core'
-import type { Answer, EmbedProgress, RetrievalStatus, RetrievedChunk } from '../core/retrieval'
+import { Channel, invoke } from '@tauri-apps/api/core'
+import type {
+  Answer,
+  EmbedProgress,
+  QaStreamEvent,
+  RetrievalStatus,
+  RetrievedChunk,
+} from '../core/retrieval'
 import { SEED, splitTitle } from './mock'
 
 /** 检索 + 问答适配器。 */
@@ -7,6 +13,10 @@ export interface RetrievalAdapter {
   status(): Promise<RetrievalStatus>
   buildIndex(maxChunks?: number): Promise<EmbedProgress>
   ask(question: string, topK?: number): Promise<Answer>
+  /** 流式问答：检索完成后逐字回调；返回完整答案（被停止时返回已生成的部分）。 */
+  askStream(question: string, onEvent: (ev: QaStreamEvent) => void, topK?: number): Promise<Answer>
+  /** 请求停止当前流式问答（下一次增量检查时生效）。 */
+  cancel(): Promise<void>
 }
 
 class TauriRetrievalAdapter implements RetrievalAdapter {
@@ -18,6 +28,14 @@ class TauriRetrievalAdapter implements RetrievalAdapter {
   }
   ask(question: string, topK?: number) {
     return invoke<Answer>('ask_question', { question, topK: topK ?? 6 })
+  }
+  askStream(question: string, onEvent: (ev: QaStreamEvent) => void, topK?: number) {
+    const channel = new Channel<QaStreamEvent>()
+    channel.onmessage = (ev) => onEvent(ev)
+    return invoke<Answer>('ask_question_stream', { question, topK: topK ?? 6, onEvent: channel })
+  }
+  cancel() {
+    return invoke<void>('qa_cancel')
   }
 }
 
@@ -92,6 +110,37 @@ class MockRetrievalAdapter implements RetrievalAdapter {
       completionTokens: null,
     }
   }
+
+  /** 浏览器预览：把整段回答按小步长"吐"出来，方便验证流式交互（不发真实请求）。 */
+  async askStream(question: string, onEvent: (ev: QaStreamEvent) => void): Promise<Answer> {
+    this.cancelled = false
+    const full = await this.ask(question)
+    onEvent({
+      type: 'retrieved',
+      question: full.question,
+      model: full.model,
+      sources: full.sources,
+      trace: full.trace,
+    })
+    const text = full.answer
+    let cut = 0
+    while (cut < text.length) {
+      if (this.cancelled) break
+      const step = 6 + Math.floor(Math.random() * 8)
+      onEvent({ type: 'delta', text: text.slice(cut, cut + step) })
+      cut += step
+      await new Promise((resolve) => setTimeout(resolve, 18))
+    }
+    const final: Answer = { ...full, answer: text.slice(0, cut) }
+    onEvent({ type: 'done', answer: final })
+    return final
+  }
+
+  async cancel() {
+    this.cancelled = true
+  }
+
+  private cancelled = false
 }
 
 export function retrievalAdapter(): RetrievalAdapter {

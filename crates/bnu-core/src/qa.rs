@@ -126,6 +126,97 @@ pub async fn answer(
     })
 }
 
+/// 流式问答事件（经 Tauri Channel 推给前端）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum QaEvent {
+    /// 检索完成：先把来源与轨迹给前端，随后开始逐字返回
+    Retrieved {
+        question: String,
+        model: String,
+        sources: Vec<RetrievedChunk>,
+        trace: RetrievalTrace,
+    },
+    /// 正文增量
+    Delta { text: String },
+    /// 思考增量
+    Reasoning { text: String },
+    /// 收尾：完整答案（含耗时与 token）
+    Done { answer: Answer },
+}
+
+/// 流式问答主流程（检索 → 逐字生成 → 收尾）。
+///
+/// `on_event` 返回 `false` 表示用户点了「停止」：立刻中止读取，返回已生成的部分。
+pub async fn answer_stream<F>(
+    conn: &Mutex<Connection>,
+    cfg: &ModelConfig,
+    question: &str,
+    top_k: usize,
+    mut on_event: F,
+) -> Result<Answer>
+where
+    F: FnMut(QaEvent) -> bool + Send,
+{
+    let started = Instant::now();
+    let question = question.trim();
+    if question.is_empty() {
+        return Err(anyhow!("问题不能为空"));
+    }
+    let chat_cfg = cfg
+        .chat
+        .as_ref()
+        .ok_or_else(|| anyhow!("未配置对话模型：请到「设置」里填写对话端点（问答需要它）"))?;
+
+    let opts = RetrieveOptions { top_k: top_k.clamp(1, 12), ..Default::default() };
+    let (chunks, trace) = retrieval::retrieve(conn, cfg, question, &opts).await?;
+
+    if chunks.is_empty() {
+        let answer = Answer {
+            question: question.to_string(),
+            answer: no_result_answer(question),
+            sources: Vec::new(),
+            trace,
+            model: chat_cfg.model.clone(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            completion_tokens: None,
+        };
+        on_event(QaEvent::Done { answer: answer.clone() });
+        return Ok(answer);
+    }
+
+    on_event(QaEvent::Retrieved {
+        question: question.to_string(),
+        model: chat_cfg.model.clone(),
+        sources: chunks.clone(),
+        trace: trace.clone(),
+    });
+
+    let messages = build_messages(question, &chunks);
+    let reply = models::chat_stream(
+        chat_cfg,
+        &messages,
+        &ChatOptions { max_tokens: Some(1024), temperature: Some(0.2), ..Default::default() },
+        |ev| match ev {
+            models::ChatStreamEvent::Delta(t) => on_event(QaEvent::Delta { text: t }),
+            models::ChatStreamEvent::Reasoning(t) => on_event(QaEvent::Reasoning { text: t }),
+        },
+    )
+    .await?;
+
+    let answer = Answer {
+        question: question.to_string(),
+        answer: reply.content,
+        sources: chunks,
+        trace,
+        model: chat_cfg.model.clone(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        completion_tokens: reply.completion_tokens,
+    };
+    on_event(QaEvent::Done { answer: answer.clone() });
+    Ok(answer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +279,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("未配置对话模型"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn answer_stream_empty_index_only_emits_done() {
+        let conn = Mutex::new(db::open_memory().unwrap());
+        let cfg = ModelConfig {
+            chat: Some(models::EndpointConfig {
+                base_url: "http://127.0.0.1:1".into(),
+                model: "m".into(),
+                params: json!({}),
+                api_key: None,
+            }),
+            ..Default::default()
+        };
+        let mut events: Vec<String> = Vec::new();
+        let a = answer_stream(&conn, &cfg, "镜像拉取超时怎么办", 6, |ev| {
+            events.push(match ev {
+                QaEvent::Retrieved { .. } => "retrieved".into(),
+                QaEvent::Delta { .. } => "delta".into(),
+                QaEvent::Reasoning { .. } => "reasoning".into(),
+                QaEvent::Done { .. } => "done".into(),
+            });
+            true
+        })
+        .await
+        .unwrap();
+        assert!(a.answer.contains("没有找到"));
+        // 空索引不调用模型：只有收尾事件
+        assert_eq!(events, vec!["done"]);
     }
 
     #[tokio::test]

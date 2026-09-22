@@ -7,6 +7,7 @@
 
 use crate::secret::SecretBox;
 use anyhow::{anyhow, bail, Context, Result};
+use futures_util::StreamExt;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -262,18 +263,20 @@ pub struct ChatReply {
     pub reasoning: Option<String>,
 }
 
-/// 调用对话补全（非流式）。若 `content` 为空但有 `reasoning`，会回退返回思考文本。
-pub async fn chat(cfg: &EndpointConfig, messages: &[ChatMessage], opts: &ChatOptions) -> Result<ChatReply> {
-    if cfg.base_url.trim().is_empty() {
-        bail!("未配置对话模型端点");
-    }
+/// 拼对话补全的请求体（流式 / 非流式共用）。
+fn build_chat_body(
+    cfg: &EndpointConfig,
+    messages: &[ChatMessage],
+    opts: &ChatOptions,
+    stream: bool,
+) -> Result<Map<String, Value>> {
     let mut body: Map<String, Value> = match &cfg.params {
         Value::Object(m) => m.clone(),
         _ => Map::new(),
     };
     body.insert("model".into(), json!(cfg.model));
     body.insert("messages".into(), serde_json::to_value(messages)?);
-    body.insert("stream".into(), json!(false));
+    body.insert("stream".into(), json!(stream));
     if let Some(mt) = opts.max_tokens {
         body.insert("max_tokens".into(), json!(mt));
     }
@@ -285,6 +288,15 @@ pub async fn chat(cfg: &EndpointConfig, messages: &[ChatMessage], opts: &ChatOpt
             body.insert(k.clone(), v.clone());
         }
     }
+    Ok(body)
+}
+
+/// 调用对话补全（非流式）。若 `content` 为空但有 `reasoning`，会回退返回思考文本。
+pub async fn chat(cfg: &EndpointConfig, messages: &[ChatMessage], opts: &ChatOptions) -> Result<ChatReply> {
+    if cfg.base_url.trim().is_empty() {
+        bail!("未配置对话模型端点");
+    }
+    let body = build_chat_body(cfg, messages, opts, false)?;
 
     let url = format!("{}/chat/completions", api_root(&cfg.base_url));
     let resp = auth(http()?.post(&url), cfg)
@@ -323,6 +335,160 @@ pub async fn chat(cfg: &EndpointConfig, messages: &[ChatMessage], opts: &ChatOpt
         bail!("模型返回内容为空（finish_reason={finish}）");
     }
     Ok(ChatReply { content, finish_reason: finish, completion_tokens, reasoning })
+}
+
+/// 流式增量事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatStreamEvent {
+    /// 正文增量
+    Delta(String),
+    /// 思考过程增量（部分模型返回 reasoning_content）
+    Reasoning(String),
+}
+
+/// SSE 累计器：把每一行 `data:` 折进结果，便于单测（不需要网络）。
+#[derive(Debug, Default, Clone)]
+pub struct ChatStreamAccum {
+    pub content: String,
+    pub reasoning: String,
+    pub finish_reason: String,
+    pub completion_tokens: Option<u64>,
+    pub done: bool,
+}
+
+impl ChatStreamAccum {
+    /// 吃掉一行 `data:` 的内容，返回要向上抛的事件。
+    pub fn feed(&mut self, data: &str) -> Option<ChatStreamEvent> {
+        let data = data.trim();
+        if data.is_empty() {
+            return None;
+        }
+        if data == "[DONE]" {
+            self.done = true;
+            return None;
+        }
+        let v: Value = serde_json::from_str(data).ok()?;
+
+        if let Some(t) = v.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64()) {
+            self.completion_tokens = Some(t);
+        }
+        let choice = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first())?;
+        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+            if !fr.is_empty() {
+                self.finish_reason = fr.to_string();
+            }
+        }
+        let delta = choice.get("delta")?;
+        if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+            if !c.is_empty() {
+                self.content.push_str(c);
+                return Some(ChatStreamEvent::Delta(c.to_string()));
+            }
+        }
+        if let Some(r) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+            if !r.is_empty() {
+                self.reasoning.push_str(r);
+                return Some(ChatStreamEvent::Reasoning(r.to_string()));
+            }
+        }
+        None
+    }
+
+    pub fn into_reply(self) -> ChatReply {
+        let reasoning = if self.reasoning.trim().is_empty() {
+            None
+        } else {
+            Some(self.reasoning.trim().to_string())
+        };
+        let finish_reason = if self.finish_reason.is_empty() {
+            "stop".to_string()
+        } else {
+            self.finish_reason
+        };
+        ChatReply { content: self.content.trim().to_string(), finish_reason, completion_tokens: self.completion_tokens, reasoning }
+    }
+}
+
+/// 解析一行 SSE：只认 `data:` 前缀，返回其后的载荷（按规范去掉一个前导空格）。
+pub fn sse_payload(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("data:")?;
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    Some(rest.trim_end_matches(['\r', '\n']))
+}
+
+/// 流式对话补全。
+///
+/// `on_event` 返回 `false` 表示调用方要求中止：此时停止读取，`finish_reason` 记为 `cancelled`，
+/// 已生成的部分照常返回（前端可保留半截回答）。
+pub async fn chat_stream<F>(
+    cfg: &EndpointConfig,
+    messages: &[ChatMessage],
+    opts: &ChatOptions,
+    mut on_event: F,
+) -> Result<ChatReply>
+where
+    F: FnMut(ChatStreamEvent) -> bool,
+{
+    if cfg.base_url.trim().is_empty() {
+        bail!("未配置对话模型端点");
+    }
+    let body = build_chat_body(cfg, messages, opts, true)?;
+    let url = format!("{}/chat/completions", api_root(&cfg.base_url));
+    let resp = auth(http()?.post(&url), cfg)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("请求失败: {url}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        bail!("对话模型返回 {}: {}", status.as_u16(), truncate(&text, 300));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut acc = ChatStreamAccum::default();
+    let mut buf = String::new();
+    let mut cancelled = false;
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let bytes = chunk.context("读取流式响应失败")?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = buf.find('\n') {
+            let line: String = buf.drain(..=pos).collect();
+            let Some(data) = sse_payload(&line) else { continue };
+            if let Some(ev) = acc.feed(data) {
+                if !on_event(ev) {
+                    cancelled = true;
+                    break 'outer;
+                }
+            }
+            if acc.done {
+                break 'outer;
+            }
+        }
+    }
+    // 收尾：最后一行可能没有换行符
+    if !cancelled && !acc.done {
+        if let Some(data) = sse_payload(&buf) {
+            let _ = acc.feed(data);
+        }
+    }
+
+    let reply = acc.into_reply();
+    if cancelled {
+        return Ok(ChatReply { finish_reason: "cancelled".into(), ..reply });
+    }
+    if reply.content.is_empty() {
+        if reply.finish_reason == "length" {
+            bail!("模型思考太长被截断（finish_reason=length）。建议：提高 max_tokens，或设置 params.chat_template_kwargs.enable_thinking=false");
+        }
+        if let Some(r) = reply.reasoning.clone() {
+            return Ok(ChatReply { content: r, ..reply });
+        }
+        bail!("模型返回内容为空（finish_reason={}）", reply.finish_reason);
+    }
+    Ok(reply)
 }
 
 /// 文本嵌入。
@@ -652,5 +818,46 @@ mod tests {
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(wav.len(), 44 + 16000);
+    }
+
+    #[test]
+    fn sse_payload_only_matches_data_lines() {
+        assert_eq!(sse_payload("data: {\"a\":1}\r"), Some("{\"a\":1}"));
+        assert_eq!(sse_payload("event: ping"), None);
+        assert_eq!(sse_payload(": comment"), None);
+    }
+
+    #[test]
+    fn stream_accum_collects_deltas_reasoning_and_usage() {
+        let mut acc = ChatStreamAccum::default();
+        assert_eq!(acc.feed(" {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]} "), Some(ChatStreamEvent::Delta("你好".into())));
+        assert_eq!(
+            acc.feed("{\"choices\":[{\"delta\":{\"reasoning_content\":\"想想\"}}]}"),
+            Some(ChatStreamEvent::Reasoning("想想".into()))
+        );
+        // 只有 finish_reason，没有 delta：不抛事件
+        assert_eq!(acc.feed("{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}"), None);
+        assert_eq!(acc.feed("{\"choices\":[],\"usage\":{\"completion_tokens\":42}}"), None);
+        assert_eq!(acc.feed("[DONE]"), None);
+        // 空行 / 非法 JSON 静默跳过
+        assert_eq!(acc.feed("  "), None);
+        assert_eq!(acc.feed("{oops"), None);
+
+        assert!(acc.done);
+        let reply = acc.into_reply();
+        assert_eq!(reply.content, "你好");
+        assert_eq!(reply.reasoning.as_deref(), Some("想想"));
+        assert_eq!(reply.finish_reason, "stop");
+        assert_eq!(reply.completion_tokens, Some(42));
+    }
+
+    #[test]
+    fn stream_accum_falls_back_to_reasoning_when_content_empty() {
+        let mut acc = ChatStreamAccum::default();
+        acc.feed("{\"choices\":[{\"delta\":{\"reasoning_content\":\"只有思考\"}}]}");
+        let reply = acc.into_reply();
+        assert!(reply.content.is_empty());
+        assert_eq!(reply.reasoning.as_deref(), Some("只有思考"));
+        assert_eq!(reply.finish_reason, "stop", "缺省 finish_reason 视为 stop");
     }
 }

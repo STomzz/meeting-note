@@ -11,6 +11,7 @@ import { MessagePlugin } from 'tdesign-vue-next'
 import { useRouter } from 'vue-router'
 import { useChatStore, type ChatEntry } from '../stores/chat'
 import { useNotesStore } from '../stores/notes'
+import { citeMarkup } from '../core/citations'
 import { modeLabel, type RetrievedChunk } from '../core/retrieval'
 
 const chat = useChatStore()
@@ -107,8 +108,29 @@ function toggleTrace(id: number) {
   expandedTrace.value = next
 }
 
-function render(text: string) {
-  return md.render(text || '')
+/**
+ * 回答里的 [1] [2] 渲染成可点的引用角标：
+ * markdown-it 的 text 规则只作用于正文（代码块、链接语法不受影响），
+ * 悬停有来源提示，点击跳到对应来源行。
+ */
+md.renderer.rules.text = (tokens, idx, _options, env) => {
+  const sources = ((env as { sources?: RetrievedChunk[] }).sources ?? []) as RetrievedChunk[]
+  return citeMarkup(md.utils.escapeHtml(tokens[idx].content), sources)
+}
+
+function render(text: string, sources: RetrievedChunk[] = []) {
+  return md.render(text || '', { sources })
+}
+
+/** 点回答里的引用角标 → 打开对应来源并定位到行。 */
+function onStreamClick(e: MouseEvent) {
+  const target = e.target as HTMLElement
+  const cite = target.closest('.cite') as HTMLElement | null
+  if (!cite) return
+  const entryEl = target.closest('[data-entry-id]') as HTMLElement | null
+  const entry = chat.entries.find((x) => x.id === Number(entryEl?.dataset.entryId))
+  const source = entry?.answer?.sources[Number(cite.dataset.cite) - 1]
+  if (source) void openSource(source)
 }
 
 function shorten(text: string, n = 140) {
@@ -234,7 +256,7 @@ function stepList(e: ChatEntry): string[] {
       </t-button>
     </header>
 
-    <div class="chat-body">
+    <div class="chat-body" @click="onStreamClick">
       <div class="stream">
         <div v-if="!chat.entries.length" class="empty-state">
           <t-icon name="chat-bubble" size="30px" class="empty-icon" />
@@ -249,38 +271,55 @@ function stepList(e: ChatEntry): string[] {
           </div>
         </div>
 
-        <div v-for="e in chat.entries" :key="e.id" class="entry fade-in">
+        <div v-for="e in chat.entries" :key="e.id" class="entry fade-in" :data-entry-id="e.id">
           <div class="q-row">
             <div class="q-bubble">{{ e.question }}</div>
           </div>
 
           <div v-if="e.pending" class="pending">
             <t-loading size="small" />
-            <span>正在检索并生成…</span>
+            <span>正在检索…</span>
+          </div>
+          <div v-else-if="e.streaming" class="pending">
+            <span class="pulse" />
+            <span>正在生成…</span>
+            <button class="stop-inline" @click="chat.stop()">
+              <t-icon name="stop-circle" size="14px" />
+              停止
+            </button>
+          </div>
+          <div v-else-if="e.stopped" class="pending stopped">
+            <t-icon name="stop-circle" size="14px" />
+            <span>已停止生成（可复制已有内容，或点「重新生成」）</span>
           </div>
 
           <t-alert v-if="e.error" theme="error" :message="e.error" class="entry-alert" />
 
           <template v-if="e.answer">
             <!-- 检索过程：一行摘要，点开看步骤 -->
-            <button class="trace-line" @click="toggleTrace(e.id)">
+            <button v-if="!e.streaming" class="trace-line" @click="toggleTrace(e.id)">
               <t-icon name="check-circle" size="15px" class="trace-icon" />
               <span>
                 检索完成 · 引用 {{ e.answer.sources.length }} 篇 · {{ e.answer.elapsedMs }} ms
               </span>
               <t-icon :name="expandedTrace.has(e.id) ? 'chevron-down' : 'chevron-right'" size="14px" />
             </button>
-            <ol v-if="expandedTrace.has(e.id)" class="trace-steps fade-in">
+            <ol v-if="!e.streaming && expandedTrace.has(e.id)" class="trace-steps fade-in">
               <li v-for="(s, i) in stepList(e)" :key="i">{{ s }}</li>
             </ol>
 
-            <div class="answer md-body" v-html="render(e.answer.answer)" />
+            <details v-if="e.reasoning" class="reasoning">
+              <summary>思考过程（{{ e.reasoning.length }} 字）</summary>
+              <pre>{{ e.reasoning }}</pre>
+            </details>
+
+            <div class="answer md-body" v-html="render(e.answer.answer, e.answer.sources)" />
 
             <div v-for="(d, i) in e.answer.trace.degraded" :key="i" class="degraded">
               ⚠️ {{ d }}
             </div>
 
-            <div class="answer-bar">
+            <div v-if="!e.streaming" class="answer-bar">
               <button class="icon-btn" title="复制回答" @click="copyAnswer(e)">
                 <t-icon :name="copiedId === e.id ? 'check' : 'copy'" size="14px" />
                 <span>{{ copiedId === e.id ? '已复制' : '复制' }}</span>
@@ -347,11 +386,22 @@ function stepList(e: ChatEntry): string[] {
           <span v-if="status?.chatModel" class="chip muted">{{ status.chatModel }}</span>
           <span class="spacer" />
           <t-button
+            v-if="chat.streaming"
+            theme="danger"
+            variant="outline"
+            shape="round"
+            size="small"
+            @click="chat.stop()"
+          >
+            <t-icon name="stop-circle" size="14px" />
+            停止生成
+          </t-button>
+          <t-button
+            v-else
             theme="primary"
             shape="round"
             size="small"
             :disabled="!question.trim()"
-            :loading="chat.asking"
             @click="submit"
           >
             提问
@@ -432,6 +482,31 @@ function stepList(e: ChatEntry): string[] {
   white-space: pre-wrap;
 }
 
+/* 行内引用角标（[1] [2]） */
+.answer :deep(.cite) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  margin: 0 1px;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--brand-weak);
+  color: var(--primary);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  vertical-align: super;
+  cursor: pointer;
+  user-select: none;
+}
+
+.answer :deep(.cite:hover) {
+  background: var(--primary);
+  color: #fff;
+}
+
 .pending {
   display: flex;
   align-items: center;
@@ -443,6 +518,49 @@ function stepList(e: ChatEntry): string[] {
 
 .entry-alert {
   margin: 8px 0;
+}
+
+.pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
+}
+
+.stop-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.stop-inline:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.pending.stopped {
+  color: var(--text-3);
 }
 
 .trace-line {
@@ -482,6 +600,28 @@ function stepList(e: ChatEntry): string[] {
   color: var(--warning);
   margin-top: 8px;
   line-height: 1.7;
+}
+
+.reasoning {
+  margin: 4px 0 8px;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+.reasoning summary {
+  cursor: pointer;
+}
+
+.reasoning pre {
+  margin: 6px 0 0;
+  padding: 8px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  white-space: pre-wrap;
+  font-family: var(--font-sans);
+  line-height: 1.7;
+  color: var(--text-2);
 }
 
 .answer-bar {

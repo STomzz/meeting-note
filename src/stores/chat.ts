@@ -1,11 +1,17 @@
 import { defineStore } from 'pinia'
 import { retrievalAdapter } from '../platform/retrieval'
-import type { Answer, RetrievalStatus } from '../core/retrieval'
+import type { Answer, QaStreamEvent, RetrievalStatus } from '../core/retrieval'
 
 export interface ChatEntry {
   id: number
   question: string
   pending: boolean
+  /** 正在逐字生成（可停止） */
+  streaming?: boolean
+  /** 用户手动停止过 */
+  stopped?: boolean
+  /** 思考过程（部分模型返回 reasoning_content） */
+  reasoning?: string
   answer?: Answer
   error?: string
 }
@@ -18,6 +24,8 @@ export const useChatStore = defineStore('chat', {
     status: null as RetrievalStatus | null,
     statusError: '',
     asking: false,
+    /** 有任意一条正在流式生成 */
+    streaming: false,
     building: false,
     buildMessage: '',
   }),
@@ -50,30 +58,80 @@ export const useChatStore = defineStore('chat', {
       if (!q || this.asking) return
       const entry: ChatEntry = { id: seq++, question: q, pending: true }
       this.entries.push(entry)
-      await this.run(entry)
+      await this.runStream(entry)
     },
 
     /** 重新生成：清掉该条答案原地重跑（历史与顺序不变）。 */
     async askAgain(entry: ChatEntry) {
       if (this.asking) return
-      entry.answer = undefined
-      entry.error = ''
-      entry.pending = true
-      await this.run(entry)
+      await this.runStream(entry)
     },
 
-    /** 公共执行：置 pending → 请求 → 收尾刷新状态。 */
-    async run(entry: ChatEntry) {
+    /** 流式跑一次问答：检索 → 逐字 → 收尾；期间可 `stop()`。 */
+    async runStream(entry: ChatEntry) {
       this.asking = true
+      this.streaming = true
+      entry.pending = true
+      entry.streaming = false
+      entry.stopped = false
+      entry.error = ''
+      entry.reasoning = ''
+      entry.answer = undefined
       try {
-        entry.answer = await retrievalAdapter().ask(entry.question)
-        entry.error = ''
+        entry.answer = await retrievalAdapter().askStream(entry.question, (ev) =>
+          this.applyEvent(entry, ev),
+        )
       } catch (e) {
         entry.error = String(e)
       } finally {
         entry.pending = false
+        entry.streaming = false
+        this.streaming = false
         this.asking = false
         await this.loadStatus()
+      }
+    },
+
+    /** 把流式事件折进条目：回答边生成边渲染。 */
+    applyEvent(entry: ChatEntry, ev: QaStreamEvent) {
+      switch (ev.type) {
+        case 'retrieved':
+          entry.pending = false
+          entry.streaming = true
+          entry.answer = {
+            question: ev.question,
+            answer: '',
+            sources: ev.sources,
+            trace: ev.trace,
+            model: ev.model,
+            elapsedMs: 0,
+            completionTokens: null,
+          }
+          return
+        case 'delta':
+          entry.pending = false
+          entry.streaming = true
+          if (entry.answer) entry.answer.answer += ev.text
+          return
+        case 'reasoning':
+          entry.reasoning = `${entry.reasoning ?? ''}${ev.text}`
+          return
+        default:
+          entry.answer = ev.answer
+          entry.pending = false
+          entry.streaming = false
+      }
+    },
+
+    /** 停止生成：保留已生成的部分，标记 stopped。 */
+    async stop() {
+      if (!this.streaming) return
+      const last = [...this.entries].reverse().find((e) => e.streaming)
+      if (last) last.stopped = true
+      try {
+        await retrievalAdapter().cancel()
+      } catch {
+        // 取消失败不影响前端收尾（响应结束后会自然停止）
       }
     },
 

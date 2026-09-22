@@ -10,7 +10,7 @@ use bnu_core::meetings::{self, Meeting, MeetingDetail, Segment, SegmentStat};
 use bnu_core::minutes::{self, MinutesOutcome};
 use bnu_core::models::{self, ModelConfig, PublicModelConfig};
 use bnu_core::notes::{self, FolderInfo, NoteMeta, ScanStats, SearchHit};
-use bnu_core::qa::{self, Answer};
+use bnu_core::qa::{self, Answer, QaEvent};
 use bnu_core::rate_limit::{RateLimiter, RATE_LIMIT_PER_MINUTE};
 use bnu_core::retrieval::{self, RetrievalStatus};
 use bnu_core::rusqlite::{Connection, Result as SqlResult};
@@ -20,6 +20,7 @@ use bnu_core::vectors::{self, EmbedProgress};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::ipc::Channel;
 use tauri::{Emitter, Manager, State};
 
 mod webview_permissions;
@@ -35,6 +36,10 @@ struct AppState {
     cancel_graph: Arc<AtomicBool>,
     /// 会议笔记「一键处理」的取消标志
     cancel_meeting_note: Arc<AtomicBool>,
+    /// 问答流式生成的取消标志
+    cancel_qa: Arc<AtomicBool>,
+    /// 应用数据目录（聊天历史等 JSON 落在这里）
+    data_dir: PathBuf,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -295,6 +300,36 @@ async fn ask_question(
     qa::answer(&state.conn, &cfg, &question, top_k.unwrap_or(6))
         .await
         .map_err(err)
+}
+
+/// 流式问答：检索完成后用 Channel 逐字推送增量，`qa_cancel` 可中途停止。
+#[tauri::command]
+async fn ask_question_stream(
+    question: String,
+    top_k: Option<usize>,
+    on_event: Channel<QaEvent>,
+    state: State<'_, AppState>,
+) -> Result<Answer, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    let cancel = state.cancel_qa.clone();
+    cancel.store(false, Ordering::SeqCst);
+    qa::answer_stream(&state.conn, &cfg, &question, top_k.unwrap_or(6), move |ev| {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        on_event.send(ev).is_ok()
+    })
+    .await
+    .map_err(err)
+}
+
+/// 请求停止当前流式问答（下一次增量检查时生效）。
+#[tauri::command]
+fn qa_cancel(state: State<'_, AppState>) {
+    state.cancel_qa.store(true, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +778,8 @@ pub fn run() {
                 cancel_transcribe: Arc::new(AtomicBool::new(false)),
                 cancel_graph: Arc::new(AtomicBool::new(false)),
                 cancel_meeting_note: Arc::new(AtomicBool::new(false)),
+                cancel_qa: Arc::new(AtomicBool::new(false)),
+                data_dir,
             });
 
             // Windows(WebView2)：显式放行本应用页面的麦克风/摄像头，否则窗口里的
@@ -777,6 +814,8 @@ pub fn run() {
             retrieval_status,
             build_vector_index,
             ask_question,
+            ask_question_stream,
+            qa_cancel,
             meeting_create,
             meeting_list,
             meeting_detail,

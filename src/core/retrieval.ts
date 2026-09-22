@@ -39,6 +39,19 @@ export interface Answer {
   completionTokens: number | null
 }
 
+/** 流式问答事件（对应 Rust 侧 `QaEvent`，serde 的 tag = type）。 */
+export type QaStreamEvent =
+  | {
+      type: 'retrieved'
+      question: string
+      model: string
+      sources: RetrievedChunk[]
+      trace: RetrievalTrace
+    }
+  | { type: 'delta'; text: string }
+  | { type: 'reasoning'; text: string }
+  | { type: 'done'; answer: Answer }
+
 export interface RetrievalStatus {
   chunks: number
   vectors: number
