@@ -41,18 +41,17 @@ const editorEl = ref<HTMLTextAreaElement | null>(null)
 const blockEditorEl = ref<InstanceType<typeof BlockEditor> | null>(null)
 
 /**
- * 编辑器形态：
- * - edit：块编辑（所见即所得，默认）——点段落即改；
- * - preview：只读渲染（怕误改的时候用）；
+ * 编辑器形态（两种，v0.3.5 起去掉「预览」——它和块编辑的排版完全一样，冗余）：
+ * - edit：块编辑（所见即所得，默认）——点段落即改，其余段落就是最终排版；
  * - source：md 原文（textarea，行首 `/v` 有录音选择器）。
  */
 const EDITOR_KEY = 'bnu-notes-editor-mode'
-type EditorMode = 'edit' | 'preview' | 'source'
+type EditorMode = 'edit' | 'source'
 
 function readEditorMode(): EditorMode {
   const saved = localStorage.getItem(EDITOR_KEY)
-  if (saved === 'source' || saved === 'preview') return saved
-  return 'edit' // 兼容早先存的 'wysiwyg'
+  if (saved === 'source') return saved
+  return 'edit' // 兼容早先存的 'wysiwyg' / 'preview'（预览已并入块编辑）
 }
 
 const editorMode = ref<EditorMode>(readEditorMode())
@@ -458,7 +457,7 @@ const slashMatches = computed(() => filterRefOptions(clipOptions.value, slashFil
 const editorRefOptions = computed(() => clipOptions.value)
 
 
-/** 是否用块编辑（edit / preview），false = 源码 textarea。 */
+/** 是否用块编辑，false = 源码 textarea。 */
 const useBlockEditor = computed(() => editorMode.value !== 'source')
 
 // 每次存盘后刷新引用列表：删掉一行 `/v` 后，「未引用」要跟着变回未引用
@@ -522,7 +521,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
-/** 录音面板写入的引用：插到光标处（预览模式下追加到正文末尾）。 */
+/** 录音面板写入的引用：插到光标处（没有正在编辑的段落时：插到纪要标题前 / 文末）。 */
 watch(
   () => meeting.pendingRef,
   async (pending) => {
@@ -860,7 +859,6 @@ async function removeCurrent() {
             >
             <t-radio-group v-model="editorMode" size="small" variant="default-filled">
               <t-radio-button value="edit">编辑</t-radio-button>
-              <t-radio-button value="preview">预览</t-radio-button>
               <t-radio-button value="source">源码</t-radio-button>
             </t-radio-group>
             <t-button size="small" theme="danger" variant="text" @click="removeCurrent"
@@ -919,7 +917,6 @@ async function removeCurrent() {
               ref="blockEditorEl"
               :content="store.content"
               :render="renderBlock"
-              :editable="editorMode === 'edit'"
               :ref-options="editorRefOptions"
               @update:content="store.setContent"
             />

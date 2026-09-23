@@ -65,6 +65,50 @@ $ANDROID_HOME/build-tools/35.0.0/apksigner sign --ks ~/.android/bnu-notes.keysto
 产物已确认：ABI 仅 `arm64-v8a`，签名证书 `CN=BNU Notes`，`libbnu_notes_lib.so` 为**生产模式**
 （内嵌前端资源，不依赖 `localhost:1420` 开发服务器）。
 
+## 图标
+
+v0.3.5 起换成新图标（z-image-turbo 生成 → 处理成三张源图 → `tauri icon` 一把出全平台）：
+
+- 源图与 manifest 放在仓库外（临时目录即可），结构是：
+  `{ "default": "app-icon.png", "android_bg": "app-icon-bg.png", "android_fg": "app-icon-fg.png", "android_fg_scale": 100 }`；
+- 重新生成：
+
+```bash
+npx tauri icon /path/to/manifest.json
+# → src-tauri/icons/*（Windows .ico/.png、macOS .icns）
+# → src-tauri/gen/android/app/src/main/res/mipmap-*/（ic_launcher、_round、_foreground、_background）
+# → mipmap-anydpi-v26/ic_launcher.xml（自适应图标：背景层 + 前景层）
+```
+
+- 安卓自适应图标三件套说明：**背景层**（渐变满铺）+**前景层**（白页 + 声波，内容约占 62%，落在 66% 安全区内）
+  + `mipmap-anydpi-v26/ic_launcher.xml` 引用两者；旧版 `ic_launcher.png`（API < 26）用同一张满铺方图。
+
+## Release 里带 APK
+
+两条路，任选：
+
+**① 本地出包 + 上传（立刻可用）**
+
+```bash
+gh auth login                      # 一次性：需要 repo 权限
+bash scripts/release-android.sh v0.3.5
+# 构建 → 复制到 /tmp/opencode 与桌面 → `gh release upload v0.3.5 bnu-notes-0.3.5.apk --clobber`
+```
+
+**② CI 自动出包（加一次 secrets，之后每个 tag 自动挂）**
+
+在仓库 Settings → Secrets and variables → Actions 加 4 个 secrets：
+
+| secret | 取值 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | `base64 -w0 ~/.android/bnu-notes.keystore` 的输出 |
+| `ANDROID_KEYSTORE_PASSWORD` | `keystore.properties` 里的 `storePassword` |
+| `ANDROID_KEY_ALIAS` | `keystore.properties` 里的 `keyAlias` |
+| `ANDROID_KEY_PASSWORD` | `keystore.properties` 里的 `keyPassword` |
+
+配好后推 `v*` tag：`windows-build` 出安装包、`android-build` 出 APK，两个 job 把资产挂到同一个 Release。
+**缺 secret 时 android-build 自动跳过**（不会让 Release 失败）；密钥库仍然只存在你本机 + GitHub secrets，不入库。
+
 ## 安装与验证清单
 
 1. 把 APK 传到手机（`/mnt/c/Users/<你>/Desktop/` 里的副本直接拖进手机，或 `adb install -r bnu-notes.apk`）；
@@ -72,7 +116,7 @@ $ANDROID_HOME/build-tools/35.0.0/apksigner sign --ks ~/.android/bnu-notes.keysto
 3. 打开 App → 先在**设置**里填「API 地址 + Key」（与桌面端一致；手机需要能访问模型网关）；
 4. **会议笔记** 页 → 新建 / 打开一篇笔记 → 右下角「录音」胶囊 → 展开面板选「记到」→「开始录音」→
    说话（胶囊上红点 + 计时 + 波形）→「停止录音」（不会自动插入引用）→ 点面板上的「插入引用」，
-   或到笔记工具栏「N 段」/ 输入行首 `/v` 选择；切「预览」可试听（前台录音 + Wake Lock）；
+   或到笔记工具栏「N 段」/ 输入行首 `/v` 选择；引用行本身就是播放器，点一下就能试听（前台录音 + Wake Lock）；
    编辑后约 0.8 秒自动保存（标题栏出现「已保存」角标）；
 4.1 触屏说明：树干上的「＋ / …」操作按钮在手机上常驻显示（没有 hover）；**长按**笔记可弹右键菜单
    （重命名 / 移动到…）；文件树拖拽只在桌面可用，手机请用「移动到…」；

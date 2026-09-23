@@ -614,6 +614,12 @@ defineExpose({ insertLines, locate })
 
 <style scoped>
 .blocks {
+  /* `.editor-body` 是横向 flex，本节点是它的 flex item：
+     不 fill 的话宽度会被算成「内容 max-content」——编辑时长行会被 textarea 的固有宽度
+     （cols=20 ≈ 412px）拖成半屏宽，写回后又弹回原宽，观感就是「半屏就换行、回车又变一行」。
+     这里让它始终占满编辑列（宽度只由面板决定，不由内容决定）。 */
+  flex: 1 1 auto;
+  min-width: 0;
   padding: 6px 18px 40px;
 }
 

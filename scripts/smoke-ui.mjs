@@ -304,10 +304,33 @@ await sleep(1200)
 const saved = (await text('.panel')) ?? ''
 check('停止后给出已保存卡片与「插入引用」', saved.includes('已保存') && saved.includes('插入引用'), saved.slice(0, 80))
 
-await clickText('预览', '.t-radio-button')
+// （v0.3.5 去掉了「预览」：块编辑本身就是最终排版，这里改测「编辑态宽度 == 渲染态宽度」）
+await clickText('编辑', '.t-radio-button')
 await sleep(400)
 await click('.blocks .blk', 1)
-check('预览形态点段落不进编辑', (await count('.blk-ta')) === 0)
+await click('.blocks .blk', 1)
+await sleep(300)
+const widthPair = await page.evaluate(() => {
+  const ta = document.querySelector('.blk-ta')
+  const bodies = document.querySelectorAll('.blocks .blk.md-body')
+  const body = bodies[1] ?? bodies[0]
+  const bodyCs = body ? getComputedStyle(body) : null
+  return {
+    // textarea 没有内边距，所以和渲染块「去掉左右 padding 的内容宽」比
+    edit: +ta.getBoundingClientRect().width.toFixed(1),
+    render: body
+      ? +(body.getBoundingClientRect().width - parseFloat(bodyCs.paddingLeft) - parseFloat(bodyCs.paddingRight)).toFixed(1)
+      : -1,
+    pane: +document.querySelector('.editor-body').getBoundingClientRect().width.toFixed(1),
+  }
+})
+check(
+  '编辑态与渲染态同宽（不再「半屏就换行」）',
+  Math.abs(widthPair.edit - widthPair.render) <= 1 && widthPair.edit > widthPair.pane * 0.8,
+  JSON.stringify(widthPair),
+)
+await page.keyboard.press('Escape')
+await sleep(200)
 await clickText('源码', '.t-radio-button')
 await sleep(500)
 check('源码形态出现 textarea', (await count('textarea.editor')) === 1)
