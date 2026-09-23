@@ -17,9 +17,18 @@ const targetLabel = computed(
   () => store.targetOptions.find((o) => o.value === store.targetNoteId)?.label ?? '',
 )
 
+/** 本场（当前录音目录）已经存下的分段数。 */
+const sessionCount = computed(() =>
+  store.recordDir
+    ? store.recentClips.filter((c) => c.dir === store.recordDir).length
+    : store.recentClips.length,
+)
+
+/** 插入本场的长语音引用（一条 = 一整场，播放器自己连播分段）。 */
 async function insertLast() {
-  if (!store.lastClip) return
-  await store.insertClip(store.lastClip)
+  const dir = store.lastClip?.dir || store.recordDir
+  if (!dir) return
+  await store.insertSessionRef(dir)
 }
 </script>
 
@@ -61,7 +70,12 @@ async function insertLast() {
         </div>
         <div class="sub">
           <span class="chip">第 {{ store.recordSeq }} 段</span>
-          <span class="chip">已存 {{ store.recentClips.length }} 段</span>
+          <span class="chip">已存 {{ sessionCount }} 段</span>
+          <span v-if="store.transcribeDone || store.transcribeFailed" class="chip">
+            转写 {{ store.transcribeDone }}<template v-if="store.transcribeFailed">
+              · 失败 {{ store.transcribeFailed }}</template
+            >
+          </span>
           <span class="where" :title="targetLabel">· {{ targetLabel }}</span>
         </div>
       </template>
@@ -99,10 +113,16 @@ async function insertLast() {
 
         <div v-if="store.lastClip" class="saved">
           <t-icon class="saved-icon" name="check-circle" size="13px" />
-          <span class="saved-text" :title="store.lastClip.path">
-            第 {{ store.lastClip.seq }} 段已保存
+          <span class="saved-text" :title="store.lastClip.dir">
+            本场已存 {{ sessionCount }} 段
           </span>
-          <button class="link" @click="insertLast">插入引用</button>
+          <button class="link" title="插入一行整场引用（一条长语音）" @click="insertLast">
+            插入整场
+          </button>
+        </div>
+
+        <div v-if="store.transcribeHint" class="sub">
+          <span class="chip">{{ store.transcribeHint }}</span>
         </div>
       </template>
 

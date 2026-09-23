@@ -1,11 +1,13 @@
-//! vault 内的录音片段：`<vault>/会议音频/<笔记路径>/seg_0001.wav`
+//! vault 内的录音片段：`<vault>/会议音频/<笔记路径>/<场次>/seg_0001.wav`
 //!
 //! 与旧会议模块（应用数据目录 + `meetings` 表）不同，这里**文件即数据**：
-//! - 音频目录与笔记路径一一对应：`会议/周会.md` → `会议音频/会议/周会/seg_0001.wav`，
-//!   一眼能看出录音属于哪篇 md（前端只传 `noteId`，避免两边各写一套规则）；
-//! - 旧版（0.1.x）的扁平目录 `会议音频/周会/` 仍会被列出（见 [`dir_for_note_legacy`]），
-//!   保证历史引用与已有录音不失效；
-//! - 分段按序号命名，序号 = 新旧目录里已有的最大值 + 1；
+//! - 音频目录与笔记路径一一对应：`会议/周会.md` → `会议音频/会议/周会/`；
+//!   一次录音（开始 → 停止）落在**一个场次子目录**里，如 `.../会议/周会/20260923-1430/seg_0001.wav`；
+//! - 场次子目录可直接当引用用（`/v 会议音频/会议/周会/20260923-1430/`）= **一条长语音**，
+//!   播放器按序号连播，笔记里只占一行（见 `meeting_note::resolve_ref`）；
+//! - 旧版（0.1.x）的扁平目录 `会议音频/周会/seg_0001.wav` 仍会被列出（见 [`dir_for_note_legacy`]），
+//!   保证历史引用与已有录音不失效；它们没有场次（`session` 为空串）；
+//! - 分段按序号命名，序号 = 同一目录里已有的最大值 + 1；
 //! - 时长直接读 WAV 头算，不落库；
 //! - 所有路径都限制在 vault 内（拒绝绝对路径与 `..`）。
 
@@ -24,12 +26,14 @@ pub const SEG_PREFIX: &str = "seg_";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipInfo {
-    /// 相对 `会议音频/` 的目录（一般对应一篇会议笔记）
+    /// 相对 `会议音频/` 的目录（新录音 = 笔记目录 + 场次子目录）
     pub dir: String,
     pub file: String,
     /// vault 相对路径（可直接写进 `/v` 引用）
     pub path: String,
     pub seq: i64,
+    /// 场次 id（`20260923-1430`）；旧版扁平目录为空串
+    pub session: String,
     pub bytes: u64,
     pub duration_ms: u64,
     pub sample_rate: u32,
@@ -43,11 +47,89 @@ pub struct ClipStat {
     pub file: String,
     pub path: String,
     pub seq: i64,
+    /// 场次 id（`20260923-1430`）；旧版扁平目录为空串
+    pub session: String,
     pub bytes: u64,
     pub duration_ms: u64,
     pub sample_rate: u32,
-    /// 可直接插入笔记的引用行，如 `/v 会议音频/周会/seg_0001.wav`
+    /// 单段引用行，如 `/v 会议音频/周会/20260923-1430/seg_0001.wav`
     pub ref_line: String,
+    /// 整场引用行（一条长语音），如 `/v 会议音频/周会/20260923-1430/`
+    pub session_ref_line: String,
+}
+
+/// 场次里的一个分段（供目录引用的解析与播放器用）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegRef {
+    pub file: String,
+    /// vault 相对路径
+    pub path: String,
+    pub seq: i64,
+    pub bytes: u64,
+    pub duration_ms: u64,
+}
+
+/// 场次目录名：`YYYYMMDD-HHMM`（如 `20260923-1430`）。
+pub fn is_session_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 13
+        && b[8] == b'-'
+        && b
+            .iter()
+            .enumerate()
+            .all(|(i, c)| i == 8 || c.is_ascii_digit())
+}
+
+/// 目录属于哪个场次（不是场次目录 → 空串）。
+pub fn session_of_dir(dir: &str) -> String {
+    dir.rsplit('/')
+        .next()
+        .filter(|n| is_session_name(n))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 整场引用行：`/v 会议音频/<目录>/`（行尾斜杠 = 目录，播放器会连播里面所有分段）。
+pub fn session_ref_line(dir: &str) -> String {
+    format!("/v {AUDIO_DIR}/{}/", safe_rel(dir).unwrap_or_default())
+}
+
+/// 场次 id 兜底（前端一般传本地时间的 `YYYYMMDD-HHMM`；这里退化成 UTC 算一个）。
+pub fn session_id_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
+/// 天数（1970-01-01 起）→ (年, 月, 日)。Howard Hinnant 的 civil_from_days，免依赖。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 分段文件名 → 序号（不是 `seg_XXXX.wav` → None）。
+pub fn seg_seq(name: &str) -> Option<i64> {
+    name.strip_prefix(SEG_PREFIX)
+        .and_then(|s| s.strip_suffix(".wav"))
+        .and_then(|s| s.parse::<i64>().ok())
 }
 
 /// 笔记 id → 音频目录：与笔记路径一一对应（`会议/周会.md` → `会议/周会`）。
@@ -171,13 +253,8 @@ pub fn next_seq(vault: &Path, dir: &str) -> i64 {
     };
     let mut max = 0i64;
     for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if let Some(rest) = name.strip_prefix(SEG_PREFIX) {
-            if let Some(num) = rest.strip_suffix(".wav") {
-                if let Ok(n) = num.parse::<i64>() {
-                    max = max.max(n);
-                }
-            }
+        if let Some(n) = seg_seq(&e.file_name().to_string_lossy()) {
+            max = max.max(n);
         }
     }
     max + 1
@@ -192,22 +269,88 @@ pub fn next_seq_for_note(vault: &Path, note_id: &str) -> i64 {
         .unwrap_or(1)
 }
 
-/// 开始一篇笔记的录音分段：写进新目录（与笔记路径一一对应）。
-pub fn start_for_note(vault: &Path, note_id: &str, sample_rate: u32) -> Result<ClipStat> {
-    let dir = dir_for_note(note_id);
-    let seq = next_seq_for_note(vault, note_id);
+/// 开始一次录音（一个场次）：落进 `会议音频/<笔记目录>/<场次>/`，序号从 1 起。
+///
+/// 场次 id 由前端按本地时间给（`YYYYMMDD-HHMM`）；缺省/非法时用 UTC 兜底，
+/// 同一个场次目录重入（同一分钟里又点了开始）则接着已有序号往下排。
+pub fn start_for_note(
+    vault: &Path,
+    note_id: &str,
+    session: Option<&str>,
+    sample_rate: u32,
+) -> Result<ClipStat> {
+    let base = dir_for_note(note_id);
+    let session = match session.map(str::trim).filter(|s| is_session_name(s)) {
+        Some(s) => s.to_string(),
+        None => session_id_now(),
+    };
+    let dir = format!("{base}/{session}");
+    let seq = next_seq(vault, &dir);
     start(vault, &dir, seq, sample_rate)
 }
 
-/// 列出某篇笔记的录音（新目录 + 旧版目录，按目录与序号排序）。
+/// 列出某篇笔记的录音（新目录 + 其下所有场次 + 旧版目录，按目录与序号排序）。
 pub fn list_for_note(vault: &Path, note_id: &str) -> Result<Vec<ClipInfo>> {
     let dirs = dirs_for_note(note_id);
     let mut out: Vec<ClipInfo> = list(vault)?
         .into_iter()
-        .filter(|c| dirs.contains(&c.dir))
+        .filter(|c| dirs.iter().any(|d| dir_matches(&c.dir, d)))
         .collect();
     out.sort_by(|a, b| a.dir.cmp(&b.dir).then(a.seq.cmp(&b.seq)));
     Ok(out)
+}
+
+/// `dir` 是否就是 `base` 或 `base` 下的一场（`会议/周会` 匹配 `会议/周会/20260923-1430`）。
+pub fn dir_matches(dir: &str, base: &str) -> bool {
+    dir == base || dir.starts_with(&format!("{base}/"))
+}
+
+/// 某个场次目录下的分段（**只取直接子文件**，按序号；旧版扁平目录同样适用）。
+pub fn session_segments(vault: &Path, dir: &str) -> Vec<SegRef> {
+    let Ok(path) = clip_dir(vault, dir, false) else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(&path) else {
+        return Vec::new();
+    };
+    let dir_rel = safe_rel(dir).unwrap_or_default();
+    let mut out: Vec<SegRef> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(seq) = seg_seq(&name) else { continue };
+        if !e.path().is_file() {
+            continue;
+        }
+        let (_, duration_ms) = wav_meta(&e.path());
+        out.push(SegRef {
+            file: name.clone(),
+            path: format!("{AUDIO_DIR}/{dir_rel}/{name}"),
+            seq,
+            bytes: e.metadata().map(|m| m.len()).unwrap_or(0),
+            duration_ms,
+        });
+    }
+    out.sort_by_key(|s| s.seq);
+    out
+}
+
+/// 解析 `会议音频/` 下的一个音频文件（相对 vault 的路径）→ (绝对路径, 规范化相对路径)。
+pub fn resolve_clip_file(vault: &Path, rel: &str) -> Option<(PathBuf, String)> {
+    let rel = rel.trim().replace('\\', "/");
+    let rest = rel.strip_prefix(&format!("{AUDIO_DIR}/"))?;
+    if !rest.ends_with(".wav") {
+        return None;
+    }
+    let (dir, file) = rest.rsplit_once('/')?;
+    if file.is_empty() || file == "." || file == ".." || file.contains('\\') {
+        return None;
+    }
+    let dir = safe_rel(dir).ok()?;
+    let abs = clip_dir(vault, &dir, false).ok()?.join(file);
+    if !abs.is_file() {
+        return None;
+    }
+    Some((abs, format!("{AUDIO_DIR}/{dir}/{file}")))
 }
 
 /// 按 vault 相对路径删除一个分段（只允许 `会议音频/` 下、`seg_*.wav` 形式）。
@@ -235,15 +378,19 @@ fn stat_of(vault: &Path, dir: &str, seq: i64) -> Result<ClipStat> {
     let path = seg_path(vault, dir, seq)?;
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let (sample_rate, duration_ms) = wav_meta(&path);
+    let dir = safe_rel(dir)?;
+    let rel = rel_path(&dir, seq);
     Ok(ClipStat {
-        dir: safe_rel(dir)?,
+        session: session_of_dir(&dir),
+        session_ref_line: session_ref_line(&dir),
         file: seg_file(seq),
-        path: rel_path(dir, seq),
+        path: rel.clone(),
+        dir,
         seq,
         bytes,
         duration_ms,
         sample_rate,
-        ref_line: format!("/v {}", rel_path(dir, seq)),
+        ref_line: format!("/v {rel}"),
     })
 }
 
@@ -360,14 +507,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<ClipInfo>) -> Resul
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(SEG_PREFIX) || !name.ends_with(".wav") {
-            continue;
-        }
-        let Some(seq) = name
-            .strip_prefix(SEG_PREFIX)
-            .and_then(|s| s.strip_suffix(".wav"))
-            .and_then(|s| s.parse::<i64>().ok())
-        else {
+        let Some(seq) = seg_seq(&name) else {
             continue;
         };
         let dir_rel = path
@@ -385,6 +525,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<ClipInfo>) -> Resul
             .unwrap_or(0);
         let (sample_rate, duration_ms) = wav_meta(&path);
         out.push(ClipInfo {
+            session: session_of_dir(&dir_rel),
             dir: dir_rel.clone(),
             file: name.clone(),
             path: format!("{AUDIO_DIR}/{dir_rel}/{name}"),
@@ -432,25 +573,72 @@ mod tests {
         start(vault, "周会", 1, 16_000).unwrap();
         close(vault, "周会", 1).unwrap();
 
-        // 新录音：写进与笔记路径对应的新目录，序号接在旧录音之后
-        let s = start_for_note(vault, note, 16_000).unwrap();
-        assert_eq!(s.dir, "会议/周会");
-        assert_eq!(s.seq, 2);
+        // 新录音：落进「笔记目录 + 场次」，同一个场次里序号递增
+        let s = start_for_note(vault, note, Some("20260922-1000"), 16_000).unwrap();
+        assert_eq!(s.dir, "会议/周会/20260922-1000");
+        assert_eq!(s.session, "20260922-1000");
+        assert_eq!(s.seq, 1);
+        assert_eq!(s.ref_line, "/v 会议音频/会议/周会/20260922-1000/seg_0001.wav");
+        assert_eq!(s.session_ref_line, "/v 会议音频/会议/周会/20260922-1000/");
         append(vault, &s.dir, s.seq, &[0u8; 3200]).unwrap();
         close(vault, &s.dir, s.seq).unwrap();
 
+        // 同一场次继续录 → 序号 +1；换一场 → 重新从 1 起
+        let s2 = start_for_note(vault, note, Some("20260922-1000"), 16_000).unwrap();
+        assert_eq!(s2.seq, 2);
+        let s3 = start_for_note(vault, note, Some("20260923-0900"), 16_000).unwrap();
+        assert_eq!(s3.dir, "会议/周会/20260923-0900");
+        assert_eq!(s3.seq, 1);
+
         let clips = list_for_note(vault, note).unwrap();
-        assert_eq!(clips.len(), 2, "新旧目录的录音都要列出来：{clips:?}");
+        assert_eq!(clips.len(), 4, "旧目录 + 两个场次的分段都要列出来：{clips:?}");
         assert!(clips.iter().any(|c| c.path == "会议音频/周会/seg_0001.wav"));
         assert!(clips
             .iter()
-            .any(|c| c.path == "会议音频/会议/周会/seg_0002.wav"));
+            .any(|c| c.path == "会议音频/会议/周会/20260922-1000/seg_0001.wav"));
+        assert!(clips
+            .iter()
+            .any(|c| c.path == "会议音频/会议/周会/20260922-1000/seg_0002.wav"));
+        assert!(clips
+            .iter()
+            .any(|c| c.path == "会议音频/会议/周会/20260923-0900/seg_0001.wav"));
+        // 旧版扁平录音没有场次
+        let legacy = clips.iter().find(|c| c.dir == "周会").unwrap();
+        assert_eq!(legacy.session, "");
+
+        // 场次分段列表：只取直接子文件，按序号
+        let segs = session_segments(vault, "会议/周会/20260922-1000");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].seq, 1);
+        assert_eq!(segs[1].seq, 2);
+        assert_eq!(segs[0].path, "会议音频/会议/周会/20260922-1000/seg_0001.wav");
+        // 没有场次子目录不会混进外面旧版扁平录音
+        assert_eq!(session_segments(vault, "会议/周会").len(), 0);
 
         // 按路径删除：只允许 会议音频/ 下的分段
-        remove_path(vault, "会议音频/会议/周会/seg_0002.wav").unwrap();
-        assert_eq!(list_for_note(vault, note).unwrap().len(), 1);
+        remove_path(vault, "会议音频/会议/周会/20260922-1000/seg_0001.wav").unwrap();
+        assert_eq!(list_for_note(vault, note).unwrap().len(), 3);
         assert!(remove_path(vault, "../evil.wav").is_err());
         assert!(remove_path(vault, "笔记.md").is_err());
+        // 单文件转写的入口只认 会议音频/ 下的 wav
+        assert!(resolve_clip_file(vault, "会议音频/会议/周会/20260922-1000/seg_0002.wav").is_some());
+        assert!(resolve_clip_file(vault, "笔记.md").is_none());
+        assert!(resolve_clip_file(vault, "会议音频/../../evil.wav").is_none());
+    }
+
+    #[test]
+    fn session_names_and_ref_line() {
+        assert!(is_session_name("20260923-1430"));
+        assert!(!is_session_name("20260923"));
+        assert!(!is_session_name("2026092-1430"));
+        assert!(!is_session_name("会议/周会"));
+        assert_eq!(session_of_dir("会议/周会/20260923-1430"), "20260923-1430");
+        assert_eq!(session_of_dir("会议/周会"), "");
+        assert_eq!(session_of_dir("周会"), "");
+        assert_eq!(session_ref_line("会议/周会/20260923-1430"), "/v 会议音频/会议/周会/20260923-1430/");
+        // 没有场次时兜底也能生成合法的 `YYYYMMDD-HHMM`
+        let now = session_id_now();
+        assert!(is_session_name(&now), "{now}");
     }
 
     #[test]

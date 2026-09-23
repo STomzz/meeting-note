@@ -227,6 +227,26 @@ function paramsPlaceholder(cap: Capability): string {
       </div>
 
       <div class="card">
+        <div class="card-title">录音与转写</div>
+        <div class="card-note">
+          录音按 4 分钟切成 WAV 存在 vault 里，一次录音 = 一个场次目录，笔记里只插一行引用
+          （播放器把整场当一条长语音连播）。开启自动转写后，每段刚录完就送去识别，
+          「一键处理」时就只剩纪要生成（快很多）；自动转写只写转写缓存，不动笔记正文。
+        </div>
+        <div class="switch-row">
+          <t-switch
+            :value="meeting.autoTranscribe"
+            @change="(v: unknown) => meeting.setAutoTranscribe(Boolean(v))"
+          />
+          <span class="switch-label">录音时自动转写（每段结束就转）</span>
+        </div>
+        <div class="card-note">
+          开启后录音过程中音频会直接发到「语音转写」端点（本机直连，不经中间服务器）；
+          不想边录边传就关掉，之后点「一键处理」仍会补转。
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-title">模型配置</div>
         <div class="card-note">
           所有请求由本机客户端直连端点，不经过任何中间服务器；API Key 用本机密钥加密后存进本地数据库。
@@ -260,7 +280,7 @@ function paramsPlaceholder(cap: Capability): string {
               <t-input
                 v-model="drafts[cap.key].baseUrl"
                 size="small"
-                placeholder="https://chatapi.bnu.edu.cn"
+                placeholder="https://chatapi.bnu.edu.cn/bnuapi"
               />
             </div>
             <div class="field">
@@ -392,6 +412,18 @@ function paramsPlaceholder(cap: Capability): string {
 </template>
 
 <style scoped>
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 2px;
+}
+
+.switch-label {
+  font-size: 13px;
+  color: var(--text-2);
+}
+
 .settings-body {
   padding: 18px;
   overflow: auto;

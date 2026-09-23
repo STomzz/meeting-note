@@ -52,12 +52,17 @@ const NOTE_BODY = [
 function fakeAdapter() {
   const notes = new Map<string, string>([[NOTE_ID, NOTE_BODY]])
   const clips: ClipInfo[] = []
-  const stat = (c: ClipInfo): ClipStat => ({ ...c, refLine: `/v ${c.path}` })
+  const stat = (c: ClipInfo): ClipStat => ({
+    ...c,
+    refLine: `/v ${c.path}`,
+    sessionRefLine: `/v 会议音频/${c.dir}/`,
+  })
   const calls = {
     closed: [] as number[],
     appended: 0,
     discarded: [] as string[],
     processed: [] as string[],
+    transcribed: [] as string[],
   }
   let progressCb: ((p: ProcessProgress) => void) | null = null
 
@@ -89,9 +94,19 @@ function fakeAdapter() {
               raw: '会议音频/2026-09-22 周会/seg_0001.wav',
               path: '会议音频/2026-09-22 周会/seg_0001.wav',
               fileName: 'seg_0001.wav',
+              kind: 'file',
               exists: true,
               bytes: 32000,
               durationMs: 1000,
+              segments: [
+                {
+                  file: 'seg_0001.wav',
+                  path: '会议音频/2026-09-22 周会/seg_0001.wav',
+                  seq: 1,
+                  bytes: 32000,
+                  durationMs: 1000,
+                },
+              ],
               hasTranscript: false,
               transcript: '',
             },
@@ -135,13 +150,15 @@ function fakeAdapter() {
     write: async (id, content) => {
       notes.set(id, content)
     },
-    clipStart: async (_noteId, sampleRate) => {
-      const seq = clips.length + 1
+    clipStart: async (_noteId, session, sampleRate) => {
+      const dir = `2026-09-22 周会/${session}`
+      const seq = clips.filter((c) => c.dir === dir).length + 1
       const clip: ClipInfo = {
-        dir: '2026-09-22 周会',
+        dir,
         file: `seg_${String(seq).padStart(4, '0')}.wav`,
-        path: `会议音频/2026-09-22 周会/seg_${String(seq).padStart(4, '0')}.wav`,
+        path: `会议音频/${dir}/seg_${String(seq).padStart(4, '0')}.wav`,
         seq,
+        session,
         bytes: 44,
         durationMs: 0,
         sampleRate,
@@ -150,21 +167,25 @@ function fakeAdapter() {
       clips.push(clip)
       return stat(clip)
     },
-    clipAppend: async (_noteId, seq) => {
+    clipAppend: async (dir, seq) => {
       calls.appended += 1
-      const clip = clips.find((c) => c.seq === seq)!
+      const clip = clips.find((c) => c.dir === dir && c.seq === seq)!
       clip.bytes += 32000
       clip.durationMs += 1000
       return stat(clip)
     },
-    clipClose: async (_noteId, seq) => {
+    clipClose: async (dir, seq) => {
       calls.closed.push(seq)
-      return stat(clips.find((c) => c.seq === seq)!)
+      return stat(clips.find((c) => c.dir === dir && c.seq === seq)!)
     },
     clipDiscard: async (path: string) => {
       calls.discarded.push(path)
     },
     clipList: async () => clips,
+    transcribeClip: async (path) => {
+      calls.transcribed.push(path)
+      return { status: 'cached', path, chars: 10, error: '' }
+    },
     audioSrc: async (p) => `asset://${p}`,
   }
   return { adapter, notes, clips, calls }
@@ -311,6 +332,48 @@ describe('会议笔记 store（录音面板）', () => {
     await store.discardClip(clip)
     expect(fake.calls.discarded).toEqual([clip.path])
     expect(store.recentClips).toHaveLength(0)
+  })
+
+  it('每段收尾就自动转写（只写缓存、不动笔记），一键处理前等它跑完', async () => {
+    const store = useMeetingNoteStore()
+    await store.loadList()
+    await store.openNote(NOTE_ID)
+    store.setTarget(NOTE_ID)
+    await store.startRecording()
+    // 4 分钟到：切段 → 收尾的那一段自动进转写队列
+    store.recordSegmentMs = 4 * 60 * 1000
+    await store.rotateSegment()
+    await store.waitTranscribeIdle()
+    expect(fake.calls.closed).toEqual([1])
+    expect(fake.calls.transcribed).toHaveLength(1)
+    expect(fake.calls.transcribed[0]).toMatch(
+      /^会议音频\/2026-09-22 周会\/\d{8}-\d{4}\/seg_0001\.wav$/,
+    )
+    expect(store.transcribeDone).toBe(1)
+    expect(store.transcribeFailed).toBe(0)
+    // 自动转写只碰缓存：笔记正文一个字都没变
+    expect(fake.notes.get(NOTE_ID)).toBe(NOTE_BODY)
+    await store.stopRecording()
+    await store.waitTranscribeIdle()
+    expect(fake.calls.transcribed).toHaveLength(2)
+  })
+
+  it('关掉开关后不再排队（已有队列不受影响）', async () => {
+    const store = useMeetingNoteStore()
+    store.setAutoTranscribe(false)
+    store.enqueueTranscribe('会议音频/会议/周会/20260923-1430/seg_0001.wav')
+    expect(store.transcribeQueue).toHaveLength(0)
+    expect(fake.calls.transcribed).toEqual([])
+    store.setAutoTranscribe(true)
+  })
+
+  it('插入整场引用：笔记没打开时追加 `/v …/<场次>/`（一条长语音）', async () => {
+    const store = useMeetingNoteStore()
+    store.setTarget(NOTE_ID)
+    await store.insertSessionRef('会议/周会/20260923-1430')
+    const body = fake.notes.get(NOTE_ID)!
+    expect(body).toContain('/v 会议音频/会议/周会/20260923-1430/')
+    expect(body.indexOf('/v 会议音频')).toBeLessThan(body.indexOf('## 会议纪要（AI 整理）'))
   })
 
   it('音频播放地址走适配器', async () => {

@@ -14,18 +14,24 @@ import { useNotesStore } from '../stores/notes'
 import { useMeetingNoteStore } from '../stores/meetingNote'
 import {
   clipCountsByNote,
-  dirsForNote,
+  clipsBelongToNote,
   dirForNote,
   formatBytes,
   formatDur,
+  groupClipsByDir,
   insertRefAtCursor,
+  isClipReferenced,
   prepareAudioRefs,
   replaceAudioPlaceholders,
   parseRefs,
+  sessionLabel,
+  sessionRefLine,
   slashCommandAt,
   unreferencedClips,
+  dirRelOfRef,
 } from '../core/meetingNote'
-import type { ClipInfo } from '../core/meetingNote'
+import type { AudioRef, ClipInfo } from '../core/meetingNote'
+import { SESSION_PLAYER_TAG } from '../core/sessionPlayer'
 import { filterRefOptions, refOptions, type RefOption } from '../core/refPicker'
 import { ancestorsOf, buildTreeRows } from '../core/notesTree'
 import { lineRangeOffset } from '../core/lines'
@@ -54,6 +60,10 @@ function readEditorMode(): EditorMode {
   return 'edit' // 兼容早先存的 'wysiwyg' / 'preview'（预览已并入块编辑）
 }
 
+/** 形态按钮上的符号（不用文字）：`[]` = 编辑（所见即所得），`</>` = 源码。 */
+const GLYPH_EDIT = '[]'
+const GLYPH_SOURCE = '</>'
+
 const editorMode = ref<EditorMode>(readEditorMode())
 watch(editorMode, (mode) => {
   try {
@@ -62,6 +72,28 @@ watch(editorMode, (mode) => {
     // 存不了不影响本次切换
   }
 })
+
+// ---------------------------------------------------------------- 左侧列表收起
+const LIST_KEY = 'bnu-notes-list-collapsed'
+
+function readListCollapsed(): boolean {
+  try {
+    return localStorage.getItem(LIST_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+const listCollapsed = ref(readListCollapsed())
+
+function setListCollapsed(collapsed: boolean) {
+  listCollapsed.value = collapsed
+  try {
+    localStorage.setItem(LIST_KEY, collapsed ? '1' : '0')
+  } catch {
+    // 存不了不影响本次切换
+  }
+}
 
 /** 保存状态角标文案（自动保存 + 手动保存共用）。 */
 const saveLabel = computed(() => {
@@ -312,20 +344,35 @@ const clipSrcMap = ref<Record<string, string | null>>({})
 const playing = ref('')
 const confirmDiscard = ref<ClipInfo | null>(null)
 
-/** 本笔记录音（新目录 + 旧版目录）。 */
+/** 本笔记录音（新目录 + 其下所有场次 + 旧版目录）。 */
 const currentClips = computed(() => {
   if (!store.currentId) return []
-  const dirs = dirsForNote(store.currentId)
-  return meeting.allClips
-    .filter((c) => dirs.includes(c.dir))
-    .sort((a, b) => a.dir.localeCompare(b.dir) || a.seq - b.seq)
+  return clipsBelongToNote(meeting.allClips, store.currentId).sort(
+    (a, b) => a.dir.localeCompare(b.dir) || a.seq - b.seq,
+  )
 })
 
-const refPathSet = computed(() => new Set(meeting.refs.map((r) => r.path)))
+/** 本笔记的录音按场次分组：一场 = 一条长语音（面板里一场一行 + 段明细）。 */
+const clipSessions = computed(() => groupClipsByDir(currentClips.value))
+
 const unrefClips = computed(() => unreferencedClips(currentClips.value, meeting.refs))
+const refSegCount = computed(() =>
+  meeting.refs.reduce((n, r) => n + Math.max(1, r.segments.length), 0),
+)
 
 function isRef(c: ClipInfo): boolean {
-  return refPathSet.value.has(c.path)
+  return isClipReferenced(c, meeting.refs)
+}
+
+/** 这一场是不是已经被「整场引用」了。 */
+function isSessionRef(dir: string): boolean {
+  return meeting.refs.some((r) => r.kind === 'session' && r.path === dir)
+}
+
+function sessionUnrefCount(dir: string): number {
+  const group = clipSessions.value.find((s) => s.dir === dir)
+  if (!group) return 0
+  return group.clips.filter((c) => !isRef(c)).length
 }
 
 async function playClip(c: ClipInfo) {
@@ -371,16 +418,32 @@ async function insertClipNow(c: ClipInfo) {
   await nextTick()
   await store.save()
   if (store.currentId) await meeting.openNote(store.currentId)
-  MessagePlugin.success('已插入引用（已保存）')
+  MessagePlugin.success('已插入这一段（已保存）')
+}
+
+/** 插入一整场（一条长语音）：笔记里只有一行，播放器自己连播所有分段。 */
+async function insertSessionNow(dir: string) {
+  insertLinesNow([sessionRefLine(dir)])
+  await nextTick()
+  await store.save()
+  if (store.currentId) await meeting.openNote(store.currentId)
+  MessagePlugin.success('已插入整场长语音（一行引用，已保存）')
+}
+
+/** 「插入全部未引用」按场次合并：一场一行（不再是一段一行）。 */
+function unrefSessionLines(): string[] {
+  return clipSessions.value
+    .filter((s) => s.clips.some((c) => !isRef(c)))
+    .map((s) => sessionRefLine(s.dir))
 }
 
 async function insertAllUnref() {
-  const lines = unrefClips.value.map((c) => `/v ${c.path}`)
+  const lines = unrefSessionLines()
   insertLinesNow(lines)
   await nextTick()
   await store.save()
   if (store.currentId) await meeting.openNote(store.currentId)
-  MessagePlugin.success(`已插入 ${lines.length} 条引用（已保存）`)
+  MessagePlugin.success(`已插入 ${lines.length} 场长语音（每场一行，已保存）`)
 }
 
 async function discardClip() {
@@ -421,7 +484,8 @@ async function runProcess() {
 }
 
 async function insertUnrefAndProcess() {
-  const lines = unrefList.value.map((c) => `/v ${c.path}`)
+  const dirs = [...new Set(unrefList.value.map((c) => c.dir))]
+  const lines = dirs.map((d) => sessionRefLine(d))
   insertLinesNow(lines)
   unrefDialog.value = false
   await nextTick()
@@ -447,7 +511,8 @@ const slashIndex = ref(0)
 const clipOptions = computed(() =>
   refOptions(meeting.clips, {
     ownDirs: new Set(currentClips.value.map((c) => c.dir)),
-    usedPaths: refPathSet.value,
+    usedPaths: new Set(meeting.refs.filter((r) => r.kind === 'file').map((r) => r.path)),
+    usedDirs: new Set(meeting.refs.filter((r) => r.kind === 'session').map((r) => r.path)),
   }),
 )
 
@@ -483,14 +548,43 @@ function renderBlock(body: string): string {
   return renderMarkdown(body)
 }
 
-/** 预览：把 `/v 音频` 行渲染成播放器（src 异步取，取不到时先显示文件名）。 */
+/** 渲染：`/v 音频` 行 → 播放器（整场引用是「一条长语音」，单文件仍是普通播放器）。 */
 function renderMarkdown(body: string): string {
   const html = md.render(prepareAudioRefs(body))
   return replaceAudioPlaceholders(html, (raw) => {
+    const ref = meeting.refs.find((r) => r.raw === raw)
+    if (ref && ref.kind === 'session' && ref.segments.length) return sessionPlayerHtml(ref)
+    if (!ref && raw.trim().endsWith('/')) {
+      // 引用列表还没加载完，或者刚插进编辑器还没存盘（存盘后引用表才会含这一行）：
+      // 先占位，别渲染成破播放器；目录里确实没分段了才提示。
+      const dir = dirRelOfRef(raw)
+      const hasClips = !!dir && meeting.allClips.some((c) => c.dir === dir)
+      if (hasClips || !meeting.refs.length) {
+        return `<p class="audio-ref session"><span class="audio-name">正在准备整场播放器…（${escapeHtml(raw)}）</span></p>`
+      }
+      // 引用列表有了、目录里也没有分段（被清空 / 改名了）
+      return `<p class="audio-ref session"><code>${escapeHtml(raw)}</code>（这场的分段不在，可能被删了）</p>`
+    }
     const src = resolveSrc(raw)
     if (!src) return `<p class="audio-ref"><code>${escapeHtml(raw)}</code>（暂不可播放）</p>`
     return `<p class="audio-ref"><audio controls preload="metadata" src="${escapeHtml(src)}"></audio><span class="audio-name">${escapeHtml(raw)}</span></p>`
   })
+}
+
+/** 整场引用 → 自定义元素播放器（播放地址异步取，取到后这次渲染就会带上它）。 */
+function sessionPlayerHtml(ref: AudioRef): string {
+  const srcs = ref.segments.map((s) => resolveSrc(s.path))
+  if (srcs.some((s) => !s)) {
+    return `<p class="audio-ref session"><span class="audio-name">正在准备整场播放器…（${escapeHtml(sessionLabel(ref.path))}）</span></p>`
+  }
+  const payload = JSON.stringify({
+    segments: ref.segments.map((s, i) => ({
+      src: srcs[i],
+      name: s.file,
+      durationMs: s.durationMs,
+    })),
+  })
+  return `<p class="audio-ref session"><${SESSION_PLAYER_TAG} data-no-edit data-playlist="${escapeHtml(payload)}" data-label="${escapeHtml(sessionLabel(ref.path))}"></${SESSION_PLAYER_TAG}></p>`
 }
 
 function escapeHtml(text: string): string {
@@ -664,6 +758,14 @@ async function removeCurrent() {
 <template>
   <div class="page">
     <header class="page-header">
+      <button
+        v-if="listCollapsed"
+        class="icon-btn pane-btn"
+        title="展开笔记列表"
+        @click="setListCollapsed(false)"
+      >
+        <t-icon name="chevron-right" size="16px" />
+      </button>
       <span class="page-title">会议笔记</span>
       <span class="page-sub" :title="store.vault">{{ store.vault }}</span>
       <span v-if="store.scanMessage" class="scan-msg">{{ store.scanMessage }}</span>
@@ -675,7 +777,7 @@ async function removeCurrent() {
       <t-button size="small" :loading="store.scanning" @click="store.scan()">扫描 vault</t-button>
     </header>
 
-    <div class="notes">
+    <div class="notes" :class="{ 'list-collapsed': listCollapsed }">
       <aside class="list-pane">
         <div class="list-head">
           <t-input
@@ -686,6 +788,9 @@ async function removeCurrent() {
             @enter="onSearch"
             @clear="onSearch"
           />
+          <button class="icon-btn pane-btn" title="收起笔记列表" @click="setListCollapsed(true)">
+            <t-icon name="chevron-left" size="16px" />
+          </button>
         </div>
         <div class="list-actions">
           <t-button size="small" theme="primary" @click="startNewNote(store.current?.folder ?? '')">
@@ -837,7 +942,7 @@ async function removeCurrent() {
                 :loading="meeting.processing"
                 @click="processCurrent(false)"
               >
-                一键处理（{{ refCount }} 段录音）
+                一键处理（{{ refCount }} 处 · {{ refSegCount }} 段）
               </t-button>
               <t-popup
                 trigger="hover"
@@ -857,17 +962,31 @@ async function removeCurrent() {
             <t-button size="small" :disabled="!store.dirty" theme="primary" @click="saveCurrent()"
               >保存</t-button
             >
-            <t-radio-group v-model="editorMode" size="small" variant="default-filled">
-              <t-radio-button value="edit">编辑</t-radio-button>
-              <t-radio-button value="source">源码</t-radio-button>
-            </t-radio-group>
+            <div class="mode-switch" role="group" aria-label="编辑器形态">
+              <button
+                class="mode-part"
+                :class="{ on: editorMode === 'edit' }"
+                :title="`编辑：所见即所得（${GLYPH_EDIT}）`"
+                @click="editorMode = 'edit'"
+              >
+                {{ GLYPH_EDIT }}
+              </button>
+              <button
+                class="mode-part"
+                :class="{ on: editorMode === 'source' }"
+                :title="`源码：Markdown 原文（${GLYPH_SOURCE}）`"
+                @click="editorMode = 'source'"
+              >
+                {{ GLYPH_SOURCE }}
+              </button>
+            </div>
             <t-button size="small" theme="danger" variant="text" @click="removeCurrent"
               >删除</t-button
             >
           </div>
 
-          <!-- 本笔记录音 -->
-          <div v-if="showClips && currentClips.length" class="clips-panel">
+          <!-- 本笔记录音（按场次分组：一场 = 一条长语音） -->
+          <div v-if="showClips && clipSessions.length" class="clips-panel">
             <div class="clips-head">
               <span class="clips-title">
                 本笔记录音 · <code>会议音频/{{ dirForNote(store.currentId) }}</code>
@@ -880,30 +999,58 @@ async function removeCurrent() {
                 variant="outline"
                 @click="insertAllUnref"
               >
-                插入全部未引用（{{ unrefClips.length }}）
+                插入全部未引用（{{ unrefClips.length }} 段 / {{ unrefSessionLines().length }} 场）
               </t-button>
             </div>
-            <div v-for="c in currentClips" :key="c.path" class="clip-row">
-              <span class="clip-name">{{ c.file }}</span>
-              <span class="clip-meta">
-                {{ formatDur(c.durationMs) }} · {{ formatBytes(c.bytes) }} ·
-                {{ isRef(c) ? '已引用' : '未引用' }}
-              </span>
-              <t-button size="small" variant="text" @click="playClip(c)">
-                {{ playing === c.path ? '停止' : '试听' }}
-              </t-button>
-              <t-button v-if="!isRef(c)" size="small" variant="text" @click="insertClipNow(c)">
-                插入
-              </t-button>
-              <t-button size="small" variant="text" theme="danger" @click="confirmDiscard = c">
-                丢弃
-              </t-button>
-              <audio
-                v-if="playing === c.path && clipSrcMap[c.path]"
-                :src="clipSrcMap[c.path] ?? ''"
-                controls
-                autoplay
-              />
+
+            <div v-for="s in clipSessions" :key="s.dir" class="session-block">
+              <div class="session-row">
+                <span class="session-name">{{ sessionLabel(s.session || s.dir) }}</span>
+                <span class="session-meta">
+                  {{ s.clips.length }} 段 · {{ formatDur(s.durationMs) }} ·
+                  {{ formatBytes(s.bytes) }}
+                </span>
+                <span class="session-state" :class="{ on: isSessionRef(s.dir) }">
+                  {{
+                    isSessionRef(s.dir)
+                      ? '已引用整场'
+                      : sessionUnrefCount(s.dir) === 0
+                        ? '已引用'
+                        : `${sessionUnrefCount(s.dir)} 段未引用`
+                  }}
+                </span>
+                <span class="spacer" />
+                <t-button
+                  v-if="!isSessionRef(s.dir)"
+                  size="small"
+                  variant="text"
+                  @click="insertSessionNow(s.dir)"
+                >
+                  插入整场
+                </t-button>
+              </div>
+              <div v-for="c in s.clips" :key="c.path" class="clip-row">
+                <span class="clip-name">{{ c.file }}</span>
+                <span class="clip-meta">
+                  {{ formatDur(c.durationMs) }} · {{ formatBytes(c.bytes) }} ·
+                  {{ isRef(c) ? '已引用' : '未引用' }}
+                </span>
+                <t-button size="small" variant="text" @click="playClip(c)">
+                  {{ playing === c.path ? '停止' : '试听' }}
+                </t-button>
+                <t-button v-if="!isRef(c)" size="small" variant="text" @click="insertClipNow(c)">
+                  插入这一段
+                </t-button>
+                <t-button size="small" variant="text" theme="danger" @click="confirmDiscard = c">
+                  丢弃
+                </t-button>
+                <audio
+                  v-if="playing === c.path && clipSrcMap[c.path]"
+                  :src="clipSrcMap[c.path] ?? ''"
+                  controls
+                  autoplay
+                />
+              </div>
             </div>
           </div>
 
@@ -1116,6 +1263,96 @@ async function removeCurrent() {
   min-height: 0;
 }
 
+/* 收起左栏：编辑区独占宽度（页头有「展开」按钮兜底） */
+.notes.list-collapsed .list-pane {
+  display: none;
+}
+
+.pane-btn {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  background: var(--panel);
+  color: var(--text-3);
+}
+
+.pane-btn:hover {
+  color: var(--primary);
+}
+
+/* 编辑器形态：一个圆角按钮装两个符号（[] 编辑 / </> 源码），不用文字 */
+.mode-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+}
+
+.mode-part {
+  min-width: 30px;
+  height: 24px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: -0.5px;
+  cursor: pointer;
+}
+
+.mode-part:hover {
+  color: var(--text);
+}
+
+.mode-part.on {
+  background: var(--brand-weak);
+  color: var(--primary);
+  font-weight: 600;
+}
+
+/* 录音面板：一场一行（整场 = 一条长语音） */
+.session-block {
+  border-top: 1px dashed var(--border);
+}
+
+.session-block:first-of-type {
+  border-top: 0;
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 2px 4px;
+  font-size: 12.5px;
+}
+
+.session-name {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.session-meta {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.session-state {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.session-state.on {
+  color: var(--primary);
+}
+
 .list-head {
   display: flex;
   gap: 8px;
@@ -1259,6 +1496,17 @@ async function removeCurrent() {
 @media (pointer: coarse) {
   .tree-actions {
     display: inline-flex;
+  }
+
+  .mode-part {
+    min-width: 36px;
+    height: 28px;
+    font-size: 12.5px;
+  }
+
+  .pane-btn {
+    width: 32px;
+    height: 32px;
   }
 
   .tree-row {

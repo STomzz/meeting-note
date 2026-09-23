@@ -8,7 +8,13 @@ import type {
   ProcessOutcome,
   ProcessProgress,
 } from '../core/meetingNote'
-import { appendRefLine, outcomeSummary, progressPercent } from '../core/meetingNote'
+import {
+  appendRefLine,
+  outcomeSummary,
+  progressPercent,
+  sessionIdNow,
+  sessionRefLine,
+} from '../core/meetingNote'
 import { MicRecorder, pcmToBase64 } from '../core/recorder'
 import type { RecorderInfo } from '../core/recorder'
 import { useNotesStore } from './notes'
@@ -17,6 +23,16 @@ import { useNotesStore } from './notes'
 export const SEGMENT_MAX_MS = 4 * 60 * 1000
 /** PCM 落盘间隔：越小越不容易丢数据，IPC 越频繁。 */
 const FLUSH_MS = 1000
+/** 「录音时自动转写」的开关（localStorage，默认开）。 */
+const AUTO_ASR_KEY = 'bnu-notes-auto-transcribe'
+
+function readAutoTranscribe(): boolean {
+  try {
+    return localStorage.getItem(AUTO_ASR_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
 
 /** 录音器与大缓冲放模块级：大数组不进响应式，避免每帧代理开销。 */
 const recorder = new MicRecorder()
@@ -49,6 +65,9 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
     recorderOpen: false,
     targetNoteId: '',
     recording: false,
+    /** 本场录音的场次 id（`20260923-1430`）与目录（`会议/周会/20260923-1430`） */
+    recordSession: '',
+    recordDir: '',
     recordSeq: 0,
     recordElapsedMs: 0,
     recordSegmentMs: 0,
@@ -61,6 +80,15 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
     clipRevision: 0,
     /** 等待编辑器插到光标处的引用（笔记正打开时走这条路，避免覆盖未保存编辑） */
     pendingRef: null as { noteId: string; text: string } | null,
+
+    /** 录音时自动转写（每段录完就转，把缓存喂热；只写缓存，不改笔记） */
+    autoTranscribe: readAutoTranscribe(),
+    /** 待转写的分段队列（串行跑，别和录音抢 IPC） */
+    transcribeQueue: [] as string[],
+    transcribing: false,
+    transcribeDone: 0,
+    transcribeFailed: 0,
+    transcribeHint: '',
 
     /** vault 里所有录音片段（`/v` 选择器用） */
     clips: [] as ClipInfo[],
@@ -165,6 +193,8 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
           return null
         }
       }
+      // 后台自动转写先跑完：两条链路同时打上游会撞限流
+      await this.waitTranscribeIdle()
       this.processing = true
       this.force = force
       this.progress = 0
@@ -254,8 +284,12 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
             this.error = message
           },
         })
-        const stat = await meetingNoteAdapter().clipStart(target, info.sampleRate)
+        // 一次录音 = 一个场次目录（`会议音频/<笔记>/20260923-1430/`），笔记里只插一条整场引用
+        const session = sessionIdNow()
+        const stat = await meetingNoteAdapter().clipStart(target, session, info.sampleRate)
         this.recordInfo = info
+        this.recordSession = session
+        this.recordDir = stat.dir
         this.recordSeq = stat.seq
         this.recordElapsedMs = 0
         this.recordSegmentMs = 0
@@ -285,12 +319,14 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
         await pushChain
         await this.flushBuffer(true)
         this.recording = false
-        if (target && seq > 0) {
-          const stat = await meetingNoteAdapter().clipClose(target, seq)
+        if (target && seq > 0 && this.recordDir) {
+          const stat = await meetingNoteAdapter().clipClose(this.recordDir, seq)
           this.recentClips = [stat, ...this.recentClips.filter((c) => c.path !== stat.path)]
           this.lastClip = stat
           this.insertHint = `第 ${stat.seq} 段已保存：${stat.path}（用 /v 插入引用）`
           this.clipRevision += 1
+          // 录完的最后一段也顺手转写掉（缓存喂热 → 一键处理只剩纪要生成）
+          this.enqueueTranscribe(stat.path)
           await this.loadClips(target)
           if (this.currentId === target) await this.openNote(target)
         }
@@ -337,24 +373,29 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
       bufferedSamples = 0
       if (!merged.length) return
       try {
-        await meetingNoteAdapter().clipAppend(this.targetNoteId, this.recordSeq, pcmToBase64(merged))
+        await meetingNoteAdapter().clipAppend(this.recordDir, this.recordSeq, pcmToBase64(merged))
       } catch (e) {
         this.error = `写入录音失败：${String(e)}`
       }
     },
 
-    /** 到 4 分钟：收尾当前分段并自动开始下一段。 */
+    /** 到 4 分钟：收尾当前分段并自动开始下一段（同一场次里继续）。 */
     async rotateSegment() {
       const target = this.targetNoteId
       const seq = this.recordSeq
+      const dir = this.recordDir
       await this.flushBuffer(true)
       try {
-        const stat = await meetingNoteAdapter().clipClose(target, seq)
+        const stat = await meetingNoteAdapter().clipClose(dir, seq)
         this.recentClips = [stat, ...this.recentClips]
+        // 这一段已经收尾了：马上送去转写（后台串行，不挡录音）
+        this.enqueueTranscribe(stat.path)
         const next = await meetingNoteAdapter().clipStart(
           target,
+          this.recordSession || sessionIdNow(),
           this.recordInfo?.sampleRate || 16000,
         )
+        this.recordDir = next.dir
         this.recordSeq = next.seq
         this.recordSegmentMs = 0
         this.insertHint = `第 ${stat.seq} 段已保存，继续录第 ${next.seq} 段`
@@ -391,12 +432,84 @@ export const useMeetingNoteStore = defineStore('meetingNote', {
       }
     },
 
-    /** 重新把某段录音的引用插进笔记。 */
+    /** 重新把某段录音的引用插进笔记（单段，精确引用）。 */
     async insertClip(clip: ClipStat) {
       const target = this.targetNoteId || this.currentId
       if (!target) return
       const where = await this.insertRef(clip.refLine, target)
       this.insertHint = where === 'cursor' ? '已插到光标处（记得保存）' : '已追加到笔记末尾'
+    },
+
+    /** 插入整场引用（一条长语音）：`/v 会议音频/<笔记>/<场次>/`。 */
+    async insertSessionRef(dir: string) {
+      const target = this.targetNoteId || this.currentId
+      if (!target || !dir) return
+      const where = await this.insertRef(sessionRefLine(dir), target)
+      this.insertHint = where === 'cursor' ? '已插到光标处（记得保存）' : '已追加到笔记末尾'
+    },
+
+    // ------------------------------------------------------------ 自动转写
+    /** 「录音时自动转写」开关（默认开；关掉后已有的队列会跑完）。 */
+    setAutoTranscribe(on: boolean) {
+      this.autoTranscribe = on
+      try {
+        localStorage.setItem(AUTO_ASR_KEY, on ? '1' : '0')
+      } catch {
+        // 存不了不影响本次
+      }
+    },
+
+    /**
+     * 把一段刚录完的分段排进转写队列。
+     *
+     * 只写转写缓存（Rust 侧 `audio_clip_transcribe`），**不动笔记**：
+     * 等用户点「一键处理」时这些分段全部命中缓存，只剩纪要生成。
+     */
+    enqueueTranscribe(path: string) {
+      if (!this.autoTranscribe || !path) return
+      this.transcribeQueue.push(path)
+      void this.drainTranscribe()
+    },
+
+    /** 串行跑转写队列（一次一段，避免和录音 / 上游限流抢）。 */
+    async drainTranscribe(): Promise<void> {
+      if (this.transcribing) return
+      this.transcribing = true
+      try {
+        while (this.transcribeQueue.length) {
+          const path = this.transcribeQueue.shift() ?? ''
+          if (!path) continue
+          this.transcribeHint = `正在转写这一段（还剩 ${this.transcribeQueue.length + 1} 段）`
+          try {
+            const out = await meetingNoteAdapter().transcribeClip(path)
+            if (out.status === 'failed') {
+              this.transcribeFailed += 1
+              this.error = `自动转写失败：${out.error || path}（一键处理时会重试）`
+            } else {
+              this.transcribeDone += 1
+            }
+          } catch (e) {
+            const msg = String(e)
+            this.transcribeFailed += 1
+            if (msg.includes('未配置')) {
+              // 没配转写端点：后面的别再排队了，处理时会给出明确提示
+              this.transcribeQueue = []
+              this.error = '还没配置语音转写端点，本次自动转写已跳过（设置里配好后可用「一键处理」补转）'
+              break
+            }
+            this.error = `自动转写失败：${msg}（一键处理时会重试）`
+          }
+        }
+      } finally {
+        this.transcribing = false
+        this.transcribeHint = ''
+        this.transcribeQueue = []
+      }
+    },
+
+    /** 一键处理前等后台转写排空：别和它抢上游那 9 请求/分钟的额度。 */
+    async waitTranscribeIdle(): Promise<void> {
+      while (this.transcribing) await new Promise((r) => setTimeout(r, 120))
     },
 
     /** 一次性插入多条引用行（「插入全部未引用」）。 */

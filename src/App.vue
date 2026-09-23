@@ -20,6 +20,28 @@ const nav = [
 
 const modeText = computed(() => (isTauri() ? '桌面客户端模式' : '浏览器预览模式'))
 
+/** 左侧导航收起（只留图标）：给编辑区让宽度，状态记在 localStorage。 */
+const NAV_KEY = 'bnu-notes-nav-collapsed'
+
+function readNavCollapsed(): boolean {
+  try {
+    return localStorage.getItem(NAV_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+const navCollapsed = ref(readNavCollapsed())
+
+function toggleNav() {
+  navCollapsed.value = !navCollapsed.value
+  try {
+    localStorage.setItem(NAV_KEY, navCollapsed.value ? '1' : '0')
+  } catch {
+    // 存不了不影响本次切换
+  }
+}
+
 const theme = ref<ThemeMode>(getThemeMode())
 let disposeTheme: (() => void) | null = null
 
@@ -53,10 +75,18 @@ function cycleTheme() {
 
 <template>
   <div class="app">
-    <aside class="sidebar">
+    <aside class="sidebar" :class="{ collapsed: navCollapsed }">
       <div class="brand">
         <span class="brand-logo">BNU</span>
-        <span class="brand-name">Notes</span>
+        <span v-if="!navCollapsed" class="brand-name">Notes</span>
+        <span class="spacer" />
+        <button
+          class="icon-btn nav-toggle"
+          :title="navCollapsed ? '展开侧栏' : '收起侧栏'"
+          @click="toggleNav"
+        >
+          <t-icon :name="navCollapsed ? 'chevron-right' : 'chevron-left'" size="15px" />
+        </button>
       </div>
       <nav class="nav">
         <router-link
@@ -65,14 +95,15 @@ function cycleTheme() {
           :to="item.path"
           class="nav-item"
           active-class="active"
+          :title="item.label"
         >
           <t-icon :name="item.icon" size="17px" />
-          <span>{{ item.label }}</span>
+          <span v-if="!navCollapsed">{{ item.label }}</span>
         </router-link>
       </nav>
       <div class="sidebar-foot">
-        <t-icon name="desktop" size="14px" />
-        <span class="foot-text">{{ modeText }}</span>
+        <t-icon v-if="!navCollapsed" name="desktop" size="14px" />
+        <span v-if="!navCollapsed" class="foot-text">{{ modeText }}</span>
         <span class="spacer" />
         <button
           class="icon-btn"

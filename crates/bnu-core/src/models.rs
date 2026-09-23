@@ -797,7 +797,7 @@ mod tests {
     #[ignore]
     async fn bundled_roots_cover_gateway_tls() {
         let host = std::env::var("BNU_TEST_BASE_URL")
-            .unwrap_or_else(|_| "https://chatapi.bnu.edu.cn".to_string());
+            .unwrap_or_else(|_| "https://chatapi.bnu.edu.cn/bnuapi".to_string());
         let url = format!("{}/v1/models", host.trim_end_matches('/'));
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -845,6 +845,15 @@ mod tests {
     fn api_root_normalization() {
         assert_eq!(api_root("https://chatapi.bnu.edu.cn/"), "https://chatapi.bnu.edu.cn/v1");
         assert_eq!(api_root("https://chatapi.bnu.edu.cn/v1"), "https://chatapi.bnu.edu.cn/v1");
+        // 2026-09-23 起的新默认：机器通道在 /bnuapi 下
+        assert_eq!(
+            api_root("https://chatapi.bnu.edu.cn/bnuapi"),
+            "https://chatapi.bnu.edu.cn/bnuapi/v1"
+        );
+        assert_eq!(
+            api_root("https://chatapi.bnu.edu.cn/bnuapi/v1/"),
+            "https://chatapi.bnu.edu.cn/bnuapi/v1"
+        );
         assert_eq!(api_root("http://127.0.0.1:8080/v1/"), "http://127.0.0.1:8080/v1");
     }
 

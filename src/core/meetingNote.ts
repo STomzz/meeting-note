@@ -24,13 +24,27 @@ export interface AudioRef {
   line: number
   token: string
   raw: string
+  /** `file` = 单个音频；`session` = 整场（一条长语音） */
+  kind: 'file' | 'session'
+  /** `file` = 文件路径；`session` = 相对 `会议音频/` 的场次目录（与 `ClipInfo.dir` 一致） */
   path: string
   fileName: string
   exists: boolean
   bytes: number
   durationMs: number
+  /** 场次里的分段（单文件引用只有一项） */
+  segments: AudioRefSegment[]
   hasTranscript: boolean
   transcript: string
+}
+
+/** 场次引用里的一个分段。 */
+export interface AudioRefSegment {
+  file: string
+  path: string
+  seq: number
+  bytes: number
+  durationMs: number
 }
 
 export interface ClipInfo {
@@ -38,6 +52,8 @@ export interface ClipInfo {
   file: string
   path: string
   seq: number
+  /** 场次 id（`20260923-1430`）；旧版扁平目录为空串 */
+  session: string
   bytes: number
   durationMs: number
   sampleRate: number
@@ -49,11 +65,15 @@ export interface ClipStat {
   file: string
   path: string
   seq: number
+  /** 场次 id（`20260923-1430`）；旧版扁平目录为空串 */
+  session: string
   bytes: number
   durationMs: number
   sampleRate: number
-  /** 可直接插入笔记的引用行，如 `/v 会议音频/周会/seg_0001.wav` */
+  /** 单段引用行，如 `/v 会议音频/周会/20260923-1430/seg_0001.wav` */
   refLine: string
+  /** 整场引用行（一条长语音），如 `/v 会议音频/周会/20260923-1430/` */
+  sessionRefLine: string
 }
 
 export interface ProcessProgress {
@@ -79,6 +99,16 @@ export interface ProcessOutcome {
   elapsedMs: number
   cancelled: boolean
   errors: string[]
+}
+
+/** 单段转写的结果（录音过程中「每段结束就转写」用）。 */
+export interface ClipTranscribeOutcome {
+  /** cached / transcribed / empty / failed */
+  status: string
+  /** vault 相对路径 */
+  path: string
+  chars: number
+  error: string
 }
 
 export const MEETING_DIR = '会议'
@@ -260,26 +290,107 @@ function sanitizeSegment(part: string): string {
   return Array.from(s).slice(0, 60).join('')
 }
 
-/** 还没写进笔记的录音（按 vault 相对路径比对）。 */
-export function unreferencedClips(clips: ClipInfo[], refs: Array<{ path: string }>): ClipInfo[] {
-  const used = new Set(refs.map((r) => normalizeRel(r.path)))
-  return clips.filter((c) => !used.has(normalizeRel(c.path)))
+/** 判断一段录音是否已经被笔记引用（单文件按 path 匹配，整场按目录匹配）。 */
+export function isClipReferenced(
+  clip: Pick<ClipInfo, 'path' | 'dir'>,
+  refs: Array<Pick<AudioRef, 'kind' | 'path'>>,
+): boolean {
+  const path = normalizeRel(clip.path)
+  const dir = normalizeRel(clip.dir)
+  return refs.some((r) =>
+    r.kind === 'session' ? normalizeRel(r.path) === dir : normalizeRel(r.path) === path,
+  )
+}
+
+/** 还没写进笔记的录音（按 vault 相对路径 / 场次目录比对）。 */
+export function unreferencedClips(
+  clips: ClipInfo[],
+  refs: Array<Pick<AudioRef, 'kind' | 'path'>>,
+): ClipInfo[] {
+  return clips.filter((c) => !isClipReferenced(c, refs))
+}
+
+/** 属于某篇笔记的录音（新目录 + 其下所有场次 + 旧版扁平目录）。 */
+export function clipsBelongToNote(clips: ClipInfo[], noteId: string): ClipInfo[] {
+  const dirs = dirsForNote(noteId)
+  return clips.filter((c) => dirs.some((d) => c.dir === d || c.dir.startsWith(`${d}/`)))
+}
+
+/** 一场录音（同一个场次目录里的全部分段）。 */
+export interface ClipSession {
+  dir: string
+  session: string
+  clips: ClipInfo[]
+  durationMs: number
+  bytes: number
+  modifiedAt: number
+}
+
+/** 按场次（目录）分组：组内按序号，组间新的在前。 */
+export function groupClipsByDir(clips: ClipInfo[]): ClipSession[] {
+  const map = new Map<string, ClipInfo[]>()
+  for (const c of clips) {
+    const list = map.get(c.dir)
+    if (list) list.push(c)
+    else map.set(c.dir, [c])
+  }
+  return [...map.entries()]
+    .map(([dir, list]) => {
+      const sorted = [...list].sort((a, b) => a.seq - b.seq)
+      return {
+        dir,
+        session: sorted[0]?.session ?? '',
+        clips: sorted,
+        durationMs: sorted.reduce((s, c) => s + c.durationMs, 0),
+        bytes: sorted.reduce((s, c) => s + c.bytes, 0),
+        modifiedAt: sorted.reduce((m, c) => Math.max(m, c.modifiedAt), 0),
+      }
+    })
+    .sort((a, b) => b.modifiedAt - a.modifiedAt)
+}
+
+/** 场次 id：本地时间 `YYYYMMDD-HHMM`（一次录音 = 一个场次目录）。 */
+export function sessionIdNow(d = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`
+}
+
+/** 场次展示名：`09-23 14:30`；没有场次的旧录音 → `早期录音`。 */
+export function sessionLabel(sessionOrDir: string): string {
+  const last = sessionOrDir.split('/').filter(Boolean).pop() ?? ''
+  const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})$/.exec(last)
+  return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : '早期录音'
+}
+
+/** 整场引用行（一条长语音）：`/v 会议音频/<目录>/`。 */
+export function sessionRefLine(dir: string): string {
+  return `/v ${AUDIO_DIR}/${normalizeRel(dir)}/`
+}
+
+/**
+ * 引用路径里的音频目录（相对 `会议音频/`，等于 `ClipInfo.dir`）。
+ *
+ * `会议音频/会议/周会/20260922-0930/` → `会议/周会/20260922-0930`；
+ * 看着像文件（带音频扩展名）或捞不出目录时返回 ''，调用方按文件处理。
+ */
+export function dirRelOfRef(raw: string): string {
+  const inner = normalizeRel(raw).replace(new RegExp(`^${AUDIO_DIR}/`), '')
+  if (!inner || /\.(wav|mp3|m4a|ogg|flac|aac|opus)$/i.test(inner)) return ''
+  return inner
 }
 
 function normalizeRel(p: string): string {
-  return p.trim().replace(/\\/g, '/').replace(/^\.?\/+/, '')
+  return p.trim().replace(/\\/g, '/').replace(/^\.?\/+/, '').replace(/\/+$/, '')
 }
 
-/** 每篇笔记的录音数量（新目录 + 旧版目录），用于列表徽章。 */
+/** 每篇笔记的录音数量（含场次与旧版目录），用于列表徽章。 */
 export function clipCountsByNote(
   notes: Array<{ id: string }>,
   clips: ClipInfo[],
 ): Record<string, number> {
-  const byDir = new Map<string, number>()
-  for (const c of clips) byDir.set(c.dir, (byDir.get(c.dir) ?? 0) + 1)
   const out: Record<string, number> = {}
   for (const n of notes) {
-    const count = dirsForNote(n.id).reduce((sum, d) => sum + (byDir.get(d) ?? 0), 0)
+    const count = clipsBelongToNote(clips, n.id).length
     if (count) out[n.id] = count
   }
   return out

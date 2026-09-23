@@ -6,12 +6,16 @@ import {
   MINUTES_HINT,
   appendRefLine,
   clipCountsByNote,
+  clipsBelongToNote,
   dirForNote,
   dirForNoteLegacy,
+  dirRelOfRef,
   dirsForNote,
   formatBytes,
   formatDur,
+  groupClipsByDir,
   insertRefAtCursor,
+  isClipReferenced,
   minutesReady,
   outcomeSummary,
   parseRefLine,
@@ -19,6 +23,9 @@ import {
   prepareAudioRefs,
   progressPercent,
   replaceAudioPlaceholders,
+  sessionIdNow,
+  sessionLabel,
+  sessionRefLine,
   slashCommandAt,
   splitMinutes,
   unreferencedClips,
@@ -195,18 +202,21 @@ describe('dirForNote / 展示辅助', () => {
   })
 
   it('未引用录音与列表徽章（新旧目录都算）', () => {
-    const mk = (dir: string, seq: number): ClipInfo => ({
+    const mk = (dir: string, seq: number, session = ''): ClipInfo => ({
       dir,
       file: `seg_${String(seq).padStart(4, '0')}.wav`,
       path: `会议音频/${dir}/seg_${String(seq).padStart(4, '0')}.wav`,
       seq,
+      session,
       bytes: 100,
       durationMs: 1000,
       sampleRate: 16000,
       modifiedAt: seq,
     })
     const clips = [mk('会议/周会', 1), mk('会议/周会', 2), mk('周会', 1), mk('其它', 1)]
-    const unref = unreferencedClips(clips, [{ path: '会议音频/会议/周会/seg_0001.wav' }])
+    const unref = unreferencedClips(clips, [
+      { kind: 'file', path: '会议音频/会议/周会/seg_0001.wav' },
+    ])
     expect(unref.map((c) => c.path)).toEqual([
       '会议音频/会议/周会/seg_0002.wav',
       '会议音频/周会/seg_0001.wav',
@@ -218,6 +228,67 @@ describe('dirForNote / 展示辅助', () => {
     })
   })
 
+  it('场次：判定已引用 / 归属笔记 / 分组 / 展示名', () => {
+    const mk = (dir: string, seq: number, session = ''): ClipInfo => ({
+      dir,
+      file: `seg_${String(seq).padStart(4, '0')}.wav`,
+      path: `会议音频/${dir}/seg_${String(seq).padStart(4, '0')}.wav`,
+      seq,
+      session,
+      bytes: 100,
+      durationMs: 1000,
+      sampleRate: 16000,
+      modifiedAt: seq,
+    })
+    const sessionDir = '会议/周会/20260923-1430'
+    const clips = [
+      mk(sessionDir, 1, '20260923-1430'),
+      mk(sessionDir, 2, '20260923-1430'),
+      mk('会议/周会', 1), // 旧版扁平
+      mk('会议/评审/20260924-1000', 1, '20260924-1000'),
+    ]
+
+    // 整场引用（`/v .../20260923-1430/`）覆盖这一场的全部分段，但不碰旧版扁平录音
+    const refs = [
+      { kind: 'session' as const, path: sessionDir },
+    ]
+    expect(isClipReferenced(clips[0], refs)).toBe(true)
+    expect(isClipReferenced(clips[1], refs)).toBe(true)
+    expect(isClipReferenced(clips[2], refs)).toBe(false)
+    expect(
+      isClipReferenced(clips[0], [{ kind: 'file' as const, path: clips[0].path }]),
+    ).toBe(true)
+
+    expect(unreferencedClips(clips, refs).map((c) => c.path)).toEqual([
+      '会议音频/会议/周会/seg_0001.wav',
+      '会议音频/会议/评审/20260924-1000/seg_0001.wav',
+    ])
+
+    // 归属：笔记的新目录 + 其下所有场次 + 旧版目录
+    expect(clipsBelongToNote(clips, '会议/周会.md').map((c) => c.path)).toEqual([
+      '会议音频/会议/周会/20260923-1430/seg_0001.wav',
+      '会议音频/会议/周会/20260923-1430/seg_0002.wav',
+      '会议音频/会议/周会/seg_0001.wav',
+    ])
+    expect(clipsBelongToNote(clips, '会议/评审.md').map((c) => c.path)).toEqual([
+      '会议音频/会议/评审/20260924-1000/seg_0001.wav',
+    ])
+
+    // 分组：一场一个（组内按序号、总时长求和）
+    const groups = groupClipsByDir(clipsBelongToNote(clips, '会议/周会.md'))
+    expect(groups.map((g) => g.dir)).toEqual([sessionDir, '会议/周会'])
+    expect(groups[0].clips.map((c) => c.seq)).toEqual([1, 2])
+    expect(groups[0].durationMs).toBe(2000)
+    expect(groups[0].session).toBe('20260923-1430')
+    expect(groups[1].session).toBe('')
+
+    // 引用行与展示名
+    expect(sessionRefLine(sessionDir)).toBe('/v 会议音频/会议/周会/20260923-1430/')
+    expect(sessionLabel(sessionDir)).toBe('09-23 14:30')
+    expect(sessionLabel('会议/周会')).toBe('早期录音')
+    expect(sessionIdNow(new Date(2026, 8, 23, 14, 30))).toBe('20260923-1430')
+  })
+
   it('时长与体积格式化', () => {
     expect(formatDur(0)).toBe('0:00')
     expect(formatDur(65_000)).toBe('1:05')
@@ -225,6 +296,22 @@ describe('dirForNote / 展示辅助', () => {
     expect(formatBytes(0)).toBe('0 B')
     expect(formatBytes(2048)).toBe('2 KB')
     expect(formatBytes(5 * 1024 * 1024)).toBe('5 MB')
+  })
+})
+
+describe('dirRelOfRef（引用路径 → 音频目录）', () => {
+  it('整场引用：去掉 会议音频/ 前缀与行尾斜杠', () => {
+    expect(dirRelOfRef('会议音频/会议/周会/20260922-0930/')).toBe('会议/周会/20260922-0930')
+    expect(dirRelOfRef('会议音频/会议/周会/20260922-0930')).toBe('会议/周会/20260922-0930')
+    expect(dirRelOfRef('会议音频\\会议\\周会\\20260922-0930\\')).toBe('会议/周会/20260922-0930')
+  })
+  it('单段文件 / 空串 → 空（按文件处理）', () => {
+    expect(dirRelOfRef('会议音频/会议/周会/20260922-0930/seg_0001.wav')).toBe('')
+    expect(dirRelOfRef('会议音频/周会/seg_0002.WAV')).toBe('')
+    expect(dirRelOfRef('   ')).toBe('')
+  })
+  it('早期录音（扁平目录，场次为空）', () => {
+    expect(dirRelOfRef('会议音频/周会/')).toBe('周会')
   })
 })
 

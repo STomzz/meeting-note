@@ -20,7 +20,7 @@ fn env_or(name: &str, default: &str) -> String {
 
 fn endpoint(model_env: &str, model_default: &str, params: serde_json::Value) -> EndpointConfig {
     EndpointConfig {
-        base_url: env_or("BNU_TEST_BASE_URL", "https://chatapi.bnu.edu.cn"),
+        base_url: env_or("BNU_TEST_BASE_URL", "https://chatapi.bnu.edu.cn/bnuapi"),
         model: env_or(model_env, model_default),
         params,
         api_key: Some(env_or("BNU_TEST_API_KEY", "")),

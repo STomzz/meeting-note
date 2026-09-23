@@ -8,6 +8,7 @@ function clip(dir: string, file: string, modifiedAt: number, durationMs = 4000):
     file,
     path: `${dir}/${file}`,
     seq: Number(file.replace(/\D/g, '')) || 0,
+    session: '',
     bytes: 1000,
     durationMs,
     sampleRate: 16000,

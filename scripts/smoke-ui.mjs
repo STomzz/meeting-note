@@ -99,6 +99,22 @@ const click = async (sel, nth = 0) => {
   if (!els[nth]) throw new Error(`找不到元素 ${sel} #${nth}`)
   await els[nth].click()
 }
+/** DOM click（不按坐标，面板展开时也不会点空） */
+const domClick = async (sel, nth = 0) => {
+  const ok = await page.evaluate(
+    (s, n) => {
+      const el = document.querySelectorAll(s)[n]
+      if (!el) return false
+      el.scrollIntoView({ block: 'center' })
+      el.click()
+      return true
+    },
+    sel,
+    nth,
+  )
+  if (!ok) throw new Error(`点不到 ${sel} #${nth}`)
+  await sleep(320)
+}
 const clickText = async (t, cls = '.tree-row') => {
   const ok = await page.evaluate(
     (t, cls) => {
@@ -112,6 +128,28 @@ const clickText = async (t, cls = '.tree-row') => {
   )
   if (!ok) throw new Error(`点不到「${t}」（${cls}）`)
   await sleep(400)
+}
+const until = async (fn, timeout = 5000) => {
+  const started = Date.now()
+  while (Date.now() - started < timeout) {
+    if (await fn()) return true
+    await sleep(120)
+  }
+  return false
+}
+/** 编辑器形态按钮：按符号点（[] = 编辑 / </> = 源码） */
+const clickMode = async (mode) => {
+  const ok = await page.evaluate((m) => {
+    const glyph = m === 'edit' ? '[]' : '</>'
+    const hit = [...document.querySelectorAll('.mode-switch .mode-part')].find(
+      (el) => (el.textContent || '').trim() === glyph,
+    )
+    if (!hit) return false
+    hit.click()
+    return true
+  }, mode)
+  if (!ok) throw new Error(`点不到形态按钮 ${mode}`)
+  await sleep(450)
 }
 const setTextarea = (sel, value) =>
   page.evaluate(
@@ -137,6 +175,82 @@ const bodyText = (await text('.blocks')) ?? ''
 check('正文里看不到 md 标记', !bodyText.includes('# 示例周会') && !bodyText.includes('## 会议纪要'))
 check('`/v` 行渲染成播放器行', (await count('.blocks .audio-ref')) === 1)
 await page.screenshot({ path: `${SHOTS}/01-editor.png` })
+
+console.log('== 笔记：整场引用 = 一条长语音 ==')
+check(
+  '整场引用渲染成场次播放器（自定义元素已升级）',
+  await until(async () => (await count('bnu-session-player')) === 1),
+)
+const player = await page.evaluate(() => {
+  const el = document.querySelector('bnu-session-player')
+  if (!el) return null
+  return {
+    play: (el.querySelector('.sp-btn')?.textContent ?? '').trim(),
+    time: el.querySelector('.sp-time')?.textContent ?? '',
+    seg: el.querySelector('.sp-seg')?.textContent ?? '',
+    label: el.querySelector('.sp-name')?.textContent ?? '',
+    bar: !!el.querySelector('.sp-bar'),
+    audio: el.querySelectorAll('audio').length,
+  }
+})
+check(
+  '播放器有播放键 / 进度条 / 段号 / 场次名',
+  !!player && player.bar && player.play === '▶' && player.seg.includes('第 1/2 段'),
+  JSON.stringify(player),
+)
+await page.evaluate(() => document.querySelector('bnu-session-player .sp-btn')?.click())
+await sleep(800)
+const playing = await page.evaluate(() => {
+  const el = document.querySelector('bnu-session-player')
+  const a = el?.querySelector('audio')
+  return {
+    glyph: (el?.querySelector('.sp-btn')?.textContent ?? '').trim(),
+    paused: a?.paused ?? null,
+    dur: a ? +a.duration.toFixed(2) : -1,
+  }
+})
+check(
+  '点播放进入播放态（按钮变暂停、媒体已就绪）',
+  playing.glyph === '❚❚' && playing.paused === false && playing.dur > 0,
+  JSON.stringify(playing),
+)
+// 无头 Chrome 没有音频输出设备，媒体时钟不前进；用真实事件来验证连播与整场定位
+await page.evaluate(() =>
+  document.querySelector('bnu-session-player audio')?.dispatchEvent(new Event('ended')),
+)
+await sleep(700)
+const advanced = await page.evaluate(() => {
+  const el = document.querySelector('bnu-session-player')
+  return {
+    seg: el?.querySelector('.sp-seg')?.textContent ?? '',
+    glyph: (el?.querySelector('.sp-btn')?.textContent ?? '').trim(),
+  }
+})
+check('一段放完自动接下一段（连播）', advanced.seg.includes('第 2/2 段'), JSON.stringify(advanced))
+await page.evaluate(() => {
+  const bar = document.querySelector('bnu-session-player .sp-bar')
+  if (!bar) return
+  bar.value = '1000'
+  bar.dispatchEvent(new Event('input', { bubbles: true }))
+  bar.dispatchEvent(new Event('change', { bubbles: true }))
+})
+await sleep(600)
+const seeked = await page.evaluate(() => {
+  const el = document.querySelector('bnu-session-player')
+  const a = el?.querySelector('audio')
+  return {
+    seg: el?.querySelector('.sp-seg')?.textContent ?? '',
+    time: el?.querySelector('.sp-time')?.textContent ?? '',
+    cur: a ? +a.currentTime.toFixed(2) : -1,
+  }
+})
+check(
+  '进度条是整场时间轴：拖到末尾定位到第 2 段',
+  seeked.seg.includes('第 2/2 段') && seeked.cur > 1,
+  JSON.stringify(seeked),
+)
+await page.evaluate(() => document.querySelector('bnu-session-player .sp-btn')?.click())
+await page.screenshot({ path: `${SHOTS}/01b-session-player.png` })
 
 const blocksBefore = await count('.blocks .blk')
 await click('.blocks .blk', 1)
@@ -287,9 +401,19 @@ const idleBox = await page.evaluate(() => {
 })
 check('展开态是一行小条（宽 ≤ 260 / 高 ≤ 84）', idleBox.w <= 260 && idleBox.h <= 84, JSON.stringify(idleBox))
 await page.screenshot({ path: `${SHOTS}/06-recorder-idle.png` })
+const recReady = await page.evaluate(() => {
+  const b = document.querySelector('[title="开始录音"]')
+  return {
+    exists: !!b,
+    disabled: b?.disabled ?? null,
+    panel: (document.querySelector('.panel')?.textContent ?? '').slice(0, 60),
+  }
+})
+check('开始按钮可用（录音目标笔记已在）', recReady.exists && recReady.disabled === false, JSON.stringify(recReady))
 await click('[title="开始录音"]')
 await sleep(2600)
 const liveState = await page.evaluate(() => ({
+  panel: (document.querySelector('.panel')?.textContent ?? '').slice(0, 90),
   timer: document.querySelector('.panel .timer')?.textContent ?? null,
   chips: document.querySelectorAll('.panel .chip').length,
   level: document.querySelector('.panel .level i')?.style.width ?? '',
@@ -314,14 +438,68 @@ await sleep(300)
 await click('[title="停止录音"]')
 await sleep(1200)
 const saved = (await text('.panel')) ?? ''
-check('停止后给出已保存提示与「插入引用」', saved.includes('已保存') && saved.includes('插入引用'), saved.slice(0, 80))
+check(
+  '停止后提示本场已存段数，并给「插入整场」入口',
+  saved.includes('本场已存') && saved.includes('插入整场'),
+  saved.slice(0, 80),
+)
+
+// 面板「插入整场」：插一行目录引用，存盘后应该变成真播放器（中途不能闪「分段不在」）
+const beforeInsert = await page.evaluate(() => ({
+  refs: document.querySelectorAll('.blocks .audio-ref').length,
+  players: document.querySelectorAll('bnu-session-player').length,
+}))
+await page.evaluate(() => {
+  const btn = [...document.querySelectorAll('.panel .link')].find((b) =>
+    b.textContent.includes('插入整场'),
+  )
+  btn?.click()
+})
+const insertedOk = await until(async () => {
+  const now = await page.evaluate(() => ({
+    players: document.querySelectorAll('bnu-session-player').length,
+    broken: [...document.querySelectorAll('.blocks .audio-ref')].some((el) =>
+      el.textContent.includes('分段不在'),
+    ),
+  }))
+  return now.players === beforeInsert.players + 1 && !now.broken
+}, 8000)
+const afterInsert = await page.evaluate(() => ({
+  refs: document.querySelectorAll('.blocks .audio-ref').length,
+  players: document.querySelectorAll('bnu-session-player').length,
+  broken: [...document.querySelectorAll('.blocks .audio-ref')].some((el) =>
+    el.textContent.includes('分段不在'),
+  ),
+}))
+check(
+  '「插入整场」插成一行引用，存盘后变成真播放器（不闪「分段不在」）',
+  insertedOk && afterInsert.refs === beforeInsert.refs + 1,
+  JSON.stringify({ beforeInsert, afterInsert }),
+)
 
 // （v0.3.5 去掉了「预览」：块编辑本身就是最终排版，这里改测「编辑态宽度 == 渲染态宽度」）
-await clickText('编辑', '.t-radio-button')
-await sleep(400)
-await click('.blocks .blk', 1)
-await click('.blocks .blk', 1)
-await sleep(300)
+const modeInfo = await page.evaluate(() => ({
+  parts: [...document.querySelectorAll('.mode-switch .mode-part')].map((el) => ({
+    glyph: (el.textContent || '').trim(),
+    on: el.className.includes('on'),
+  })),
+  radios: document.querySelectorAll('.editor-bar .t-radio-button').length,
+  barText: (document.querySelector('.mode-switch')?.textContent ?? '').trim(),
+}))
+check(
+  '形态开关：只有一个圆角按钮，里面是 [] 与 </> 两个符号（没有文字）',
+  modeInfo.parts.length === 2 &&
+    modeInfo.parts.some((p) => p.glyph === '[]' && p.on) &&
+    modeInfo.parts.some((p) => p.glyph === '</>') &&
+    modeInfo.radios === 0 &&
+    !/[\u4e00-\u9fa5]/.test(modeInfo.barText),
+  JSON.stringify(modeInfo),
+)
+await clickMode('edit')
+// 录音面板/片段面板会把正文挤下去，坐标点击可能落空：这里用 DOM click 点段落
+await domClick('.blocks .blk', 1)
+await domClick('.blocks .blk', 1)
+await sleep(350)
 const widthPair = await page.evaluate(() => {
   const ta = document.querySelector('.blk-ta')
   const bodies = document.querySelectorAll('.blocks .blk.md-body')
@@ -329,7 +507,9 @@ const widthPair = await page.evaluate(() => {
   const bodyCs = body ? getComputedStyle(body) : null
   return {
     // textarea 没有内边距，所以和渲染块「去掉左右 padding 的内容宽」比
-    edit: +ta.getBoundingClientRect().width.toFixed(1),
+    ta: !!ta,
+    blocks: document.querySelectorAll('.blocks .blk').length,
+    edit: ta ? +ta.getBoundingClientRect().width.toFixed(1) : -1,
     render: body
       ? +(body.getBoundingClientRect().width - parseFloat(bodyCs.paddingLeft) - parseFloat(bodyCs.paddingRight)).toFixed(1)
       : -1,
@@ -337,19 +517,79 @@ const widthPair = await page.evaluate(() => {
   }
 })
 check(
+  '点段落进入编辑态',
+  widthPair.ta === true,
+  JSON.stringify(widthPair),
+)
+check(
   '编辑态与渲染态同宽（不再「半屏就换行」）',
   Math.abs(widthPair.edit - widthPair.render) <= 1 && widthPair.edit > widthPair.pane * 0.8,
   JSON.stringify(widthPair),
 )
 await page.keyboard.press('Escape')
 await sleep(200)
-await clickText('源码', '.t-radio-button')
-await sleep(500)
+await clickMode('source')
+await sleep(400)
 check('源码形态出现 textarea', (await count('textarea.editor')) === 1)
 const raw = await page.evaluate(() => document.querySelector('textarea.editor')?.value ?? '')
 check('源码里能看到原文与新小节', raw.includes('## 测试小节') && raw.includes('/v 会议音频/'))
+check(
+  '源码形态下形态按钮高亮切到 </>',
+  await page.evaluate(() => {
+    const on = [...document.querySelectorAll('.mode-switch .mode-part')].find((el) =>
+      el.className.includes('on'),
+    )
+    return (on?.textContent ?? '').trim() === '</>'
+  }),
+)
 await page.screenshot({ path: `${SHOTS}/03-source.png` })
-await clickText('编辑', '.t-radio-button')
+await clickMode('edit')
+
+console.log('== 布局：左侧文件树 / 导航收起展开 ==')
+await page.evaluate(() => document.querySelector('.list-head .pane-btn')?.click())
+await sleep(350)
+check(
+  '收起文件树：列表隐藏，编辑区吃满宽度',
+  await page.evaluate(() => {
+    const pane = document.querySelector('.list-pane')
+    const editor = document.querySelector('.editor-pane')
+    return (
+      !!pane &&
+      getComputedStyle(pane).display === 'none' &&
+      editor.getBoundingClientRect().width > 900
+    )
+  }),
+)
+await page.screenshot({ path: `${SHOTS}/13-pane-collapsed.png` })
+await page.evaluate(() => document.querySelector('.page-header .pane-btn')?.click())
+await sleep(350)
+check(
+  '页头按钮能把文件树再展开',
+  await page.evaluate(() => {
+    const pane = document.querySelector('.list-pane')
+    return !!pane && getComputedStyle(pane).display !== 'none'
+  }),
+)
+
+await page.evaluate(() => document.querySelector('.nav-toggle')?.click())
+await sleep(350)
+check(
+  '收起左侧导航（只留图标）',
+  await page.evaluate(() => {
+    const s = document.querySelector('.sidebar')
+    return s.classList.contains('collapsed') && s.getBoundingClientRect().width <= 60
+  }),
+)
+await page.screenshot({ path: `${SHOTS}/14-nav-collapsed.png` })
+await page.evaluate(() => document.querySelector('.nav-toggle')?.click())
+await sleep(350)
+check(
+  '再点一次展开回原样',
+  await page.evaluate(() => {
+    const s = document.querySelector('.sidebar')
+    return !s.classList.contains('collapsed') && s.getBoundingClientRect().width > 150
+  }),
+)
 
 console.log('== 图谱：3D ↔ 2D 切换 ==')
 await page.goto(`${BASE}/#/graph`, { waitUntil: 'networkidle2' })
@@ -364,7 +604,48 @@ await page.screenshot({ path: `${SHOTS}/11-graph-3d.png` })
 
 // 用户报过的 bug 路径：3D → 去设置 → 回图谱（此时仍是 3D）→ 切回 2D
 await page.goto(`${BASE}/#/settings`, { waitUntil: 'networkidle2' })
-await sleep(800)
+await sleep(900)
+
+console.log('== 设置：录音与转写 ==')
+const asrCard = await page.evaluate(() => {
+  const card = [...document.querySelectorAll('.card')].find(
+    (c) => c.querySelector('.card-title')?.textContent?.trim() === '录音与转写',
+  )
+  const sw = card?.querySelector('.t-switch')
+  return {
+    found: !!card,
+    titles: [...document.querySelectorAll('.card-title')].map((el) => el.textContent?.trim()),
+    on: sw ? sw.className.includes('checked') : null,
+    label: card?.querySelector('.switch-label')?.textContent?.trim() ?? '',
+    note: (card?.textContent ?? '').includes('不经中间服务器'),
+  }
+})
+check(
+  '设置页有「录音与转写」卡片：自动转写默认开、说明写清直连与只写缓存',
+  asrCard.found && asrCard.on === true && asrCard.label.includes('自动转写') && asrCard.note,
+  JSON.stringify(asrCard),
+)
+const toggled = await page.evaluate(async () => {
+  const card = [...document.querySelectorAll('.card')].find(
+    (c) => c.querySelector('.card-title')?.textContent?.trim() === '录音与转写',
+  )
+  const sw = card?.querySelector('.t-switch')
+  sw?.click()
+  await new Promise((r) => setTimeout(r, 200))
+  const off = sw ? sw.className.includes('checked') : null
+  const savedOff = localStorage.getItem('bnu-notes-auto-transcribe')
+  sw?.click()
+  await new Promise((r) => setTimeout(r, 200))
+  return { off, savedOff, on: sw ? sw.className.includes('checked') : null, savedOn: localStorage.getItem('bnu-notes-auto-transcribe') }
+})
+check(
+  '开关能切换并记住（关 = localStorage 0，开 = 1）',
+  toggled.off === false && toggled.savedOff === '0' && toggled.on === true && toggled.savedOn === '1',
+  JSON.stringify(toggled),
+)
+await page.screenshot({ path: `${SHOTS}/15-settings-asr.png` })
+
+await page.goto(`${BASE}/#/graph`, { waitUntil: 'networkidle2' })
 await page.goto(`${BASE}/#/graph`, { waitUntil: 'networkidle2' })
 await sleep(3500)
 const state = await page.evaluate(() => {

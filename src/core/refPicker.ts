@@ -24,8 +24,10 @@ export interface RefOption {
 export interface RefOptionContext {
   /** 当前笔记的音频目录集合（`ClipInfo.dir`） */
   ownDirs?: Set<string>
-  /** 正文里已引用的 vault 相对路径 */
+  /** 正文里已引用的单文件路径 */
   usedPaths?: Set<string>
+  /** 正文里已整场引用的场次目录 */
+  usedDirs?: Set<string>
 }
 
 function rank(o: RefOption): number {
@@ -36,6 +38,7 @@ function rank(o: RefOption): number {
 export function refOptions(clips: ClipInfo[], ctx: RefOptionContext = {}): RefOption[] {
   const ownDirs = ctx.ownDirs ?? new Set<string>()
   const usedPaths = ctx.usedPaths ?? new Set<string>()
+  const usedDirs = ctx.usedDirs ?? new Set<string>()
   return clips
     .map((c) => ({
       path: c.path,
@@ -43,7 +46,7 @@ export function refOptions(clips: ClipInfo[], ctx: RefOptionContext = {}): RefOp
       file: c.file,
       label: `${c.dir}/${c.file}`,
       durationMs: c.durationMs,
-      used: usedPaths.has(c.path),
+      used: usedPaths.has(c.path) || usedDirs.has(c.dir),
       own: ownDirs.has(c.dir),
       modifiedAt: c.modifiedAt,
     }))

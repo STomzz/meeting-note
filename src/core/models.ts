@@ -68,14 +68,18 @@ export const CAPABILITIES: Array<{
   },
 ]
 
-/** 集群网关的推荐预填（一键填入）。 */
+/** 集群网关的推荐预填（一键填入）。
+ *
+ * 2026-09-23 起公网入口的机器通道是 `/bnuapi/v1/*`（门户融合后 BNUAPI 控制台挪到 `/bnuapi`；
+ * 同域的旧路径 `/v1/*` 仍兼容保留）——`api_root()` 会自动补 `/v1`。
+ */
 export const RECOMMENDED_PRESET: ModelConfigInput = {
   chat: {
-    baseUrl: 'https://chatapi.bnu.edu.cn',
+    baseUrl: 'https://chatapi.bnu.edu.cn/bnuapi',
     model: 'Qwen-Inno-35B-v1',
     params: { chat_template_kwargs: { enable_thinking: false } },
   },
-  embedding: { baseUrl: 'https://chatapi.bnu.edu.cn', model: 'bge-m3', params: {} },
-  rerank: { baseUrl: 'https://chatapi.bnu.edu.cn', model: 'bge-reranker-v2-m3', params: {} },
-  asr: { baseUrl: 'https://chatapi.bnu.edu.cn', model: 'qwen3-asr-1.7b', params: { language: 'zh' } },
+  embedding: { baseUrl: 'https://chatapi.bnu.edu.cn/bnuapi', model: 'bge-m3', params: {} },
+  rerank: { baseUrl: 'https://chatapi.bnu.edu.cn/bnuapi', model: 'bge-reranker-v2-m3', params: {} },
+  asr: { baseUrl: 'https://chatapi.bnu.edu.cn/bnuapi', model: 'qwen3-asr-1.7b', params: { language: 'zh' } },
 }

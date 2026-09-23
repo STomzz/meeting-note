@@ -65,14 +65,29 @@ pub struct AudioRefView {
     pub line: usize,
     pub token: String,
     pub raw: String,
-    /// 解析出的 vault 相对路径（找不到为空）
+    /// `file` = 单个音频；`session` = 整场（一条长语音，播放器连播所有分段）
+    pub kind: String,
+    /// 解析出的 vault 相对路径（单文件 = 文件；场次 = 目录，不带尾斜杠；找不到为空）
     pub path: String,
     pub file_name: String,
     pub exists: bool,
     pub bytes: u64,
     pub duration_ms: u64,
+    /// 场次里的分段（单文件引用只有一项）；播放器按它连播、总时长也是各段之和
+    pub segments: Vec<AudioRefSegment>,
     pub has_transcript: bool,
     pub transcript: String,
+}
+
+/// 场次引用里的一个分段。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioRefSegment {
+    pub file: String,
+    pub path: String,
+    pub seq: i64,
+    pub bytes: u64,
+    pub duration_ms: u64,
 }
 
 /// 会议页列表项。
@@ -201,32 +216,67 @@ fn find_by_name(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
     None
 }
 
-/// 解析引用路径 → (绝对路径, vault 相对路径)。
+/// 引用解析结果：一个音频文件，或一个场次目录（一条长语音）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefTarget {
+    File { abs: PathBuf, rel: String },
+    Session { dir_rel: String, segs: Vec<audio_clip::SegRef> },
+}
+
+/// 解析引用路径 → 文件或场次目录。
 ///
-/// 支持：① 相对 vault 的路径（`会议音频/xx/seg_0001.wav`）；② 裸文件名（先去 `会议音频/` 里找，再试 vault 根）。
-pub fn resolve_path(vault: &Path, raw: &str) -> Option<(PathBuf, String)> {
+/// 支持：
+/// ① 场次目录（行尾斜杠或指向已存在的目录）：`会议音频/会议/周会/20260923-1430/`
+///    —— 一条长语音，播/转写都按目录里的分段顺序来；
+/// ② 相对 vault 的音频文件（`会议音频/xx/seg_0001.wav`）；
+/// ③ 裸文件名（先去 `会议音频/` 里找，再试 vault 根）。
+pub fn resolve_ref(vault: &Path, raw: &str) -> Option<RefTarget> {
     let cleaned = raw.trim().trim_start_matches("./");
     if cleaned.is_empty() {
         return None;
     }
     let normalized = cleaned.replace('\\', "/");
-    if normalized.contains('/') {
-        let (abs, rel) = checked_join(vault, &normalized)?;
-        if abs.is_file() {
-            return Some((abs, rel));
+    let dir_hint = normalized.ends_with('/');
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('/') {
+        let (abs, rel) = checked_join(vault, trimmed)?;
+        if abs.is_dir() {
+            // `session_segments` 要的是相对 `会议音频/` 的目录（与 `ClipInfo.dir` 一致）
+            let seg_dir = rel
+                .strip_prefix(&format!("{}/", audio_clip::AUDIO_DIR))
+                .unwrap_or(&rel)
+                .to_string();
+            let segs = audio_clip::session_segments(vault, &seg_dir);
+            if !segs.is_empty() {
+                return Some(RefTarget::Session { dir_rel: seg_dir, segs });
+            }
+        }
+        if abs.is_file() && !dir_hint {
+            return Some(RefTarget::File { abs, rel });
         }
         return None;
     }
-    if let Some(abs) = find_by_name(&vault.join(audio_clip::AUDIO_DIR), &normalized, 0) {
+    if let Some(abs) = find_by_name(&vault.join(audio_clip::AUDIO_DIR), trimmed, 0) {
         if let Some(rel) = rel_of(vault, &abs) {
-            return Some((abs, rel));
+            return Some(RefTarget::File { abs, rel });
         }
     }
-    let (abs, rel) = checked_join(vault, &normalized)?;
+    let (abs, rel) = checked_join(vault, trimmed)?;
     if abs.is_file() {
-        return Some((abs, rel));
+        return Some(RefTarget::File { abs, rel });
     }
     None
+}
+
+/// 解析引用路径 → (绝对路径, vault 相对路径)：只看单个文件（兼容旧调用）。
+pub fn resolve_path(vault: &Path, raw: &str) -> Option<(PathBuf, String)> {
+    match resolve_ref(vault, raw)? {
+        RefTarget::File { abs, rel } => Some((abs, rel)),
+        RefTarget::Session { .. } => None,
+    }
 }
 
 /// 从行数组里取出 `idx` 之后紧跟的 `>` 块（若存在）→ (结束行下标（不含）, 文本)。
@@ -255,15 +305,56 @@ pub fn refs_of(vault: &Path, body: &str) -> Vec<AudioRefView> {
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let Some((token, raw)) = parse_ref_line(line) else { continue };
-        let resolved = resolve_path(vault, &raw);
-        let (path, exists, bytes, duration_ms) = match &resolved {
-            Some((abs, rel)) => {
-                let bytes = std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
-                let (_, dur) = audio_clip::wav_meta(abs);
-                (rel.clone(), true, bytes, dur)
+        let target = resolve_ref(vault, &raw);
+        let mut kind = "file".to_string();
+        let mut path = String::new();
+        let mut file_name = String::new();
+        let mut exists = false;
+        let mut bytes = 0u64;
+        let mut duration_ms = 0u64;
+        let mut segments: Vec<AudioRefSegment> = Vec::new();
+        match target {
+            Some(RefTarget::File { abs, rel }) => {
+                exists = true;
+                bytes = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+                duration_ms = audio_clip::wav_meta(&abs).1;
+                file_name = abs
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                segments.push(AudioRefSegment {
+                    file: file_name.clone(),
+                    path: rel.clone(),
+                    seq: audio_clip::seg_seq(&file_name).unwrap_or(0),
+                    bytes,
+                    duration_ms,
+                });
+                path = rel;
             }
-            None => (String::new(), false, 0, 0),
-        };
+            Some(RefTarget::Session { dir_rel, segs }) => {
+                kind = "session".to_string();
+                exists = true;
+                bytes = segs.iter().map(|s| s.bytes).sum();
+                duration_ms = segs.iter().map(|s| s.duration_ms).sum();
+                file_name = dir_rel
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(dir_rel.as_str())
+                    .to_string();
+                segments = segs
+                    .into_iter()
+                    .map(|s| AudioRefSegment {
+                        file: s.file,
+                        path: s.path,
+                        seq: s.seq,
+                        bytes: s.bytes,
+                        duration_ms: s.duration_ms,
+                    })
+                    .collect();
+                path = dir_rel;
+            }
+            None => {}
+        }
         let transcript = block_after(&lines, i)
             .map(|(_, t)| {
                 t.lines()
@@ -279,14 +370,13 @@ pub fn refs_of(vault: &Path, body: &str) -> Vec<AudioRefView> {
             line: i + 1,
             token,
             raw,
-            file_name: resolved
-                .as_ref()
-                .and_then(|(abs, _)| abs.file_name().map(|n| n.to_string_lossy().to_string()))
-                .unwrap_or_default(),
+            kind,
             path,
+            file_name,
             exists,
             bytes,
             duration_ms,
+            segments,
             has_transcript,
             transcript,
         });
@@ -535,6 +625,31 @@ fn mmss(ms: u64) -> String {
     format!("{:02}:{:02}:{:02}", total / 3600, (total % 3600) / 60, total % 60)
 }
 
+/// 把 `[hh:mm:ss]` 前缀整体后移 `offset_ms`：整场连播时，多段转写接成一条时间轴。
+fn shift_timestamps(text: &str, offset_ms: u64) -> String {
+    if offset_ms == 0 {
+        return text.to_string();
+    }
+    text.lines()
+        .map(|line| {
+            let t = line.trim_end();
+            if let Some(rest) = t.strip_prefix('[') {
+                if let Some((ts, body)) = rest.split_once(']') {
+                    let parts: Vec<u64> =
+                        ts.split(':').filter_map(|p| p.trim().parse().ok()).collect();
+                    if parts.len() == 3 {
+                        let ms =
+                            (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000 + offset_ms;
+                        return format!("[{}] {}", mmss(ms), body.trim_start());
+                    }
+                }
+            }
+            t.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 转写一个音频文件（静音切段 + 串行限流 + 重试），返回带时间戳的文本。
 async fn transcribe_clip(
     asr_cfg: &EndpointConfig,
@@ -600,6 +715,73 @@ async fn transcribe_clip(
     Ok(lines.join("\n"))
 }
 
+/// 一段录音的转写结果（「每段结束就转写」的后台任务返给它）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipTranscribeOutcome {
+    /// cached / transcribed / empty / failed
+    pub status: String,
+    /// vault 相对路径
+    pub path: String,
+    pub chars: usize,
+    pub error: String,
+}
+
+/// 转写一个音频分段（录音过程中调用，把缓存喂热；不改笔记）。
+///
+/// 与「一键处理」走同一条链路（静音切段 + 限流 + 重试 + 缓存），
+/// 所以之后点「一键处理」时这些分段全部命中缓存，只剩纪要生成。
+pub async fn transcribe_one(
+    conn: &Mutex<Connection>,
+    vault: &Path,
+    cfg: &ModelConfig,
+    path: &str,
+) -> Result<ClipTranscribeOutcome> {
+    let (abs, rel) = audio_clip::resolve_clip_file(vault, path).ok_or_else(|| {
+        anyhow!("只能转写 {}/ 下的音频：{path}", audio_clip::AUDIO_DIR)
+    })?;
+    let asr_cfg = cfg
+        .asr
+        .clone()
+        .ok_or_else(|| anyhow!("未配置语音转写模型：请到「设置」里填写转写端点"))?;
+    let mut out = ClipTranscribeOutcome {
+        status: "failed".to_string(),
+        path: rel.clone(),
+        chars: 0,
+        error: String::new(),
+    };
+    let stamp = file_stamp(&abs);
+    let cached = {
+        let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
+        load_cache(&c, &rel, stamp, &asr_cfg.model, false)?
+    };
+    if let Some(t) = cached {
+        out.status = "cached".to_string();
+        out.chars = t.chars().count();
+        return Ok(out);
+    }
+    let bytes =
+        std::fs::read(&abs).with_context(|| format!("读取音频失败: {}", abs.display()))?;
+    let mut limiter = RateLimiter::new(RATE_LIMIT_PER_MINUTE, Duration::from_secs(60));
+    let cancel = AtomicBool::new(false);
+    let mut on_msg = |_m: String| {};
+    match transcribe_clip(&asr_cfg, &bytes, &mut limiter, &cancel, &mut on_msg).await {
+        Ok(t) => {
+            let chars = t.chars().count();
+            let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
+            save_cache(&c, &rel, file_stamp(&abs), &asr_cfg.model, &t, "")?;
+            out.status = if chars == 0 { "empty".to_string() } else { "transcribed".to_string() };
+            out.chars = chars;
+        }
+        Err(e) => {
+            out.error = e.to_string();
+            let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
+            let _ = save_cache(&c, &rel, stamp, &asr_cfg.model, "", &out.error);
+        }
+    }
+    Ok(out)
+}
+
 /// 一键处理：转写笔记里引用的所有音频 → 写回转写块 → 生成纪要段。
 ///
 /// 手写内容与纪要段的旧内容不会被当作文本输入；转写缓存按文件戳命中，重跑不重复烧 ASR。
@@ -633,10 +815,63 @@ pub async fn process(
         })
     };
 
+    // 引用可能指向整场（目录）：先展开成「要转写的分段」，进度按分段算
     let refs = parse_refs(&body);
-    out.audio_total = refs.len();
+
+    struct SegWork {
+        abs: PathBuf,
+        rel: String,
+        file: String,
+        duration_ms: u64,
+    }
+    struct RefWork {
+        line: usize,
+        /// 整场引用的场次名（单文件引用为 None）
+        session: Option<String>,
+        segs: Vec<SegWork>,
+    }
+
+    let mut work: Vec<RefWork> = Vec::new();
+    let mut missing: Vec<(usize, String)> = Vec::new();
+    for r in &refs {
+        match resolve_ref(vault, &r.raw) {
+            Some(RefTarget::File { abs, rel }) => {
+                let file = abs
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let duration_ms = audio_clip::wav_meta(&abs).1;
+                work.push(RefWork {
+                    line: r.line,
+                    session: None,
+                    segs: vec![SegWork { abs, rel, file, duration_ms }],
+                });
+            }
+            Some(RefTarget::Session { dir_rel, segs }) => {
+                let session = audio_clip::session_of_dir(&dir_rel);
+                work.push(RefWork {
+                    line: r.line,
+                    session: Some(session),
+                    segs: segs
+                        .into_iter()
+                        .map(|s| SegWork {
+                            abs: vault.join(&s.path),
+                            rel: s.path,
+                            file: s.file,
+                            duration_ms: s.duration_ms,
+                        })
+                        .collect(),
+                });
+            }
+            None => missing.push((r.line, r.raw.clone())),
+        }
+    }
+
+    let total_segments: usize = work.iter().map(|w| w.segs.len()).sum();
+    out.audio_total = total_segments + missing.len();
 
     let note = note_id.to_string();
+    let total_all = out.audio_total;
     let emit = |phase: &str,
                 message: String,
                 current: &str,
@@ -646,7 +881,7 @@ pub async fn process(
         progress(ProcessProgress {
             note_id: note.clone(),
             phase: phase.to_string(),
-            audio_total: refs.len(),
+            audio_total: total_all,
             audio_done: done,
             audio_skipped: skipped,
             audio_failed: failed,
@@ -656,7 +891,7 @@ pub async fn process(
     };
     emit(
         "parse",
-        format!("找到 {} 处音频引用", refs.len()),
+        format!("找到 {} 处音频引用（{} 段）", refs.len(), total_segments),
         "",
         out.audio_done,
         out.audio_skipped,
@@ -668,120 +903,161 @@ pub async fn process(
     let mut limiter = RateLimiter::new(RATE_LIMIT_PER_MINUTE, Duration::from_secs(60));
     let mut cancelled = false;
 
-    for (idx, r) in refs.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            cancelled = true;
-            break;
-        }
-        let Some((abs, rel)) = resolve_path(vault, &r.raw) else {
-            out.audio_failed += 1;
-            errors.push(format!("第 {} 行：找不到音频「{}」", r.line, r.raw));
-            emit(
-                "transcribe",
-                format!("第 {} 行找不到音频：{}", r.line, r.raw),
-                &r.raw,
-                out.audio_done,
-                out.audio_skipped,
-                out.audio_failed,
-            );
-            continue;
-        };
-        let file_name = abs.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let stamp = file_stamp(&abs);
-        let cached = {
-            let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
-            load_cache(&c, &rel, stamp, &asr_cfg.model, force)?
-        };
-        let (text, skipped) = match cached {
-            Some(t) => (t, true),
-            None => {
-                emit(
-                    "transcribe",
-                    format!("转写 {}（{} / {}）", file_name, idx + 1, refs.len()),
-                    &file_name,
-                    out.audio_done,
-                    out.audio_skipped,
-                    out.audio_failed,
-                );
-                let bytes = std::fs::read(&abs)
-                    .with_context(|| format!("读取音频失败: {}", abs.display()))?;
-                let done = out.audio_done;
-                let skipped_now = out.audio_skipped;
-                let failed = out.audio_failed;
-                let total = refs.len();
-                let note_c = note.clone();
-                let mut on_msg = |m: String| {
-                    progress(ProcessProgress {
-                        note_id: note_c.clone(),
-                        phase: "transcribe".to_string(),
-                        audio_total: total,
-                        audio_done: done,
-                        audio_skipped: skipped_now,
-                        audio_failed: failed,
-                        current: file_name.clone(),
-                        message: m,
-                    });
-                };
-                match transcribe_clip(&asr_cfg, &bytes, &mut limiter, cancel, &mut on_msg).await {
-                    Ok(t) => {
-                        let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
-                        save_cache(&c, &rel, file_stamp(&abs), &asr_cfg.model, &t, "")?;
-                        (t, false)
-                    }
-                    Err(e) => {
-                        if cancel.load(Ordering::Relaxed) {
-                            cancelled = true;
-                            break;
-                        }
-                        out.audio_failed += 1;
-                        errors.push(format!("第 {} 行（{}）：{}", r.line, file_name, e));
-                        let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
-                        let _ = save_cache(
-                            &c,
-                            &rel,
-                            stamp,
-                            &asr_cfg.model,
-                            "",
-                            &e.to_string(),
-                        );
-                        emit(
-                            "transcribe",
-                            format!("转写失败：{file_name}"),
-                            &file_name,
-                            out.audio_done,
-                            out.audio_skipped,
-                            out.audio_failed,
-                        );
-                        continue;
-                    }
-                }
-            }
-        };
-        if skipped {
-            out.audio_skipped += 1;
-        } else {
-            out.audio_done += 1;
-        }
-        let dur = audio_clip::wav_meta(&abs).1;
-        entries.insert(
-            r.line,
-            TranscriptEntry {
-                meta: format!("{}–{} · {}", mmss(0), mmss(dur), file_name),
-                text,
-            },
-        );
+    for (line, raw) in &missing {
+        out.audio_failed += 1;
+        errors.push(format!("第 {line} 行：找不到音频「{raw}」"));
         emit(
             "transcribe",
-            if skipped {
-                format!("复用缓存：{}（不重复调用转写）", file_name)
-            } else {
-                format!("完成 {} / {}", idx + 1, refs.len())
-            },
-            &file_name,
+            format!("第 {line} 行找不到音频：{raw}"),
+            raw,
             out.audio_done,
             out.audio_skipped,
             out.audio_failed,
         );
+    }
+
+    let mut done_segments = 0usize;
+    for w in work.iter() {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut offset = 0u64;
+        let mut seg_failed: Vec<String> = Vec::new();
+        for seg in w.segs.iter() {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                break;
+            }
+            let file_name = seg.file.clone();
+            let stamp = file_stamp(&seg.abs);
+            let cached = {
+                let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
+                load_cache(&c, &seg.rel, stamp, &asr_cfg.model, force)?
+            };
+            let (text, skipped) = match cached {
+                Some(t) => (t, true),
+                None => {
+                    emit(
+                        "transcribe",
+                        format!(
+                            "转写 {}（第 {} / {} 段）",
+                            file_name,
+                            done_segments + 1,
+                            total_segments
+                        ),
+                        &file_name,
+                        out.audio_done,
+                        out.audio_skipped,
+                        out.audio_failed,
+                    );
+                    let bytes = std::fs::read(&seg.abs)
+                        .with_context(|| format!("读取音频失败: {}", seg.abs.display()))?;
+                    let done = out.audio_done;
+                    let skipped_now = out.audio_skipped;
+                    let failed = out.audio_failed;
+                    let note_c = note.clone();
+                    let mut on_msg = |m: String| {
+                        progress(ProcessProgress {
+                            note_id: note_c.clone(),
+                            phase: "transcribe".to_string(),
+                            audio_total: total_segments,
+                            audio_done: done,
+                            audio_skipped: skipped_now,
+                            audio_failed: failed,
+                            current: file_name.clone(),
+                            message: m,
+                        });
+                    };
+                    match transcribe_clip(&asr_cfg, &bytes, &mut limiter, cancel, &mut on_msg).await
+                    {
+                        Ok(t) => {
+                            let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
+                            save_cache(&c, &seg.rel, file_stamp(&seg.abs), &asr_cfg.model, &t, "")?;
+                            (t, false)
+                        }
+                        Err(e) => {
+                            if cancel.load(Ordering::Relaxed) {
+                                cancelled = true;
+                                break;
+                            }
+                            out.audio_failed += 1;
+                            seg_failed.push(file_name.clone());
+                            errors.push(format!("第 {} 行（{}）：{}", w.line, file_name, e));
+                            let c = conn.lock().map_err(|_| anyhow!("数据库锁定失败"))?;
+                            let _ = save_cache(
+                                &c,
+                                &seg.rel,
+                                stamp,
+                                &asr_cfg.model,
+                                "",
+                                &e.to_string(),
+                            );
+                            emit(
+                                "transcribe",
+                                format!("转写失败：{file_name}"),
+                                &file_name,
+                                out.audio_done,
+                                out.audio_skipped,
+                                out.audio_failed,
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            if skipped {
+                out.audio_skipped += 1;
+            } else {
+                out.audio_done += 1;
+            }
+            done_segments += 1;
+            if !text.trim().is_empty() {
+                // 整场连播：各段的时间戳接上前面的累计时长，读起来才是一整场
+                parts.push(shift_timestamps(&text, offset));
+            }
+            offset += seg.duration_ms;
+            emit(
+                "transcribe",
+                if skipped {
+                    format!("复用缓存：{}（不重复调用转写）", file_name)
+                } else {
+                    format!("完成 {} / {} 段", done_segments, total_segments)
+                },
+                &file_name,
+                out.audio_done,
+                out.audio_skipped,
+                out.audio_failed,
+            );
+        }
+        if cancelled {
+            break;
+        }
+        // 全部失败 + 没有内容 → 不写块（保留上一次的转写）
+        if parts.is_empty() && !seg_failed.is_empty() {
+            continue;
+        }
+        let mut text = parts.join("\n");
+        if !seg_failed.is_empty() {
+            text = format!(
+                "（{} 段转写失败：{}；可再点一次「一键处理」只重试这些）\n{}",
+                seg_failed.len(),
+                seg_failed.join("、"),
+                text
+            );
+        }
+        let meta = match &w.session {
+            Some(session) => format!(
+                "{}–{} · {} 段 · {}",
+                mmss(0),
+                mmss(offset),
+                w.segs.len(),
+                session
+            ),
+            None => format!("{}–{} · {}", mmss(0), mmss(offset), w.segs[0].file),
+        };
+        entries.insert(w.line, TranscriptEntry { meta, text });
     }
 
     out.transcript_chars = entries.values().map(|e| e.text.chars().count()).sum();
@@ -1195,6 +1471,74 @@ mod tests {
     }
 
     #[test]
+    fn resolves_session_dirs_and_lists_segments() {
+        let tmp = tmp_vault();
+        let vault = tmp.path();
+        let dir = "会议/周会/20260923-1430";
+        write_clip(vault, dir, 1, 1);
+        write_clip(vault, dir, 2, 2);
+        write_clip(vault, "会议/周会", 1, 1); // 旧版扁平：不属于任何场次
+
+        // 行尾斜杠 / 不带斜杠都能识别成整场
+        for raw in [
+            "会议音频/会议/周会/20260923-1430/",
+            "会议音频/会议/周会/20260923-1430",
+        ] {
+            match resolve_ref(vault, raw).unwrap() {
+                RefTarget::Session { dir_rel, segs } => {
+                    assert_eq!(dir_rel, dir);
+                    assert_eq!(segs.len(), 2);
+                    assert_eq!(segs[0].seq, 1);
+                    assert_eq!(segs[1].duration_ms, 2000);
+                }
+                other => panic!("应解析成场次：{other:?}"),
+            }
+        }
+        // 单文件引用仍然指某一段
+        match resolve_ref(vault, "会议音频/会议/周会/20260923-1430/seg_0001.wav").unwrap() {
+            RefTarget::File { .. } => {}
+            other => panic!("应解析成文件：{other:?}"),
+        }
+        // 空目录 / 不存在 → None
+        std::fs::create_dir_all(vault.join("会议音频/空场次/20260923-1500")).unwrap();
+        assert!(resolve_ref(vault, "会议音频/空场次/20260923-1500/").is_none());
+        assert!(resolve_ref(vault, "会议音频/空/").is_none());
+
+        // refs_of：场次引用给出分段清单与总时长；转写块照旧跟着引用行
+        let body = format!(
+            "# 周会\n\n手写一句\n/v 会议音频/{dir}/\n> 🎙 转写 00:00:00–00:03:00 · 2 段 · 20260923-1430\n>\n> [00:00:00] 甲：你好\n\n/v 会议音频/会议/周会/seg_0001.wav\n"
+        );
+        let refs = refs_of(vault, &body);
+        assert_eq!(refs.len(), 2);
+        let s = &refs[0];
+        assert_eq!(s.kind, "session");
+        assert_eq!(s.path, dir);
+        assert_eq!(s.file_name, "20260923-1430");
+        assert_eq!(s.segments.len(), 2);
+        assert_eq!(s.duration_ms, 3000);
+        assert_eq!(s.bytes, s.segments.iter().map(|x| x.bytes).sum::<u64>());
+        assert!(s.has_transcript);
+        assert!(s.transcript.contains("甲：你好"));
+        assert!(!s.transcript.contains("🎙"), "转写块标题不算正文");
+        let f = &refs[1];
+        assert_eq!(f.kind, "file");
+        assert_eq!(f.file_name, "seg_0001.wav");
+        assert_eq!(f.segments.len(), 1);
+        assert_eq!(f.duration_ms, 1000);
+        assert!(!f.has_transcript);
+    }
+
+    #[test]
+    fn timestamps_shift_across_segments() {
+        let text = "[00:00:05] 甲：开头\n[00:01:00] 乙：中间\n没有时间戳的行";
+        let shifted = shift_timestamps(text, 4 * 60_000 + 1000); // 前面已累计 4:01
+        assert!(shifted.starts_with("[00:04:06] 甲：开头"), "{shifted}");
+        assert!(shifted.contains("[00:05:01] 乙：中间"), "{shifted}");
+        assert!(shifted.contains("没有时间戳的行"));
+        assert_eq!(shift_timestamps(text, 0), text);
+    }
+
+    #[test]
     fn transcript_blocks_are_idempotent() {
         let body = "# 会\n\n手写一句。\n/v a.wav\n\n后面还有手写。\n";
         let mut entries = BTreeMap::new();
@@ -1396,3 +1740,4 @@ mod tests {
         assert_eq!(civil_from_days(20_000), (2024, 10, 4));
     }
 }
+

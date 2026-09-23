@@ -1,6 +1,7 @@
 //! Tauri 命令层：薄封装，真正的逻辑都在 `bnu-core`。
 
 use bnu_core::audio_clip::{self, ClipInfo, ClipStat};
+use bnu_core::meeting_note::ClipTranscribeOutcome;
 use bnu_core::chat_history;
 use bnu_core::db;
 use bnu_core::graph::{self, ExtractOutcome, GraphProgress, GraphSnapshot, GraphStats, NodeDetail};
@@ -611,39 +612,50 @@ fn meeting_note_migrate_legacy(state: State<'_, AppState>) -> Result<Vec<String>
     meeting_note::export_legacy(&conn, &vault, &state.meetings_root).map_err(err)
 }
 
-/// 开始一段会议录音（目录与笔记路径一一对应，如 `会议音频/会议/周会/`）。
+/// 开始一段会议录音（`会议音频/<笔记目录>/<场次>/`，一条长语音 = 一个场次目录）。
 #[tauri::command]
 fn audio_clip_start(
     note_id: String,
+    session: Option<String>,
     sample_rate: u32,
     state: State<'_, AppState>,
 ) -> Result<ClipStat, String> {
     let vault = state.vault.lock().map_err(err)?.clone();
-    audio_clip::start_for_note(&vault, &note_id, sample_rate).map_err(err)
+    audio_clip::start_for_note(&vault, &note_id, session.as_deref(), sample_rate).map_err(err)
 }
 
 #[tauri::command]
 fn audio_clip_append(
-    note_id: String,
+    dir: String,
     seq: i64,
     pcm_base64: String,
     state: State<'_, AppState>,
 ) -> Result<ClipStat, String> {
     let vault = state.vault.lock().map_err(err)?.clone();
-    let dir = audio_clip::dir_for_note(&note_id);
     audio_clip::append_base64(&vault, &dir, seq, &pcm_base64).map_err(err)
 }
 
 /// 结束当前分段，返回可插入笔记的 `/v` 引用行。
 #[tauri::command]
-fn audio_clip_close(
-    note_id: String,
-    seq: i64,
-    state: State<'_, AppState>,
-) -> Result<ClipStat, String> {
+fn audio_clip_close(dir: String, seq: i64, state: State<'_, AppState>) -> Result<ClipStat, String> {
     let vault = state.vault.lock().map_err(err)?.clone();
-    let dir = audio_clip::dir_for_note(&note_id);
     audio_clip::close(&vault, &dir, seq).map_err(err)
+}
+
+/// 单段转写（录音过程中「每段结束就转写」用）：只写转写缓存，不动笔记。
+#[tauri::command]
+async fn audio_clip_transcribe(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<ClipTranscribeOutcome, String> {
+    let cfg = {
+        let conn = state.conn.lock().map_err(err)?;
+        models::load_config(&conn, &state.secret).map_err(err)?
+    };
+    let vault = state.vault.lock().map_err(err)?.clone();
+    meeting_note::transcribe_one(&state.conn, &vault, &cfg, &path)
+        .await
+        .map_err(err)
 }
 
 /// 丢弃一段录音（按 vault 相对路径；界面上的「重录 / 录坏了删掉」）。
@@ -869,6 +881,7 @@ pub fn run() {
             audio_clip_append,
             audio_clip_close,
             audio_clip_discard,
+            audio_clip_transcribe,
             audio_clip_list,
             graph_stats,
             graph_snapshot,

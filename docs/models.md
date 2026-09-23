@@ -14,6 +14,11 @@
 
 baseURL 写 `https://host` 或 `https://host/v1` 都可以，客户端会自动补 `/v1`（已含则不重复追加）。
 
+**集群网关默认地址（2026-09-23 起）**：`https://chatapi.bnu.edu.cn/bnuapi`
+（门户融合后 BNUAPI 控制台挪到 `/bnuapi`，机器通道随之是 `/bnuapi/v1/*`；请求实际打到
+`https://chatapi.bnu.edu.cn/bnuapi/v1/chat/completions` 等。同域旧路径 `/v1/*` 仍兼容保留，
+已配置成 `https://chatapi.bnu.edu.cn` 的客户端不用改也能用。「填入推荐配置」已按新地址预填四项。）
+
 ## 推理模型注意事项
 
 `Qwen-Inno-35B-v1` 默认先输出思考过程（响应里的 `reasoning` 字段），慢且费 token。请求带：
@@ -29,6 +34,27 @@ baseURL 写 `https://host` 或 `https://host/v1` 都可以，客户端会自动�
 
 - `content` 为空但有 `reasoning` → 回退返回思考文本；
 - `finish_reason=length` 且无 content → 明确报错，提示提高 `max_tokens` 或关闭思考。
+
+## 实测记录（2026-09-23，新前缀 `/bnuapi`）
+
+用仓库里的真实联调测试跑（`crates/bnu-core/tests/gateway_live.rs`，客户端同一条代码路径）：
+
+```bash
+BNU_TEST_BASE_URL=https://chatapi.bnu.edu.cn/bnuapi BNU_TEST_API_KEY=sk-… \
+  cargo test -p bnu-core --test gateway_live -- --ignored --nocapture --test-threads=1
+```
+
+| 调用 | 结果 |
+|---|---|
+| `GET /bnuapi/v1/models` | 200，16 个模型（含 `Qwen-Inno-35B-v1` / `qwen3-asr-1.7b` / `bge-m3` / `bge-reranker-v2-m3`） |
+| chat（非流式，关思考） | 200，351 ms，content=`正常`，`reasoning_tokens=0` |
+| chat（流式） | 200，496 ms（首字 290 ms），34 个增量 |
+| chat（流式中断） | 200，`finish=cancelled`，已收到增量 3 个 |
+| 设置页「测试连通性」四项 | chat 347 ms / embedding 127 ms（1024 维）/ rerank 114 ms（#0=0.9993，#1=0.0000）/ asr 118 ms |
+| embedding `bge-m3` | 200，2 条 1024 维 |
+| rerank `bge-reranker-v2-m3` | 200，相关文档 0.9913 / 无关 0.000016 |
+| asr `qwen3-asr-1.7b`（0.5 s 静音 WAV） | 200，返回 `嗯。`（静音也能连通） |
+| 旧前缀 `POST /v1/chat/completions` | 200（兼容保留） |
 
 ## 实测记录（2026-09-22，集群网关）
 
