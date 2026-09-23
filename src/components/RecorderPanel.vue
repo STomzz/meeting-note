@@ -3,7 +3,8 @@
  * 浮动录音面板。
  *
  * - 收起态：一颗胶囊；录音中变成红色计时胶囊（带跳动的电平条）；
- * - 展开态：目标笔记 → 一个主按钮 → 已保存卡片 → 一行说明；
+ * - 展开态：**尽量小的一行小条**（v0.3.6 起）——待录时「记到 ▾ + 开始」，
+ *   录音中「计时 + 电平 + 停止」，其余信息压到 11px 的副行里；
  * - 停止只保存文件，**不自动写引用**：引用由笔记里的 `/v` 选择器插。
  */
 import { computed } from 'vue'
@@ -43,90 +44,69 @@ async function insertLast() {
       </template>
     </button>
 
-    <!-- 展开态：面板 -->
+    <!-- 展开态：一行小条（占位尽量小，别挡内容） -->
     <div v-else class="panel">
-      <div class="head">
-        <span class="badge" :class="{ live: store.recording }">
-          <t-icon :name="store.recording ? 'sound' : 'microphone-1'" size="14px" />
-        </span>
-        <span class="title">{{ store.recording ? '录音中' : '录音' }}</span>
-        <span v-if="store.recording" class="timer">{{ elapsed }}</span>
-        <span class="spacer" />
-        <button class="icon-btn" title="收起" @click="store.toggleRecorder(false)">
-          <t-icon name="chevron-down" size="15px" />
-        </button>
-      </div>
-
       <template v-if="store.recording">
-        <div class="level"><i :style="{ width: `${store.levelPercent}%` }" /></div>
-        <div class="meta">
+        <div class="row">
+          <span class="dot" aria-hidden="true" />
+          <span class="timer">{{ elapsed }}</span>
+          <span class="level" aria-hidden="true"><i :style="{ width: `${store.levelPercent}%` }" /></span>
+          <button class="mini danger" title="停止录音" @click="store.stopRecording()">
+            <t-icon name="stop-circle-filled" size="14px" />
+            <span>停止</span>
+          </button>
+          <button class="icon-btn" title="收起（后台继续录）" @click="store.toggleRecorder(false)">
+            <t-icon name="chevron-down" size="14px" />
+          </button>
+        </div>
+        <div class="sub">
           <span class="chip">第 {{ store.recordSeq }} 段</span>
-          <span class="chip quiet">已存 {{ store.recentClips.length }} 段</span>
-          <span class="spacer" />
-          <span v-if="targetLabel" class="where" :title="targetLabel">{{ targetLabel }}</span>
+          <span class="chip">已存 {{ store.recentClips.length }} 段</span>
+          <span class="where" :title="targetLabel">· {{ targetLabel }}</span>
         </div>
       </template>
 
-      <div v-else class="field">
-        <span class="label">记到</span>
-        <t-select
-          :value="store.targetNoteId"
-          class="target"
-          size="small"
-          placeholder="选择目标笔记"
-          @change="(v: unknown) => store.setTarget(String(v))"
-        >
-          <t-option
-            v-for="opt in store.targetOptions"
-            :key="opt.value"
-            :value="opt.value"
-            :label="opt.label"
-          />
-        </t-select>
-      </div>
-
-      <t-button
-        v-if="!store.recording"
-        class="action"
-        block
-        size="large"
-        theme="danger"
-        :disabled="!store.targetNoteId"
-        @click="store.startRecording()"
-      >
-        <span class="action-inner">
-          <t-icon name="microphone-1" size="16px" />
-          开始录音
-        </span>
-      </t-button>
-      <t-button
-        v-else
-        class="action"
-        block
-        size="large"
-        theme="default"
-        @click="store.stopRecording()"
-      >
-        <span class="action-inner">
-          <t-icon name="stop-circle-filled" size="16px" />
-          停止录音
-        </span>
-      </t-button>
-
-      <div v-if="store.lastClip && !store.recording" class="saved">
-        <t-icon class="saved-icon" name="check-circle" size="15px" />
-        <div class="saved-body">
-          <div class="saved-title">第 {{ store.lastClip.seq }} 段已保存</div>
-          <div class="saved-path" :title="store.lastClip.path">{{ store.lastClip.path }}</div>
+      <template v-else>
+        <div class="row">
+          <t-select
+            :value="store.targetNoteId"
+            class="target"
+            size="small"
+            placeholder="记到哪篇笔记"
+            :title="targetLabel"
+            @change="(v: unknown) => store.setTarget(String(v))"
+          >
+            <t-option
+              v-for="opt in store.targetOptions"
+              :key="opt.value"
+              :value="opt.value"
+              :label="opt.label"
+            />
+          </t-select>
+          <button
+            class="mini danger"
+            :disabled="!store.targetNoteId"
+            title="开始录音"
+            @click="store.startRecording()"
+          >
+            <t-icon name="microphone-1" size="14px" />
+            <span>开始</span>
+          </button>
+          <button class="icon-btn" title="收起" @click="store.toggleRecorder(false)">
+            <t-icon name="chevron-down" size="14px" />
+          </button>
         </div>
-        <t-button size="small" theme="primary" variant="outline" @click="insertLast">
-          插入引用
-        </t-button>
-      </div>
+
+        <div v-if="store.lastClip" class="saved">
+          <t-icon class="saved-icon" name="check-circle" size="13px" />
+          <span class="saved-text" :title="store.lastClip.path">
+            第 {{ store.lastClip.seq }} 段已保存
+          </span>
+          <button class="link" @click="insertLast">插入引用</button>
+        </div>
+      </template>
 
       <div v-if="store.error" class="err">{{ store.error }}</div>
-
-      <div class="tip">每 4 分钟自动分段 · 引用用笔记里的 <code>/v</code> 插</div>
     </div>
   </div>
 </template>
@@ -252,82 +232,64 @@ async function insertLast() {
   }
 }
 
-/* ---- 展开态 ---- */
+/* ---- 展开态：一行小条（236px 宽，待录态仅一行 ≈40px 高） ---- */
 
 .panel {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  width: 320px;
-  max-width: calc(100vw - 32px);
-  padding: 14px;
+  gap: 6px;
+  width: 236px;
+  max-width: calc(100vw - 28px);
+  padding: 8px 9px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-l);
+  border-radius: var(--radius-m);
   background: var(--panel);
-  box-shadow: var(--shadow-3);
+  box-shadow: var(--shadow-2);
 }
 
-.head {
+.row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
 }
 
-.badge {
-  display: inline-flex;
+.target {
+  flex: 1;
+  min-width: 0;
+}
+
+.dot {
   flex: none;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
-  background: var(--brand-weak);
-  color: var(--primary);
-}
-
-.badge.live {
   background: var(--danger);
-  color: #fff;
+  animation: dot-blink 1.3s ease-in-out infinite;
 }
 
-.title {
-  font-size: 13.5px;
-  font-weight: 600;
+@keyframes dot-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.3;
+  }
 }
 
 .timer {
+  flex: none;
   color: var(--danger);
-  font-size: 13.5px;
+  font-size: 12.5px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
 
-.spacer {
-  flex: 1;
-}
-
-.icon-btn {
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius-s);
-  background: transparent;
-  color: var(--text-3);
-  cursor: pointer;
-}
-
-.icon-btn:hover {
-  background: var(--hover);
-  color: var(--text);
-}
-
 .level {
-  height: 5px;
+  flex: 1;
+  min-width: 24px;
+  height: 4px;
   border-radius: 999px;
   background: var(--code-bg);
   overflow: hidden;
@@ -341,65 +303,86 @@ async function insertLast() {
   transition: width 0.12s linear;
 }
 
-.meta {
+/* 小按钮：开始 / 停止 */
+.mini {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.mini.danger {
+  background: var(--danger);
+  color: #fff;
+}
+
+.mini.danger:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.mini:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.icon-btn {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+/* 副行：11px 轻文字，超长省略 */
+.sub {
   display: flex;
   align-items: center;
   gap: 6px;
-}
-
-.chip {
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: var(--panel-2);
-  color: var(--text-2);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-
-.chip.quiet {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-3);
-}
-
-.where {
-  max-width: 46%;
   overflow: hidden;
   color: var(--text-3);
-  font-size: 11.5px;
-  text-overflow: ellipsis;
+  font-size: 11px;
+  line-height: 1.45;
   white-space: nowrap;
 }
 
-.field {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.label {
+.chip {
   flex: none;
-  color: var(--text-3);
-  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
-.target {
-  flex: 1;
-}
-
-.action-inner {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+.where {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .saved {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: var(--radius-m);
-  background: var(--panel-2);
+  gap: 6px;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.45;
 }
 
 .saved-icon {
@@ -407,40 +390,49 @@ async function insertLast() {
   color: var(--success);
 }
 
-.saved-body {
-  flex: 1;
-  min-width: 0;
-}
-
-.saved-title {
-  color: var(--text-2);
-  font-size: 12px;
-}
-
-.saved-path {
+.saved-text {
   overflow: hidden;
-  color: var(--text-3);
-  font-family: var(--font-mono);
-  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.link {
+  flex: none;
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
 .err {
   color: var(--danger);
-  font-size: 12px;
+  font-size: 11.5px;
   word-break: break-all;
 }
 
-.tip {
-  color: var(--text-3);
-  font-size: 11px;
-  line-height: 1.6;
-}
+/* 触屏没有 hover，按钮放大一档（仍是一行小条，只是好点） */
+@media (pointer: coarse) {
+  .mini {
+    height: 30px;
+    padding: 0 11px;
+    font-size: 12.5px;
+  }
 
-.tip code {
-  padding: 0 3px;
-  border-radius: 3px;
-  background: var(--panel-2);
+  .icon-btn {
+    width: 26px;
+    height: 26px;
+  }
+
+  .capsule {
+    height: 38px;
+  }
 }
 </style>

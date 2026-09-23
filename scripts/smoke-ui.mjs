@@ -280,18 +280,30 @@ console.log('== 录音面板（假麦克风）==')
 await click('.capsule')
 await sleep(400)
 check('展开录音面板', (await count('.panel')) === 1)
+// v0.3.6：面板压成「一行小条」，别挡内容
+const idleBox = await page.evaluate(() => {
+  const r = document.querySelector('.panel').getBoundingClientRect()
+  return { w: Math.round(r.width), h: Math.round(r.height) }
+})
+check('展开态是一行小条（宽 ≤ 260 / 高 ≤ 84）', idleBox.w <= 260 && idleBox.h <= 84, JSON.stringify(idleBox))
 await page.screenshot({ path: `${SHOTS}/06-recorder-idle.png` })
-await clickText('开始录音', '.t-button')
+await click('[title="开始录音"]')
 await sleep(2600)
 const liveState = await page.evaluate(() => ({
   timer: document.querySelector('.panel .timer')?.textContent ?? null,
   chips: document.querySelectorAll('.panel .chip').length,
   level: document.querySelector('.panel .level i')?.style.width ?? '',
-  stop: [...document.querySelectorAll('.panel .t-button')].map((b) => b.textContent.trim()),
+  stop: !!document.querySelector('.panel [title="停止录音"]'),
+  start: !!document.querySelector('.panel [title="开始录音"]'),
+  h: Math.round(document.querySelector('.panel').getBoundingClientRect().height),
 }))
 check('录音中有计时', !!liveState.timer && liveState.timer !== '0:00', String(liveState.timer))
 check('录音中有电平与分段信息', liveState.chips >= 2 && liveState.level.endsWith('%'), JSON.stringify(liveState))
-check('按钮变成「停止录音」', liveState.stop.some((t) => t.includes('停止录音')), JSON.stringify(liveState.stop))
+check(
+  '按钮变成「停止」且录音态也仍是一行小条',
+  liveState.stop && !liveState.start && liveState.h <= 84,
+  JSON.stringify(liveState),
+)
 await page.screenshot({ path: `${SHOTS}/07-recorder-live.png` })
 await page.evaluate(() => document.querySelector('.panel .icon-btn')?.click())
 await sleep(600)
@@ -299,10 +311,10 @@ check('收起后是录音中的胶囊（红点 + 计时）', (await count('.caps
 await page.screenshot({ path: `${SHOTS}/08-capsule-live.png` })
 await click('.capsule.live')
 await sleep(300)
-await clickText('停止录音', '.t-button')
+await click('[title="停止录音"]')
 await sleep(1200)
 const saved = (await text('.panel')) ?? ''
-check('停止后给出已保存卡片与「插入引用」', saved.includes('已保存') && saved.includes('插入引用'), saved.slice(0, 80))
+check('停止后给出已保存提示与「插入引用」', saved.includes('已保存') && saved.includes('插入引用'), saved.slice(0, 80))
 
 // （v0.3.5 去掉了「预览」：块编辑本身就是最终排版，这里改测「编辑态宽度 == 渲染态宽度」）
 await clickText('编辑', '.t-radio-button')
