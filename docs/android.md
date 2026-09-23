@@ -106,7 +106,21 @@ bash scripts/release-android.sh v0.3.5
 | `ANDROID_KEY_ALIAS` | `keystore.properties` 里的 `keyAlias` |
 | `ANDROID_KEY_PASSWORD` | `keystore.properties` 里的 `keyPassword` |
 
-配好后推 `v*` tag：`windows-build` 出安装包、`android-build` 出 APK，两个 job 把资产挂到同一个 Release。
+配好后推 `v*` tag：`windows-build` 出安装包、`android-build` 出 APK，两个 job 把资产挂到同一个 Release
+（APK 资产名 `bnu-notes-<版本>.apk`，比如 `bnu-notes-0.3.6.apk`）。
+
+> 现状（2026-09-23）：4 个 secrets 已配置；`android-build` 已用**手动触发**跑通过一次，产出的 APK
+> 用 `apksigner verify --print-certs` 核对过证书 = `CN=BNU Notes`、SHA-256 指纹与本地出包一致
+> （覆盖安装不会因签名不同失败）。手动再验一次：
+
+```bash
+gh workflow run ci.yml --ref client      # 手动触发（只出 artifact，不建 Release）
+gh run watch                             # 或到 Actions 页面看
+```
+
+CI 里 Android 环节的小坑：不要用 `android-actions/setup-android@v3`（实测在 runner 上必失败），
+现在是显式用 runner 自带的 `$ANDROID_SDK_ROOT`，缺了才下载 cmdline-tools；构建日志会 tee 到文件，
+失败时自动把尾部 300 行推到 `ci-logs` 分支方便排查。
 **缺 secret 时 android-build 自动跳过**（不会让 Release 失败）；密钥库仍然只存在你本机 + GitHub secrets，不入库。
 
 ## 安装与验证清单

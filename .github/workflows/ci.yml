@@ -168,8 +168,9 @@ jobs:
           exec > >(tee -a /tmp/android-build.log) 2>&1
           export NDK_HOME="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
           npm run tauri android build -- --apk --target aarch64
+          VERSION="${GITHUB_REF_NAME#v}"           # v0.3.6 → 0.3.6，资产名与手工上传保持一致
           cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk \
-             "bnu-notes-${GITHUB_REF_NAME}.apk"
+             "bnu-notes-${VERSION}.apk"
       - if: steps.ks.outputs.ready == 'yes' && startsWith(github.ref, 'refs/tags/v')
         name: 挂到 Release
         uses: softprops/action-gh-release@v2
