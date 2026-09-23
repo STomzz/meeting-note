@@ -1,6 +1,8 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <!-- Base application theme. -->
     <style name="Theme.bnu_notes" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <!-- Customize your theme here. -->
+        <!-- 边到边模式下，状态栏 / 导航栏背后露出来的就是这个底色（内容视图被 Insets 让开了）。
+             与应用浅色背景色（#f4f5f7）对齐，避免顶上出现一条突兀的白条。 -->
+        <item name="android:windowBackground">#F4F5F7</item>
     </style>
 </resources>

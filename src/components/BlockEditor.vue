@@ -6,7 +6,15 @@
  * - 编辑空段时输入 `#` / `##` / `/` 弹出块类型菜单（正文 / 一级标题 / …），选完回车就是排版结果；
  * - 只替换被编辑的那一块：其它块（会议笔记里的 `/v` 引用、`> 🎙 转写`、纪要段）逐字节不动。
  */
-import { computed, nextTick, onBeforeUnmount, ref, watch, type ComponentPublicInstance } from 'vue'
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+  type ComponentPublicInstance,
+} from 'vue'
 import { MINUTES_HEADING, formatDur, parseRefLine, slashCommandAt } from '../core/meetingNote'
 import { filterRefOptions, refLineFor, type RefOption } from '../core/refPicker'
 import {
@@ -90,6 +98,20 @@ function currentTa(): HTMLTextAreaElement | null {
   return taEl.value ?? rootEl.value?.querySelector<HTMLTextAreaElement>('textarea.blk-ta') ?? null
 }
 
+/**
+ * 让输入框高度跟着「折行之后的内容」长。
+ *
+ * 只按 `:rows="逻辑行数"` 算高度的话，长行折行时会少算一行：光标走到第二个视觉行，
+ * 浏览器就把输入框内部滚动一下，行首被顶出去——`overflow: hidden` 还拉不回来
+ * （真机上的表现就是「打了几个字，前面的就不见了，回车之后才又能看到」）。
+ * 进编辑 / 每次输入 / 文档宽度变化时都要重算。
+ */
+function autosizeTa(el: HTMLTextAreaElement | null) {
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight}px`
+}
+
 /** 自己刚发出去的内容不要再回灌，否则打字中途会被重置。 */
 let lastEmitted = props.content
 let flashTimer = 0
@@ -143,6 +165,7 @@ function startEdit(block: Block, caret: 'start' | 'end' = 'end') {
   void nextTick(() => {
     const el = currentTa()
     if (!el) return
+    autosizeTa(el)
     el.focus()
     const pos = caret === 'start' ? markerOffset(el.value) : el.value.length
     el.setSelectionRange(pos, pos)
@@ -226,6 +249,7 @@ function choose(kind: BlockKind) {
   void nextTick(() => {
     const el = currentTa()
     if (!el) return
+    autosizeTa(el)
     el.focus()
     el.setSelectionRange(el.value.length, el.value.length)
   })
@@ -233,6 +257,7 @@ function choose(kind: BlockKind) {
 
 function onInput() {
   const el = currentTa()
+  autosizeTa(el)
   const cursor = el ? el.selectionStart : draft.value.length
   // 行首敲 `/v` / `/video` → 录音选择器（与源码模式同一套判定）
   const hit = slashCommandAt(draft.value, cursor)
@@ -468,7 +493,25 @@ function locate(startLine: number, endLine: number) {
   }, 1800)
 }
 
+/** 文档宽度变了（转屏 / 拉侧栏 / 窗口缩放）→ 折行位置变 → 高度要重算。 */
+let widthWatcher: ResizeObserver | null = null
+let lastWidth = 0
+
+onMounted(() => {
+  if (typeof ResizeObserver === 'undefined' || !rootEl.value) return
+  widthWatcher = new ResizeObserver(() => {
+    const width = rootEl.value?.clientWidth ?? 0
+    // 只看宽度：高度变化（正是输入框长高引起的）不能再触发一轮，否则来回抖
+    if (width === lastWidth) return
+    lastWidth = width
+    autosizeTa(currentTa())
+  })
+  widthWatcher.observe(rootEl.value)
+})
+
 onBeforeUnmount(() => {
+  widthWatcher?.disconnect()
+  widthWatcher = null
   window.clearTimeout(flashTimer)
   window.clearTimeout(hintTimer)
   window.clearTimeout(copiedTimer)

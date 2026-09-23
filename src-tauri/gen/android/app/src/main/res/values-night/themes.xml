@@ -1,6 +1,7 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <!-- Base application theme. -->
     <style name="Theme.bnu_notes" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <!-- Customize your theme here. -->
+        <!-- 深色下与应用背景色（#16181c）对齐（应用主题默认跟随系统，两边一致） -->
+        <item name="android:windowBackground">#16181C</item>
     </style>
 </resources>

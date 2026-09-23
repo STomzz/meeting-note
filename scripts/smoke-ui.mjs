@@ -176,6 +176,23 @@ check('只替换了被编辑的块（块数不变）', (await count('.blocks .bl
 check('引用行仍在', (await count('.blocks .audio-ref')) === 1)
 check('纪要标题仍在', ((await text('.blocks')) ?? '').includes('会议纪要（AI 整理）'))
 
+// 真机反馈（Android）：长行折行后输入框高度不跟着长，光标走到第二个视觉行时
+// 浏览器把输入框内部一滚，行首就被顶出去（overflow: hidden 还拉不回来）
+await click('.blocks .blk', 1)
+await setTextarea('.blk-ta', '')
+await page.keyboard.type('长行折行测试：' + '这是一句用来测试折行的话，'.repeat(8))
+await sleep(200)
+const fit = await page.evaluate(() => {
+  const el = document.querySelector('.blk-ta')
+  return { sh: el.scrollHeight, ch: el.clientHeight, sw: el.scrollWidth, cw: el.clientWidth }
+})
+check('长行折行后输入框高度跟着长（行首不会被裁）', fit.sh <= fit.ch + 1, JSON.stringify(fit))
+check('长行按文档宽度折行（不横向溢出）', fit.sw <= fit.cw + 1, JSON.stringify(fit))
+await page.keyboard.down('Control')
+await page.keyboard.press('Enter')
+await page.keyboard.up('Control')
+await sleep(400)
+
 await click('.add-row')
 await sleep(300)
 await setTextarea('.blk-ta', '##')
