@@ -3,6 +3,10 @@
 所有请求由客户端本地（Rust `reqwest`，Tauri 命令层）带着设置里的 baseURL + API Key 直连，不经过任何中间服务器。
 浏览器预览模式（`npm run dev`）不发起真实请求。
 
+> 开发便利：预览模式会用 `.env.local` 里的 `VITE_DEV_API_KEY` 预填输入框（仍需手动保存）。
+> 该文件在 `.gitignore` 里（`*.local`），且预填入口有 `import.meta.env.DEV` 守卫——
+> 正式包（Windows 安装包 / APK）里既没有这个文件、也不会执行预填，**不会带出任何 Key**。
+
 ## 四类能力
 
 | 能力 | 接口 | 推荐模型 | 是否必需 | 未配置时的行为 |
@@ -55,6 +59,10 @@ BNU_TEST_BASE_URL=https://chatapi.bnu.edu.cn/bnuapi BNU_TEST_API_KEY=sk-… \
 | rerank `bge-reranker-v2-m3` | 200，相关文档 0.9913 / 无关 0.000016 |
 | asr `qwen3-asr-1.7b`（0.5 s 静音 WAV） | 200，返回 `嗯。`（静音也能连通） |
 | 旧前缀 `POST /v1/chat/completions` | 200（兼容保留） |
+
+用**真实用户令牌**（非集群内部测试令牌）复测同样全过：能力四项 337/113/110/138 ms，
+会议链路真实中文语音 13 s → 静音切段 3 块、失败 0、转写 1005 ms，纪要 559 ms（`Qwen-Inno-35B-v1`），
+流式问答首字 290 ms 级。
 
 ## 实测记录（2026-09-22，集群网关）
 
