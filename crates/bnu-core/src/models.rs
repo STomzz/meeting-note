@@ -217,11 +217,59 @@ pub fn api_root(base_url: &str) -> String {
     }
 }
 
+/// TLS 根证书库：**系统证书库 + 内置 Mozilla 根证书**。
+///
+/// 为什么要合并：`rustls-native-certs` 在 Android 上依赖 `openssl-probe`，而后者
+/// 只认 Termux 的路径（`/data/data/com.termux/files/usr/etc/tls/cert.pem`）——
+/// 普通 APK 里一个系统根证书都读不到，于是所有 `https://` 请求都会
+/// `invalid peer certificate: UnknownIssuer`（Windows 读系统证书库，所以桌面端正常）。
+/// 这里再并一份内置根证书兜底：公网 CA 签发的证书（如 `*.bnu.edu.cn` 的 DigiCert）都能验过。
+pub fn root_store() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        // 个别证书解析失败不影响其它（Android 上本来就一个都读不到）
+        let _ = roots.add(cert);
+    }
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+/// TLS 客户端配置（模型调用统一用它，别各建各的）。
+pub fn tls_config() -> Result<rustls::ClientConfig> {
+    let roots = root_store();
+    if roots.is_empty() {
+        bail!("没有可用的 TLS 根证书（系统证书库与内置根证书都为空）");
+    }
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
+/// 统一的 HTTP 客户端（模型调用都走这里）。
 fn http() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
+        .use_preconfigured_tls(tls_config()?)
         .build()
         .context("创建 HTTP 客户端失败")
+}
+
+/// 把 reqwest 的错误连**根因**一起写出来。
+///
+/// `reqwest::Error` 的 `Display` 只有最外层（`error sending request for url (...)`），
+/// 真正有用的（`invalid peer certificate: UnknownIssuer`、`connection refused`…）藏在 source 链里。
+/// Android 上「系统根证书读不到」这个坑就是被这层吞掉的，排障时只看到一句「请求失败」。
+fn req_err(url: &str, e: reqwest::Error) -> anyhow::Error {
+    let mut chain = vec![e.to_string()];
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        let text = s.to_string();
+        if !chain.iter().any(|c| c.contains(&text)) {
+            chain.push(text);
+        }
+        src = s.source();
+    }
+    anyhow!("请求失败: {url} → {}", chain.join(" → "))
 }
 
 fn auth(req: reqwest::RequestBuilder, cfg: &EndpointConfig) -> reqwest::RequestBuilder {
@@ -303,7 +351,7 @@ pub async fn chat(cfg: &EndpointConfig, messages: &[ChatMessage], opts: &ChatOpt
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("请求失败: {url}"))?;
+        .map_err(|e| req_err(&url, e))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -448,7 +496,7 @@ where
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("请求失败: {url}"))?;
+        .map_err(|e| req_err(&url, e))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -511,7 +559,7 @@ pub async fn embed(cfg: &EndpointConfig, inputs: &[String]) -> Result<Vec<Vec<f3
         .json(&json!({ "model": cfg.model, "input": inputs }))
         .send()
         .await
-        .with_context(|| format!("请求失败: {url}"))?;
+        .map_err(|e| req_err(&url, e))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -558,7 +606,7 @@ pub async fn rerank(
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("请求失败: {url}"))?;
+        .map_err(|e| req_err(&url, e))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -601,7 +649,7 @@ pub async fn transcribe(cfg: &EndpointConfig, wav: Vec<u8>, filename: &str) -> R
         .multipart(form)
         .send()
         .await
-        .with_context(|| format!("请求失败: {url}"))?;
+        .map_err(|e| req_err(&url, e))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -633,7 +681,7 @@ pub async fn list_models(cfg: &EndpointConfig) -> Result<Vec<String>> {
     let resp = auth(http()?.get(&url), cfg)
         .send()
         .await
-        .with_context(|| format!("请求失败: {url}"))?;
+        .map_err(|e| req_err(&url, e))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -726,6 +774,71 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let sb = SecretBox::load_or_create(&dir.path().join("secret.key")).unwrap();
         (dir, conn, sb)
+    }
+
+    #[test]
+    fn root_store_merges_native_and_bundled() {
+        let bundled = webpki_roots::TLS_SERVER_ROOTS.len();
+        assert!(bundled > 100, "内置根证书数量异常：{bundled}");
+        let merged = root_store();
+        assert!(
+            merged.len() >= bundled,
+            "合并后的根证书库不该比内置的还少：{} < {bundled}",
+            merged.len()
+        );
+        assert!(tls_config().is_ok(), "TLS 配置应能建出来");
+    }
+
+    /// 模拟 Android：系统证书库读不到（`openssl-probe` 只认 Termux 路径）时，
+    /// **只靠内置根证书**要能验过网关注书（`*.bnu.edu.cn` 是 DigiCert 签的）。
+    ///
+    /// 需要网络：`cargo test -p bnu-core --lib -- --ignored --nocapture bundled_roots`
+    #[tokio::test]
+    #[ignore]
+    async fn bundled_roots_cover_gateway_tls() {
+        let host = std::env::var("BNU_TEST_BASE_URL")
+            .unwrap_or_else(|_| "https://chatapi.bnu.edu.cn".to_string());
+        let url = format!("{}/v1/models", host.trim_end_matches('/'));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .expect("只装内置根证书时也应验过网关证书（Android 走的正是这条路）");
+        println!("{url} → {}", resp.status());
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 401,
+            "意外状态码：{}",
+            resp.status()
+        );
+
+        // 反证：根证书库为空 = 修复前 Android 的状态，必须失败（用户看到的就是这个）
+        let bare = reqwest::Client::builder()
+            .use_preconfigured_tls(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            )
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let err = bare.get(&url).send().await.unwrap_err();
+        let is_connect = err.is_connect();
+        let text = req_err(&url, err).to_string();
+        println!("空根证书库 → {text}");
+        assert!(
+            text.contains("UnknownIssuer") || is_connect,
+            "空根证书库应当验不过证书，实际：{text}"
+        );
     }
 
     #[test]

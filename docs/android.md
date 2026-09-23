@@ -93,4 +93,7 @@ $ANDROID_HOME/build-tools/35.0.0/apksigner sign --ks ~/.android/bnu-notes.keysto
 - Android 上不能用 `localhost` 访问模型网关，必须填手机网络能到达的地址；
 - `tauri android dev`（开发服务器 + 热重载）在 Tauri 里走 `tauri://localhost` 代理，
   需要 `adb reverse`；本仓库的验证流程用打包 APK，不走这条路径；
-- 手机与电脑不在同一网络时，转写/纪要会失败（录音、播放、保存都是本地的，不受影响）。
+- 手机与电脑不在同一网络时，转写/纪要会失败（录音、播放、保存都是本地的，不受影响）；
+- **https 网关（v0.3.2 及以前）**：安卓上根证书读不到（见 `docs/models.md` 的「TLS 根证书」），
+  所有 https 请求都会失败（`invalid peer certificate: UnknownIssuer`）→ 用 v0.3.3 及以后的 APK；
+  临时替代：把网关地址换成 `http://` 的内网地址（内网 IP 不受 TLS 影响）。

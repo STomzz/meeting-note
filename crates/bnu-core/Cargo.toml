@@ -19,6 +19,10 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-native-roots",
     "stream",
 ] }
+# TLS 根证书：系统库 + 内置 Mozilla 根证书（Android 上系统库读不到，见 models::tls_config）
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1.0"
 futures-util = "0.3"
 
 [dev-dependencies]

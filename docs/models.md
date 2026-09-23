@@ -54,6 +54,23 @@ BNU_TEST_API_KEY=sk-xxx cargo test -p bnu-core --test gateway_live -- --ignored 
 - 切段经验：单段 8 s~45 s（客户端默认 4 分钟整段，转写前按静音细切）、静音阈值 600 ms、RMS 自适应；
 - 限流经验：约 9 请求/分钟，需要排队 + 退避重试。
 
+## TLS 根证书（v0.3.3 修）
+
+HTTP 客户端用 **系统证书库 + 内置 Mozilla 根证书**合并后的根证书库（`models::root_store()` / `models::tls_config()`）。
+
+为什么要合并：`reqwest` 的 `rustls-tls-native-roots` 依赖 `rustls-native-certs` → `openssl-probe`，而
+`openssl-probe` 在 `target_os = "android"` 分支里**只认 Termux 的路径**
+（`/data/data/com.termux/files/usr/etc/tls/cert.pem`），APK 里既没有 Android 系统 CA 目录也没有 APEX 目录，
+于是安卓上根证书数量是 **0**：所有 `https://` 请求都以
+`invalid peer certificate: UnknownIssuer` 失败（Windows 读系统证书库，因此桌面端正常）。
+现在再并一份内置根证书兜底，公网 CA（DigiCert / Let's Encrypt 等）都能验过。
+
+- 自签 / 内网 CA 的 `https://`（如集群 `:9443` 的 vllm-tls）在两端都验不过——桌面端需要把 CA 装进系统证书库；
+- 请求失败时的错误信息会带上 source 链（`请求失败: <url> → ... → invalid peer certificate: UnknownIssuer`），
+  别再只写一句「请求失败」（`models::req_err`）；
+- 自检：`cargo test -p bnu-core --lib -- --ignored --nocapture bundled_roots`
+  （会真的打一次网关：只装内置根证书应通、空根证书库应报 `UnknownIssuer`）。
+
 ## 安全
 
 - API Key 用本机密钥（`secret.key`，权限 0600，位于应用数据目录）AES-256-GCM 加密后存进 SQLite；
